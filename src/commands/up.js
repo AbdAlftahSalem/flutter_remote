@@ -116,7 +116,7 @@ export async function up(cwd, flags = {}) {
   await gh.dispatch(cwd, WORKFLOW, branch, {
     session,
     gate_token: gateToken,
-    minutes: String(flags.minutes ?? 30),
+    minutes: String(flags.minutes ?? 10),
     device: flags.device ?? 'iPhone 17 Pro',
     mode,
     flutter_version: flutterVersion,

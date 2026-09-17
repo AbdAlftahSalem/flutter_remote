@@ -25,7 +25,7 @@ ${bold('COMMANDS')}
   turn      Configure WebRTC TURN credentials in repository secrets
 
 ${bold('OPTIONS (flutter-remote up)')}
-  --minutes <n>          Session duration in minutes            ${dim('default 30, max 350')}
+  --minutes <n>          Session duration in minutes            ${dim('default 10, max 350')}
   --device <name>        iOS Simulator device name              ${dim('default "iPhone 17 Pro"')}
   --runner <label>       macOS runner image (must be ARM64)     ${dim('default macos-26')}
   --flutter-version <v>  Flutter SDK version or channel         ${dim('default: auto-detected or stable')}

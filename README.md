@@ -162,7 +162,7 @@ The browser interface streams the iOS Simulator display with full bidirectional 
 
 | Option | Default | Description |
 |---|---|---|
-| `--minutes <n>` | `30` | Duration to hold simulator session open (1 to 350 min) |
+| `--minutes <n>` | `10` | Duration to hold simulator session open (1 to 350 min) |
 | `--device <name>` | `iPhone 17 Pro` | Simulator device name (auto-falls back if runner differs) |
 | `--runner <label>` | `macos-26` | GitHub macOS runner label (must be ARM64 for serve-sim) |
 | `--flutter-version <v>` | `stable` | Flutter SDK version or channel (e.g. `3.29.0`) |
