@@ -2,8 +2,11 @@
 
 > Run, test, and interact with real **Flutter iOS applications** on a genuine **Apple iOS Simulator** hosted on GitHub macOS runners — directly from Chrome, Edge, or Firefox on **Windows, Linux, or macOS**.
 
+[![npm version](https://img.shields.io/npm/v/flutter-remote.svg?color=cb3837)](https://www.npmjs.com/package/flutter-remote)
+[![npm downloads](https://img.shields.io/npm/dm/flutter-remote.svg)](https://www.npmjs.com/package/flutter-remote)
+[![CI](https://github.com/AbdAlftahSalem/flutter_remote/actions/workflows/ci.yml/badge.svg)](https://github.com/AbdAlftahSalem/flutter_remote/actions/workflows/ci.yml)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org)
-[![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](https://opensource.org/licenses/ISC)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform: Cross-Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](https://github.com/AbdAlftahSalem/flutter_remote)
 
 ---
@@ -245,4 +248,4 @@ Flutter Remote Doctor
 
 ## License
 
-ISC © Flutter Remote Contributors
+MIT © AbdAlftah Salem
