@@ -1,16 +1,36 @@
 {
-  "name": "flutter_remote",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "flutter-remote",
+  "version": "0.1.0",
+  "description": "Run Flutter iOS applications on a real iOS Simulator on GitHub macOS runners and stream interactively to your browser.",
+  "type": "module",
+  "bin": {
+    "flutter-remote": "bin/flutter-remote.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "templates"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/*.test.js"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/AbdAlftahSalem/flutter_remote.git"
   },
-  "keywords": [],
+  "keywords": [
+    "flutter",
+    "ios",
+    "simulator",
+    "remote",
+    "testing",
+    "browser",
+    "serve-sim",
+    "github-actions"
+  ],
   "author": "",
   "license": "ISC",
   "bugs": {
