@@ -179,6 +179,7 @@ jobs:
           ARGS=(
             --detach
             --quiet
+            --fit
             --port "$PREVIEW_PORT"
             --codec '${{ inputs.codec }}'
           )
