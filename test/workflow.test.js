@@ -19,7 +19,7 @@ describe('Workflow & Gate Templates', () => {
 
   test('templates/flutter-remote.yml contains required markers and steps', () => {
     const yml = readFileSync('templates/flutter-remote.yml', 'utf8');
-    assert.ok(yml.includes('# flutter-remote-template-version: 2'));
+    assert.ok(yml.includes('# flutter-remote-template-version: 3'));
     assert.ok(yml.includes('name: flutter-remote'));
     assert.ok(yml.includes('subosito/flutter-action@v2'));
     assert.ok(yml.includes('flutter build'));

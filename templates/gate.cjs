@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 1
+// flutter-remote-template-version: 2
 /**
  * flutter-remote auth gate.
  *
@@ -28,6 +28,14 @@ if (!TOKEN) {
   console.error('FLUTTER_REMOTE_GATE_TOKEN is required — refusing to proxy an unauthenticated simulator');
   process.exit(1);
 }
+
+// Prevent any uncaught socket or network error from crashing the proxy daemon
+process.on('uncaughtException', (err) => {
+  console.error('[gate uncaughtException]', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[gate unhandledRejection]', reason);
+});
 
 function timingSafeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
@@ -76,9 +84,15 @@ h1{font-size:1.1rem;margin-bottom:.5rem}code{background:#f3f4f6;padding:.15rem .
 <p>This stream is secured by a gate token. Use the full URL provided by <code>flutter-remote up</code>.</p>`;
 
 const server = http.createServer((req, res) => {
+  if (req.url.startsWith('/__flutter-remote/healthz')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, target: TARGET_PORT, agent: AGENT_PORT || null }));
+    return;
+  }
+
   const auth = authorize(req);
   if (!auth) {
-    res.writeHead(401, {
+    res.writeHead(403, {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
     });
@@ -86,29 +100,30 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  const url = new URL(req.url, 'http://localhost');
-  const headers = { ...req.headers };
-  delete headers.host;
+  const agent = isAgentRoute(req);
 
-  if (auth === 'query') {
+  // Trade query token for HttpOnly cookie on human stream
+  if (auth === 'query' && !agent) {
+    const url = new URL(req.url, 'http://localhost');
     url.searchParams.delete('k');
-    const cleanUrl = `${url.pathname}${url.search}`;
+    const cleanPath = `${url.pathname}${url.search}`;
     res.writeHead(302, {
-      Location: cleanUrl || '/',
-      'Set-Cookie': `${COOKIE}=${encodeURIComponent(TOKEN)}; Path=/; HttpOnly; SameSite=Lax`,
+      Location: cleanPath || '/',
+      'Set-Cookie': `${COOKIE}=${encodeURIComponent(TOKEN)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200`,
       'Cache-Control': 'no-store',
     });
     res.end();
     return;
   }
 
-  const isAgent = isAgentRoute(req);
-  const upstreamPort = isAgent ? AGENT_PORT : TARGET_PORT;
-  let upstreamPath = req.url;
+  const upstreamPort = agent ? AGENT_PORT : TARGET_PORT;
+  const upstreamPath = req.url;
 
-  if (isAgent) {
-    upstreamPath = upstreamPath.slice(AGENT_PREFIX.length) || '/';
-  }
+  const upstreamHeaders = {
+    ...req.headers,
+    'x-forwarded-proto': 'https',
+    'x-forwarded-host': req.headers.host,
+  };
 
   const proxy = http.request(
     {
@@ -116,17 +131,27 @@ const server = http.createServer((req, res) => {
       port: upstreamPort,
       method: req.method,
       path: upstreamPath,
-      headers,
+      headers: upstreamHeaders,
     },
     (upstreamRes) => {
-      res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
+      res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
       upstreamRes.pipe(res);
     }
   );
 
   proxy.on('error', (err) => {
-    res.writeHead(502, { 'Content-Type': 'text/plain' });
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'text/plain' });
+    }
     res.end(`Upstream error: ${err.message}`);
+  });
+
+  req.on('error', () => {
+    proxy.destroy();
+  });
+
+  res.on('error', () => {
+    proxy.destroy();
   });
 
   req.pipe(proxy);
@@ -134,8 +159,7 @@ const server = http.createServer((req, res) => {
 
 server.on('upgrade', (req, socket, head) => {
   if (!authorize(req)) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-    socket.destroy();
+    socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
     return;
   }
 
@@ -143,26 +167,31 @@ server.on('upgrade', (req, socket, head) => {
   const upstreamPort = isAgent ? AGENT_PORT : TARGET_PORT;
 
   const upstream = net.connect(upstreamPort, TARGET_HOST, () => {
-    let out = `${req.method} ${req.url} HTTP/1.1\r\n`;
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (Array.isArray(v)) {
-        for (const item of v) out += `${k}: ${item}\r\n`;
-      } else {
-        out += `${k}: ${v}\r\n`;
-      }
-    }
-    out += '\r\n';
-    upstream.write(out);
+    const forwarded = {
+      ...req.headers,
+      'x-forwarded-proto': 'https',
+      'x-forwarded-host': req.headers.host,
+    };
+    const headers = Object.entries(forwarded)
+      .map(([k, v]) => (Array.isArray(v) ? v.map((x) => `${k}: ${x}`).join('\r\n') : `${k}: ${v}`))
+      .join('\r\n');
+
+    upstream.write(`${req.method} ${req.url} HTTP/1.1\r\n${headers}\r\n\r\n`);
     if (head && head.length) upstream.write(head);
     upstream.pipe(socket);
     socket.pipe(upstream);
   });
 
-  upstream.on('error', () => {
-    socket.destroy();
-  });
+  const drop = () => {
+    try { socket.destroy(); } catch {}
+    try { upstream.destroy(); } catch {}
+  };
+
+  upstream.on('error', drop);
+  socket.on('error', drop);
+  socket.on('close', drop);
 });
 
 server.listen(PORT, TARGET_HOST, () => {
-  console.log(`[flutter-remote gate] listening on ${TARGET_HOST}:${PORT}`);
+  console.log(`[flutter-remote gate] listening on ${TARGET_HOST}:${PORT} -> :${TARGET_PORT}`);
 });
