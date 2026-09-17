@@ -31,8 +31,8 @@
     "serve-sim",
     "github-actions"
   ],
-  "author": "",
-  "license": "ISC",
+  "author": "AbdAlftah Salem",
+  "license": "MIT",
   "bugs": {
     "url": "https://github.com/AbdAlftahSalem/flutter_remote/issues"
   },

@@ -1,12 +1,37 @@
 import { spawnSync, spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+
+function resolveCommand(cmd) {
+  if (cmd === 'gh' && process.platform === 'win32') {
+    if (hasInPath('gh')) return 'gh';
+    const candidates = [
+      'C:\\Program Files\\GitHub CLI\\gh.exe',
+      process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Programs', 'GitHub CLI', 'gh.exe') : null,
+      process.env.ProgramFiles ? join(process.env.ProgramFiles, 'GitHub CLI', 'gh.exe') : null,
+    ].filter(Boolean);
+    for (const p of candidates) {
+      if (existsSync(p)) return p;
+    }
+  }
+  return cmd;
+}
+
+function hasInPath(cmd) {
+  const checker = process.platform === 'win32' ? 'where.exe' : 'which';
+  const r = spawnSync(checker, [cmd], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  return r.status === 0;
+}
 
 /**
  * Run a command and capture output. Never throws.
  */
 export function sh(cmd, args = [], opts = {}) {
-  const isWin = process.platform === 'win32';
-  // On Windows, if running a batch file or built-in, use shell if needed, but spawnSync works directly for .exe/.cmd
-  const r = spawnSync(cmd, args, {
+  const resolved = resolveCommand(cmd);
+  const r = spawnSync(resolved, args, {
     encoding: 'utf8',
     windowsHide: true,
     ...opts,
@@ -35,7 +60,8 @@ export function shx(cmd, args = [], opts = {}) {
  * Run a command with inherited stdio so user sees live output.
  */
 export function run(cmd, args = [], opts = {}) {
-  const r = spawnSync(cmd, args, {
+  const resolved = resolveCommand(cmd);
+  const r = spawnSync(resolved, args, {
     stdio: 'inherit',
     windowsHide: true,
     ...opts,
@@ -46,11 +72,14 @@ export function run(cmd, args = [], opts = {}) {
 }
 
 /**
- * Check whether a command exists in system PATH (cross-platform).
+ * Check whether a command exists in system PATH or standard locations (cross-platform).
  */
 export function has(cmd) {
-  const checker = process.platform === 'win32' ? 'where.exe' : 'which';
-  return sh(checker, [cmd]).ok;
+  if (hasInPath(cmd)) return true;
+  if (cmd === 'gh' && process.platform === 'win32') {
+    return resolveCommand('gh') !== 'gh';
+  }
+  return false;
 }
 
 /**
