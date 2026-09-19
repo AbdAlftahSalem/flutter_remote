@@ -231,48 +231,170 @@ test('Test E — backpressure: bounded queue, stale frame dropping, and latest-f
   assert.equal(writtenBuffers[1].toString(), 'frame-103');
 });
 
-test('Test F — keyframe recovery: requestKeyframe generates fresh IDR sequence', () => {
+test('Test A (Fresh IDR) — request produces fresh IDR and does not simply return cached keyframe', async () => {
   const encoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
   const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
 
-  // Cache an initial keyframe
+  // Initial keyframe (IDR 1)
+  const sps1 = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00]), Buffer.alloc(10, 0x11)]);
+  const pps1 = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x22)]);
+  const idr1 = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(40, 0x33)]);
+  const frame1Chunk = Buffer.concat([sps1, pps1, idr1]);
+
+  // P-frame 1
+  const nonIdr1 = Buffer.concat([prefix4, Buffer.from([0x41, 0x88]), Buffer.alloc(30, 0x44)]);
+
+  // Feed Frame 1 and Frame 2 to set up initial state
+  encoder.feedStream(Buffer.concat([frame1Chunk, nonIdr1]));
+  assert.ok(encoder.hasKeyframe(), 'Must have cached initial keyframe');
+  const cachedInitialKeyframe = encoder.cachedKeyframe;
+
+  // Client requests keyframe recovery
+  let keyframeRequestedEmitted = false;
+  encoder.on('keyframe_requested', (evt) => {
+    keyframeRequestedEmitted = true;
+    assert.equal(evt.count, 1);
+  });
+
+  const recoveryPromise = encoder.requestKeyframe();
+
+  // Verify requestKeyframe does NOT return the old cached keyframe synchronously
+  assert.notDeepEqual(recoveryPromise, cachedInitialKeyframe, 'Must NOT return cachedKeyframe');
+  assert.ok(recoveryPromise instanceof Promise, 'Must return a promise for the fresh IDR');
+  assert.equal(keyframeRequestedEmitted, true, 'Must emit keyframe_requested event');
+  assert.equal(encoder._keyframeRequested, true, 'Must mark _keyframeRequested');
+
+  // Now feed a fresh IDR (IDR 2) with different data bytes
+  const sps2 = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00]), Buffer.alloc(10, 0x77)]);
+  const pps2 = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x88)]);
+  const idr2 = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(50, 0x99)]);
+  // Followed by another slice to delimit AU
+  const delimiterSlice = Buffer.concat([prefix4, Buffer.from([0x41, 0x88]), Buffer.alloc(10, 0xaa)]);
+  const freshIdrChunk = Buffer.concat([sps2, pps2, idr2, delimiterSlice]);
+
+  encoder.feedStream(freshIdrChunk);
+
+  const recoveryPackets = await recoveryPromise;
+  assert.ok(Array.isArray(recoveryPackets) && recoveryPackets.length >= 3, 'Must resolve with fresh IDR packets');
+
+  // Verify that the payload of the fresh IDR contains the new bytes (0x99), not old bytes (0x33)
+  const freshIdrPacket = recoveryPackets.find(p => (p[12] & 0x1f) === NAL_TYPES.IDR);
+  assert.ok(freshIdrPacket, 'Must contain IDR packet');
+  assert.ok(freshIdrPacket.includes(0x99), 'Fresh IDR must contain new frame data, not old cached data');
+  assert.equal(freshIdrPacket.includes(0x33), false, 'Fresh IDR must not contain old frame data');
+  assert.equal(encoder._keyframeRequested, false, 'Pending keyframe request must be cleared');
+});
+
+test('Test B (Coalescing) — multiple keyframe requests are coalesced into a single pending request', async () => {
+  const encoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
+  const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+
+  // Multiple requests arrive in rapid succession
+  const p1 = encoder.requestKeyframe();
+  const p2 = encoder.requestKeyframe();
+  const p3 = encoder.requestKeyframe();
+  const p4 = encoder.requestKeyframe();
+
+  // Verify coalescing: All calls return the EXACT same pending promise
+  assert.equal(p1, p2, 'p1 and p2 must be the exact same promise');
+  assert.equal(p2, p3, 'p2 and p3 must be the exact same promise');
+  assert.equal(p3, p4, 'p3 and p4 must be the exact same promise');
+  assert.equal(encoder.metrics.keyframeRequests, 4, 'Metrics must record all 4 incoming requests');
+  assert.equal(encoder._keyframeRequested, true, 'Active requested flag must be true');
+
+  // Feed one fresh IDR
   const sps = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00]), Buffer.alloc(10, 0x11)]);
   const pps = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x22)]);
   const idr = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(40, 0x33)]);
-  const keyframeBuffer = Buffer.concat([sps, pps, idr]);
+  const delim = Buffer.concat([prefix4, Buffer.from([0x41, 0x88]), Buffer.alloc(10, 0x44)]);
+  encoder.feedStream(Buffer.concat([sps, pps, idr, delim]));
 
-  const initialPackets = encoder.packetize(keyframeBuffer, 30);
-  assert.ok(initialPackets.length >= 3);
-  const initialTs = initialPackets[0].readUInt32BE(4);
-  const initialLastSeq = initialPackets[initialPackets.length - 1].readUInt16BE(2);
-
-  // Delta frame
-  const nonIdr = Buffer.concat([prefix4, Buffer.from([0x41, 0x88]), Buffer.alloc(30, 0x44)]);
-  encoder.packetize(nonIdr, 30);
-
-  // Client requests keyframe
-  let keyframeRequestedEmitted = false;
-  encoder.on('keyframe_requested', () => {
-    keyframeRequestedEmitted = true;
-  });
-
-  const recoveryPackets = encoder.requestKeyframe();
-  assert.equal(keyframeRequestedEmitted, true, 'Must emit keyframe_requested event');
-  assert.equal(encoder.metrics.keyframeRequests, 1);
-  assert.ok(recoveryPackets.length >= 3, 'Must return recovery packets for SPS, PPS, and IDR');
-
-  // Verify recovery packets have a FRESH RTP timestamp
-  const recoveryTs = recoveryPackets[0].readUInt32BE(4);
-  assert.notEqual(recoveryTs, initialTs, 'Recovery packets must have a new, fresh RTP timestamp');
-
-  // Verify sequence numbers continue monotonically
-  const recoveryFirstSeq = recoveryPackets[0].readUInt16BE(2);
-  assert.ok(recoveryFirstSeq > initialLastSeq, 'Sequence numbers must continue monotonically');
-
-  // Verify marker bit is set ONLY on the final recovery packet
-  for (let i = 0; i < recoveryPackets.length - 1; i++) {
-    assert.equal(recoveryPackets[i][1] & 0x80, 0, `Recovery packet ${i} must have M=0`);
-  }
-  const finalRecoveryPacket = recoveryPackets[recoveryPackets.length - 1];
-  assert.equal(finalRecoveryPacket[1] & 0x80, 0x80, 'Final recovery packet must have M=1');
+  const [res1, res2, res3, res4] = await Promise.all([p1, p2, p3, p4]);
+  assert.equal(res1, res2);
+  assert.equal(res2, res3);
+  assert.equal(res3, res4);
+  assert.equal(encoder._keyframeRequested, false, 'Keyframe request state must be cleared after resolution');
+  assert.equal(encoder._pendingKeyframeResolvers.length, 0, 'Resolver queue must be empty (bounded)');
 });
+
+test('Test C (RTP Continuity) — sequence numbers, SSRC, and timestamps advance continuously across recovery IDR', () => {
+  const encoder = new VideoEncoder({ payloadType: 98, ssrc: 8888, mtu: 1200, fps: 30 });
+  const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+
+  // Frame 1: P-frame
+  const p1 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x11)]), type: NAL_TYPES.NON_IDR }];
+  const pkts1 = encoder.packetizeAccessUnit(p1, 30);
+  const ts1 = pkts1[0].readUInt32BE(4);
+  const seq1 = pkts1[0].readUInt16BE(2);
+  const ssrc1 = pkts1[0].readUInt32BE(8);
+  assert.equal(ssrc1, 8888);
+
+  // Frame 2: P-frame
+  const p2 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x22)]), type: NAL_TYPES.NON_IDR }];
+  const pkts2 = encoder.packetizeAccessUnit(p2, 30);
+  const ts2 = pkts2[0].readUInt32BE(4);
+  const seq2 = pkts2[0].readUInt16BE(2);
+  assert.equal(ts2, (ts1 + 3000) >>> 0);
+  assert.equal(seq2, (seq1 + 1) & 0xffff);
+
+  // Keyframe request arrives
+  encoder.requestKeyframe();
+
+  // Frame 3: Fresh IDR Access Unit (SPS, PPS, IDR)
+  const idrAu = [
+    { data: Buffer.from([0x67, 0x42, 0x00, 0x0a]), type: NAL_TYPES.SPS },
+    { data: Buffer.from([0x68, 0xce, 0x01]), type: NAL_TYPES.PPS },
+    { data: Buffer.concat([Buffer.from([0x65, 0x88]), Buffer.alloc(100, 0x33)]), type: NAL_TYPES.IDR },
+  ];
+  const idrPkts = encoder.packetizeAccessUnit(idrAu, 30);
+  assert.equal(idrPkts.length, 3);
+
+  const idrTs = idrPkts[0].readUInt32BE(4);
+  assert.equal(idrTs, (ts2 + 3000) >>> 0, 'Fresh IDR timestamp must advance normally');
+  assert.equal(idrPkts[1].readUInt32BE(4), idrTs, 'All packets of IDR AU must share the same timestamp');
+  assert.equal(idrPkts[2].readUInt32BE(4), idrTs, 'All packets of IDR AU must share the same timestamp');
+
+  assert.equal(idrPkts[0].readUInt16BE(2), (seq2 + 1) & 0xffff, 'Sequence numbers must continue without gap');
+  assert.equal(idrPkts[1].readUInt16BE(2), (seq2 + 2) & 0xffff);
+  assert.equal(idrPkts[2].readUInt16BE(2), (seq2 + 3) & 0xffff);
+
+  assert.equal(idrPkts[0].readUInt32BE(8), 8888, 'SSRC must remain unchanged');
+  assert.equal(idrPkts[1].readUInt32BE(8), 8888);
+  assert.equal(idrPkts[2].readUInt32BE(8), 8888);
+
+  // Frame 4: P-frame after recovery IDR
+  const p4 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x44)]), type: NAL_TYPES.NON_IDR }];
+  const pkts4 = encoder.packetizeAccessUnit(p4, 30);
+  const ts4 = pkts4[0].readUInt32BE(4);
+  const seq4 = pkts4[0].readUInt16BE(2);
+
+  assert.equal(ts4, (idrTs + 3000) >>> 0, 'Next P-frame timestamp must advance normally');
+  assert.equal(seq4, (idrPkts[2].readUInt16BE(2) + 1) & 0xffff, 'Next P-frame seq must continue from last IDR packet');
+  assert.equal(pkts4[0].readUInt32BE(8), 8888, 'SSRC must remain unchanged');
+});
+
+test('Test D (Marker Bit) — fresh IDR Access Unit sets M=1 only on the final RTP packet', () => {
+  // Use mtu = 500 so IDR slice is fragmented into multiple FU-A packets
+  const encoder = new VideoEncoder({ payloadType: 98, ssrc: 7777, mtu: 500, fps: 30 });
+
+  const freshIdrAu = [
+    { data: Buffer.from([0x67, 0x42, 0x00, 0x0a]), type: NAL_TYPES.SPS },
+    { data: Buffer.from([0x68, 0xce, 0x01]), type: NAL_TYPES.PPS },
+    { data: Buffer.concat([Buffer.from([0x65, 0x88]), Buffer.alloc(1200, 0x55)]), type: NAL_TYPES.IDR },
+  ];
+
+  const packets = encoder.packetizeAccessUnit(freshIdrAu, 30);
+  assert.ok(packets.length >= 4, 'Must produce multiple packets including FU-A');
+
+  // Verify all packets except the final packet have M=0
+  for (let i = 0; i < packets.length - 1; i++) {
+    const marker = (packets[i][1] & 0x80) !== 0;
+    assert.equal(marker, false, `Packet ${i} of fresh IDR AU must have Marker bit M=0`);
+  }
+
+  // Verify the final packet of the fresh IDR AU has M=1
+  const finalPacket = packets[packets.length - 1];
+  const finalMarker = (finalPacket[1] & 0x80) !== 0;
+  assert.equal(finalMarker, true, 'Final packet of fresh IDR AU must have Marker bit M=1');
+});
+

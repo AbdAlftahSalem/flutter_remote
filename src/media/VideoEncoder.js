@@ -71,6 +71,11 @@ export class VideoEncoder extends EventEmitter {
     this._auHasVcl = false;
     this._flushTimer = null;
 
+    // Fresh IDR Recovery & Coalescing State
+    this._keyframeRequested = false;
+    this._pendingKeyframeResolvers = [];
+    this._pendingKeyframePromise = null;
+
     // Diagnostics & Metrics
     this.metrics = {
       inputReceived: 0,
@@ -428,10 +433,37 @@ export class VideoEncoder extends EventEmitter {
     this.inspectAndCacheNals(auNals);
     this.metrics.encodedFrames++;
 
+    const isIdrAU = auNals.some(n => n.type === NAL_TYPES.IDR);
+
     const packets = this.packetizeAccessUnit(auNals, this.fps);
     if (packets.length > 0) {
       this.emit('packets', packets);
     }
+
+    if (isIdrAU) {
+      if (this._keyframeRequested) {
+        console.log(`[video] fresh IDR encoded (total keyframes: ${this.metrics.keyframes}, requests: ${this.metrics.keyframeRequests})`);
+        this.emit('fresh_keyframe_encoded', {
+          packets,
+          auNals,
+          keyframeCount: this.metrics.keyframes,
+          requestCount: this.metrics.keyframeRequests,
+        });
+        this._keyframeRequested = false;
+      }
+
+      if (this._pendingKeyframeResolvers.length > 0) {
+        const resolvers = this._pendingKeyframeResolvers;
+        this._pendingKeyframeResolvers = [];
+        this._pendingKeyframePromise = null;
+        for (const resolve of resolvers) {
+          try {
+            resolve(packets);
+          } catch {}
+        }
+      }
+    }
+
     return auNals;
   }
 
@@ -563,16 +595,24 @@ export class VideoEncoder extends EventEmitter {
 
   /**
    * Handles client keyframe requests.
-   * Emits keyframe_requested event and returns fresh recovery packets.
+   * Emits keyframe_requested event, coalesces rapid requests, and returns a promise
+   * resolving with the fresh IDR packets when encoded by the live pipeline.
+   * Does NOT replay cachedKeyframe as recovery mechanism.
    */
   requestKeyframe() {
     this.metrics.keyframeRequests++;
-    this.emit('keyframe_requested');
+    console.log(`[video] keyframe request received (request count: ${this.metrics.keyframeRequests})`);
+    this.emit('keyframe_requested', { count: this.metrics.keyframeRequests });
 
-    if (this.hasKeyframe()) {
-      return this.getKeyframePackets();
+    this._keyframeRequested = true;
+
+    if (!this._pendingKeyframePromise) {
+      this._pendingKeyframePromise = new Promise((resolve) => {
+        this._pendingKeyframeResolvers.push(resolve);
+      });
     }
-    return [];
+
+    return this._pendingKeyframePromise;
   }
 
   /**
@@ -729,5 +769,14 @@ export class VideoEncoder extends EventEmitter {
     this._pendingQueue = [];
     this._waitingForDrain = false;
     this._hasDrainListener = false;
+
+    if (this._pendingKeyframeResolvers.length > 0) {
+      for (const resolve of this._pendingKeyframeResolvers) {
+        try { resolve([]); } catch {}
+      }
+      this._pendingKeyframeResolvers = [];
+      this._pendingKeyframePromise = null;
+    }
+    this._keyframeRequested = false;
   }
 }
