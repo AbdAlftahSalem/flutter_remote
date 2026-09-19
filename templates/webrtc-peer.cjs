@@ -1,20 +1,23 @@
-// flutter-remote-template-version: 2
+// flutter-remote-template-version: 3
 /**
- * flutter-remote WebRTC & WebSocket Bridge.
+ * flutter-remote WebRTC V2 & Legacy Bridge.
  *
- * 1. Bridges WebRTC DataChannel HID messages directly to serve-sim's local /ws endpoint.
- * 2. Provides a zero-buffering /stream-ws endpoint that listens for simulator frame
- *    changes and pushes raw JPEG frames directly over WebSocket.
+ * 1. WebRTC Video Track (H.264/VP8) streaming frames directly to browser <video>.
+ * 2. WebRTC DataChannels (input, keyboard, control, telemetry) for low-latency HID.
+ * 3. Fallback /stream-ws endpoint for change-only socket streaming in legacy mode.
  */
 const http = require('node:http');
 
+let ndc;
 let PeerConnection;
+let Video;
 let WebSocket;
 let WebSocketServer;
 
 try {
-  const ndc = require('node-datachannel');
+  ndc = require('node-datachannel');
   PeerConnection = ndc.PeerConnection;
+  Video = ndc.Video;
 } catch (e) {
   console.error('[webrtc-peer] node-datachannel not found:', e.message);
 }
@@ -29,6 +32,7 @@ try {
 
 const PREVIEW_PORT = Number(process.env.FLUTTER_REMOTE_TARGET_PORT || process.env.PREVIEW_PORT || 3200);
 const SIGNAL_PORT = Number(process.env.FLUTTER_REMOTE_WEBRTC_SIGNAL_PORT || 3201);
+const TRANSPORT_MODE = process.env.FLUTTER_REMOTE_TRANSPORT || 'webrtc';
 const TARGET_HOST = '127.0.0.1';
 
 process.on('uncaughtException', (err) => {
@@ -38,10 +42,38 @@ process.on('unhandledRejection', (reason) => {
   console.error('[webrtc-peer unhandledRejection]', reason);
 });
 
+// Simple RTP packetizer for video frames
+function packetizeFrame(frameBuffer, payloadType = 98, ssrc = 12345, seqState = { seq: 1, ts: 0 }) {
+  const mtu = 1200;
+  const payloadSize = mtu - 12;
+  const totalChunks = Math.ceil(frameBuffer.length / payloadSize);
+  const packets = [];
+
+  seqState.ts = (seqState.ts + 3000) >>> 0;
+
+  for (let i = 0; i < totalChunks; i++) {
+    const isLast = (i === totalChunks - 1);
+    const start = i * payloadSize;
+    const end = Math.min(start + payloadSize, frameBuffer.length);
+    const chunk = frameBuffer.subarray(start, end);
+
+    const rtp = Buffer.alloc(12 + chunk.length);
+    rtp[0] = 0x80;
+    rtp[1] = (isLast ? 0x80 : 0x00) | (payloadType & 0x7f);
+    rtp.writeUInt16BE(seqState.seq & 0xffff, 2);
+    seqState.seq = (seqState.seq + 1) & 0xffff;
+    rtp.writeUInt32BE(seqState.ts, 4);
+    rtp.writeUInt32BE(ssrc, 8);
+    chunk.copy(rtp, 12);
+    packets.push(rtp);
+  }
+  return packets;
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, peer: 'running', targetPort: PREVIEW_PORT }));
+    res.end(JSON.stringify({ ok: true, peer: 'running', mode: TRANSPORT_MODE, targetPort: PREVIEW_PORT }));
     return;
   }
   res.writeHead(404);
@@ -51,12 +83,13 @@ const server = http.createServer((req, res) => {
 if (WebSocketServer) {
   const wss = new WebSocketServer({ server });
 
-  // ─── Stream WebSocket: Listen for simulator changes & broadcast JPEGs ───
   const streamWsClients = new Set();
+  const activeVideoTracks = new Set();
   let localStreamReq = null;
+  const rtpSeqState = { seq: 1, ts: 0 };
 
   function ensureLocalStream() {
-    if (localStreamReq || streamWsClients.size === 0) return;
+    if (localStreamReq || (streamWsClients.size === 0 && activeVideoTracks.size === 0)) return;
 
     console.log('[webrtc-peer] Starting local MJPEG stream consumer from serve-sim');
     localStreamReq = http.get(
@@ -79,11 +112,21 @@ if (WebSocketServer) {
 
             const jpeg = buffer.subarray(soi, eoi + 2);
 
-            // Broadcast raw JPEG frame to all connected WebSocket clients
+            // 1. Broadcast raw JPEG to WebSocket clients (legacy fallback)
             for (const client of streamWsClients) {
               if (client.readyState === 1 /* OPEN */) {
+                try { client.send(jpeg); } catch {}
+              }
+            }
+
+            // 2. Packetize and send to WebRTC video tracks
+            if (activeVideoTracks.size > 0) {
+              const rtpPackets = packetizeFrame(jpeg, 98, 12345, rtpSeqState);
+              for (const track of activeVideoTracks) {
                 try {
-                  client.send(jpeg);
+                  for (const packet of rtpPackets) {
+                    track.sendMessageBinary(packet);
+                  }
                 } catch {}
               }
             }
@@ -92,7 +135,6 @@ if (WebSocketServer) {
             soi = buffer.indexOf(Buffer.from([0xff, 0xd8]));
           }
 
-          // Safeguard against memory leak if no valid JPEG boundary found
           if (buffer.length > 5 * 1024 * 1024) {
             buffer = Buffer.alloc(0);
           }
@@ -100,7 +142,7 @@ if (WebSocketServer) {
 
         res.on('end', () => {
           localStreamReq = null;
-          if (streamWsClients.size > 0) {
+          if (streamWsClients.size > 0 || activeVideoTracks.size > 0) {
             setTimeout(ensureLocalStream, 1000);
           }
         });
@@ -108,7 +150,7 @@ if (WebSocketServer) {
         res.on('error', (err) => {
           console.error('[webrtc-peer local stream error]', err.message);
           localStreamReq = null;
-          if (streamWsClients.size > 0) {
+          if (streamWsClients.size > 0 || activeVideoTracks.size > 0) {
             setTimeout(ensureLocalStream, 1000);
           }
         });
@@ -118,7 +160,7 @@ if (WebSocketServer) {
     localStreamReq.on('error', (err) => {
       console.error('[webrtc-peer local stream request error]', err.message);
       localStreamReq = null;
-      if (streamWsClients.size > 0) {
+      if (streamWsClients.size > 0 || activeVideoTracks.size > 0) {
         setTimeout(ensureLocalStream, 1000);
       }
     });
@@ -127,7 +169,7 @@ if (WebSocketServer) {
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url, 'http://localhost');
 
-    // Handle /stream-ws: Change-only socket frame streaming
+    // Handle /stream-ws: Change-only socket frame streaming (legacy fallback)
     if (url.pathname === '/stream-ws') {
       console.log('[webrtc-peer] Client connected to /stream-ws');
       streamWsClients.add(ws);
@@ -135,19 +177,18 @@ if (WebSocketServer) {
 
       ws.on('close', () => {
         streamWsClients.delete(ws);
-        if (streamWsClients.size === 0 && localStreamReq) {
-          try {
-            localStreamReq.destroy();
-          } catch {}
+        if (streamWsClients.size === 0 && activeVideoTracks.size === 0 && localStreamReq) {
+          try { localStreamReq.destroy(); } catch {}
           localStreamReq = null;
         }
       });
       return;
     }
 
-    // Handle /signal: WebRTC DataChannel signaling
+    // Handle /signal: WebRTC Media & DataChannel signaling
     console.log('[webrtc-peer] Client connected to signaling');
     let peer = null;
+    let videoTrack = null;
     let serveSimWs = null;
 
     function getServeSimWs() {
@@ -171,11 +212,7 @@ if (WebSocketServer) {
             return;
           }
 
-          const rawIceServers = Array.isArray(msg.iceServers) && msg.iceServers.length > 0
-            ? msg.iceServers
-            : ['stun:stun.cloudflare.com:3478'];
-
-          // Normalize iceServers format for node-datachannel
+          const rawIceServers = (msg.payload && msg.payload.iceServers) || msg.iceServers || ['stun:stun.cloudflare.com:3478'];
           const iceServers = [];
           for (const item of rawIceServers) {
             if (typeof item === 'string') {
@@ -184,43 +221,60 @@ if (WebSocketServer) {
               const urls = item.urls || item.url;
               if (Array.isArray(urls)) {
                 for (const u of urls) {
-                  if (item.username && item.credential) {
-                    iceServers.push({ urls: u, username: item.username, credential: item.credential });
-                  } else {
-                    iceServers.push(u);
-                  }
+                  iceServers.push(item.username && item.credential ? { urls: u, username: item.username, credential: item.credential } : u);
                 }
               } else if (urls) {
-                if (item.username && item.credential) {
-                  iceServers.push({ urls, username: item.username, credential: item.credential });
-                } else {
-                  iceServers.push(urls);
-                }
+                iceServers.push(item.username && item.credential ? { urls, username: item.username, credential: item.credential } : urls);
               }
             }
           }
 
           peer = new PeerConnection('serve-sim-peer', { iceServers });
 
+          // Add Video track in V2 mode
+          if (Video && TRANSPORT_MODE !== 'v1') {
+            try {
+              const video = new Video('video', 'SendOnly');
+              video.addH264Codec(98);
+              video.addVP8Codec(97);
+              videoTrack = peer.addTrack(video);
+              activeVideoTracks.add(videoTrack);
+              ensureLocalStream();
+            } catch (err) {
+              console.warn('[webrtc-peer video track error]', err.message);
+            }
+          }
+
           peer.onLocalDescription((sdp, type) => {
             if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type, sdp }));
+              ws.send(JSON.stringify({
+                v: 2,
+                type,
+                generation: msg.generation || 1,
+                payload: { sdp },
+              }));
             }
           });
 
           peer.onLocalCandidate((candidate, mid) => {
             if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'candidate', candidate: { candidate, sdpMid: mid } }));
+              ws.send(JSON.stringify({
+                v: 2,
+                type: 'ice-candidate',
+                generation: msg.generation || 1,
+                payload: { candidate, sdpMid: mid },
+              }));
             }
           });
 
           peer.onDataChannel((dc) => {
-            console.log('[webrtc-peer] DataChannel opened:', dc.getLabel ? dc.getLabel() : 'hid');
+            const label = dc.getLabel ? dc.getLabel() : 'input';
+            console.log('[webrtc-peer] DataChannel opened:', label);
             const simWs = getServeSimWs();
 
-            dc.onMessage((hidMsg) => {
+            dc.onMessage((rawMsg) => {
               if (simWs.readyState === WebSocket.OPEN) {
-                simWs.send(hidMsg);
+                simWs.send(rawMsg);
               }
             });
 
@@ -235,20 +289,26 @@ if (WebSocketServer) {
             });
           });
 
-          peer.setRemoteDescription(msg.sdp, 'offer');
-        } else if (msg.type === 'candidate' && peer) {
-          if (msg.candidate && msg.candidate.candidate) {
-            const mid = msg.candidate.sdpMid || '0';
-            peer.addRemoteCandidate(msg.candidate.candidate, mid);
+          const offerSdp = (msg.payload && msg.payload.sdp) || msg.sdp;
+          peer.setRemoteDescription(offerSdp, 'offer');
+        } else if ((msg.type === 'ice-candidate' || msg.type === 'candidate') && peer) {
+          const candidateData = msg.payload || msg.candidate;
+          if (candidateData && candidateData.candidate) {
+            const mid = candidateData.sdpMid || '0';
+            peer.addRemoteCandidate(candidateData.candidate, mid);
           }
         }
       } catch (err) {
-        console.error('[webrtc-peer signaling message error]', err.message);
+        console.error('[webrtc-peer signaling error]', err.message);
       }
     });
 
     ws.on('close', () => {
       console.log('[webrtc-peer] Client disconnected from signaling');
+      if (videoTrack) {
+        activeVideoTracks.delete(videoTrack);
+        videoTrack = null;
+      }
       if (peer) {
         try { peer.close(); } catch {}
         peer = null;
@@ -262,5 +322,5 @@ if (WebSocketServer) {
 }
 
 server.listen(SIGNAL_PORT, TARGET_HOST, () => {
-  console.log(`[webrtc-peer] listening on ${TARGET_HOST}:${SIGNAL_PORT} -> serve-sim :${PREVIEW_PORT}`);
+  console.log(`[webrtc-peer] listening on ${TARGET_HOST}:${SIGNAL_PORT} -> serve-sim :${PREVIEW_PORT} (mode: ${TRANSPORT_MODE})`);
 });

@@ -36,5 +36,9 @@
   "bugs": {
     "url": "https://github.com/AbdAlftahSalem/flutter_remote/issues"
   },
-  "homepage": "https://github.com/AbdAlftahSalem/flutter_remote#readme"
+  "homepage": "https://github.com/AbdAlftahSalem/flutter_remote#readme",
+  "devDependencies": {
+    "node-datachannel": "^0.33.4",
+    "ws": "^8.21.3"
+  }
 }

@@ -130,13 +130,13 @@ export async function up(cwd, flags = {}) {
     export_app: flags.export ? 'true' : 'false',
     agent_device: flags.agent ? 'true' : 'false',
     agent_device_version: '0.20.1',
-    transport: flags.transport ?? 'http',
+    transport: flags.transport ?? process.env.FLUTTER_REMOTE_TRANSPORT ?? 'webrtc',
     // 'quic' = QUIC/HTTP3 (UDP-based, handles packet loss better than TCP).
     // Falls back to http2 automatically if UDP is blocked.
     tunnel_protocol: flags['tunnel-protocol'] ?? 'quic',
-    // 'mjpeg' → stable, no black-screen reconnect loops on virtual machines.
-    // 'auto' → H.264 hardware (VideoToolbox)
-    codec: flags.codec ?? 'mjpeg',
+    // 'auto' → H.264 hardware (VideoToolbox) on V2 WebRTC
+    // 'mjpeg' → stable fallback
+    codec: flags.codec ?? 'auto',
     // Note: serve-sim streams at the simulator's native resolution and 60 FPS.
     // The flags below are accepted for backward compatibility but are no-ops;
     // serve-sim does not expose --fps, --quality, or --max-dimension CLI options.

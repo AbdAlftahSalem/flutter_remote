@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 7
+// flutter-remote-template-version: 8
 /**
  * flutter-remote auth gate.
  *
@@ -8,13 +8,10 @@
  * an HttpOnly cookie, and forwards everything (including the MJPEG/H.264 stream and
  * the control WebSocket) to serve-sim on localhost.
  *
- * Design goals:
- *   1. Zero buffering on streaming responses (MJPEG / H.264 / AVCC / SSE).
- *      Cloudflare may buffer responses unless we send the right headers.
- *   2. Zero latency on WebSocket HID input (touch/keyboard → simulator).
- *      TCP_NODELAY + raw socket pipe keeps per-frame overhead under 1ms.
- *   3. Low-latency WebRTC DataChannel for direct P2P HID input.
- *   4. Direct /stream-ws change-only socket streaming to eliminate black screens.
+ * V2 ARCHITECTURE:
+ *   - Serves modern V2 WebRTC client at /__flutter-remote/client.js (zero monkey patching)
+ *   - Injects /__flutter-remote/client.js by default
+ *   - Preserves legacy /__flutter-remote/webrtc-hid.js when FLUTTER_REMOTE_TRANSPORT=v1
  */
 const http = require('node:http');
 const net = require('node:net');
@@ -23,6 +20,7 @@ const TOKEN = process.env.FLUTTER_REMOTE_GATE_TOKEN || '';
 const TARGET_PORT = Number(process.env.FLUTTER_REMOTE_TARGET_PORT || 3200);
 const AGENT_PORT = Number(process.env.FLUTTER_REMOTE_AGENT_PORT || 0);
 const WEBRTC_SIGNAL_PORT = Number(process.env.FLUTTER_REMOTE_WEBRTC_SIGNAL_PORT || 3201);
+const TRANSPORT_MODE = process.env.FLUTTER_REMOTE_TRANSPORT || 'webrtc';
 const AGENT_PREFIX = '/agent-device';
 const TARGET_HOST = '127.0.0.1';
 const PORT = Number(process.env.FLUTTER_REMOTE_GATE_PORT || 3199);
@@ -166,15 +164,325 @@ function getTurnConfig() {
   return turnFetchPromise;
 }
 
-const WEBRTC_CLIENT_SCRIPT = `
+const WEBRTC_CLIENT_SCRIPT_V2 = `
+(function() {
+  'use strict';
+  if (window.__flutterRemoteV2Injected) return;
+  window.__flutterRemoteV2Injected = true;
+
+  const PROTOCOL_VERSION = 2;
+  const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
+
+  class FlutterRemoteClient {
+    constructor() {
+      const urlParams = new URLSearchParams(window.location.search);
+      this.sessionId = urlParams.get('session') || 'active';
+      this.token = urlParams.get('k') || '';
+      this.debugMode = urlParams.get('debug') === '1';
+      this.generation = 1;
+      this.peer = null;
+      this.signalingWs = null;
+      this.dataChannels = {};
+      this.reconnectAttempt = 0;
+      this.reconnectTimer = null;
+      this.rtt = 0;
+
+      this.metrics = {
+        rtt: 0,
+        fps: 0,
+        connectionState: 'IDLE',
+        iceState: 'new',
+        reconnects: 0,
+      };
+
+      this.elements = {};
+      this._initDOM();
+      this._initInputEngine();
+      this._connectSignaling();
+    }
+
+    _initDOM() {
+      const container = document.getElementById('flutter-remote-container') || document.body;
+
+      let video = document.getElementById('flutter-remote-video');
+      if (!video) {
+        video = document.createElement('video');
+        video.id = 'flutter-remote-video';
+        video.autoplay = true;
+        video.playsInline = true;
+        video.muted = true;
+        video.style.cssText = 'width:100%;height:100%;object-fit:contain;background:#000;display:block;';
+        container.appendChild(video);
+      }
+      this.elements.video = video;
+
+      let overlay = document.getElementById('flutter-remote-input-overlay');
+      if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'flutter-remote-input-overlay';
+        overlay.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;touch-action:none;cursor:pointer;z-index:10;';
+        container.style.position = 'relative';
+        container.appendChild(overlay);
+      }
+      this.elements.overlay = overlay;
+
+      let status = document.getElementById('flutter-remote-status');
+      if (!status) {
+        status = document.createElement('div');
+        status.id = 'flutter-remote-status';
+        status.style.cssText = 'position:absolute;top:10px;left:50%;transform:translateX(-50%);padding:6px 14px;background:rgba(0,0,0,0.75);color:#fff;border-radius:20px;font:12px sans-serif;z-index:20;transition:opacity 0.3s;pointer-events:none;';
+        container.appendChild(status);
+      }
+      this.elements.status = status;
+
+      if (this.debugMode) {
+        const debugPanel = document.createElement('div');
+        debugPanel.id = 'flutter-remote-debug-panel';
+        debugPanel.style.cssText = 'position:absolute;bottom:10px;left:10px;padding:10px;background:rgba(0,0,0,0.85);color:#0f0;font:11px monospace;border-radius:6px;z-index:30;pointer-events:none;line-height:1.4;';
+        container.appendChild(debugPanel);
+        this.elements.debugPanel = debugPanel;
+        setInterval(() => this._updateDebug(), 1000);
+      }
+
+      this._updateStatus('Connecting to remote simulator...');
+    }
+
+    _updateStatus(text) {
+      if (this.elements.status) {
+        this.elements.status.textContent = text;
+        this.elements.status.style.opacity = '1';
+        if (text === 'Connected') {
+          setTimeout(() => {
+            if (this.elements.status.textContent === 'Connected') {
+              this.elements.status.style.opacity = '0';
+            }
+          }, 2000);
+        }
+      }
+    }
+
+    _initInputEngine() {
+      const overlay = this.elements.overlay;
+      let nextSeq = 1;
+      let pendingMove = null;
+      let rafId = null;
+
+      const sendPointer = (data) => {
+        const dc = this.dataChannels.input;
+        if (dc && dc.readyState === 'open') {
+          if (dc.bufferedAmount > 65536 && data.event === 'move') return;
+          dc.send(JSON.stringify(data));
+        }
+      };
+
+      const flush = () => {
+        if (pendingMove) {
+          sendPointer(pendingMove);
+          pendingMove = null;
+        }
+        rafId = null;
+      };
+
+      const handlePointer = (e, type) => {
+        const rect = this.elements.video.getBoundingClientRect();
+        const videoWidth = this.elements.video.videoWidth || 720;
+        const videoHeight = this.elements.video.videoHeight || 1280;
+        const containerAspect = rect.width / rect.height;
+        const videoAspect = videoWidth / videoHeight;
+
+        let dispW = rect.width;
+        let dispH = rect.height;
+        let offX = 0;
+        let offY = 0;
+
+        if (containerAspect > videoAspect) {
+          dispW = rect.height * videoAspect;
+          offX = (rect.width - dispW) / 2;
+        } else {
+          dispH = rect.width / videoAspect;
+          offY = (rect.height - dispH) / 2;
+        }
+
+        const rawX = e.clientX - rect.left - offX;
+        const rawY = e.clientY - rect.top - offY;
+        const normX = Math.max(0, Math.min(1, rawX / dispW));
+        const normY = Math.max(0, Math.min(1, rawY / dispH));
+
+        const evt = {
+          v: PROTOCOL_VERSION,
+          type: 'pointer',
+          seq: nextSeq++,
+          ts: Date.now(),
+          event: type,
+          pointerId: e.pointerId || 1,
+          x: Number(normX.toFixed(5)),
+          y: Number(normY.toFixed(5)),
+          button: e.button || 0,
+          buttons: e.buttons !== undefined ? e.buttons : 1,
+        };
+
+        if (type === 'down') {
+          try { overlay.setPointerCapture(e.pointerId); } catch {}
+          if (rafId) { cancelAnimationFrame(rafId); flush(); }
+          sendPointer(evt);
+        } else if (type === 'up' || type === 'cancel') {
+          try { overlay.releasePointerCapture(e.pointerId); } catch {}
+          if (rafId) { cancelAnimationFrame(rafId); flush(); }
+          sendPointer(evt);
+        } else if (type === 'move') {
+          pendingMove = evt;
+          if (!rafId) rafId = requestAnimationFrame(flush);
+        }
+      };
+
+      overlay.addEventListener('pointerdown', (e) => handlePointer(e, 'down'));
+      overlay.addEventListener('pointermove', (e) => handlePointer(e, 'move'));
+      overlay.addEventListener('pointerup', (e) => handlePointer(e, 'up'));
+      overlay.addEventListener('pointercancel', (e) => handlePointer(e, 'cancel'));
+
+      window.addEventListener('keydown', (e) => {
+        const dc = this.dataChannels.keyboard;
+        if (dc && dc.readyState === 'open') {
+          dc.send(JSON.stringify({ v: PROTOCOL_VERSION, type: 'keyboard', seq: nextSeq++, ts: Date.now(), event: 'keydown', key: e.key, code: e.code }));
+        }
+      });
+
+      window.addEventListener('keyup', (e) => {
+        const dc = this.dataChannels.keyboard;
+        if (dc && dc.readyState === 'open') {
+          dc.send(JSON.stringify({ v: PROTOCOL_VERSION, type: 'keyboard', seq: nextSeq++, ts: Date.now(), event: 'keyup', key: e.key, code: e.code }));
+        }
+      });
+    }
+
+    async _connectSignaling() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url = proto + '//' + location.host + '/signal?session=' + encodeURIComponent(this.sessionId) + '&k=' + encodeURIComponent(this.token);
+
+      this.signalingWs = new WebSocket(url);
+      this.signalingWs.onopen = async () => {
+        this._updateStatus('Negotiating WebRTC...');
+        await this._initPeer();
+      };
+
+      this.signalingWs.onmessage = async (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'answer' && this.peer) {
+            const sdp = (msg.payload && msg.payload.sdp) || msg.sdp;
+            await this.peer.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
+          } else if ((msg.type === 'ice-candidate' || msg.type === 'candidate') && this.peer) {
+            const cand = msg.payload || msg.candidate;
+            if (cand && cand.candidate) {
+              await this.peer.addIceCandidate(new RTCIceCandidate(cand));
+            }
+          }
+        } catch (err) {
+          console.warn('[flutter-remote client signaling error]', err);
+        }
+      };
+
+      this.signalingWs.onclose = () => {
+        this._scheduleReconnect();
+      };
+    }
+
+    async _initPeer() {
+      if (this.peer) {
+        try { this.peer.close(); } catch {}
+      }
+
+      let iceServers = [{ urls: 'stun:stun.cloudflare.com:3478' }];
+      try {
+        const res = await fetch('/ice-config');
+        const data = await res.json();
+        if (data && data.iceServers) iceServers = data.iceServers;
+      } catch {}
+
+      this.peer = new RTCPeerConnection({ iceServers });
+
+      this.peer.ontrack = (e) => {
+        if (e.streams && e.streams[0]) {
+          this.elements.video.srcObject = e.streams[0];
+        } else {
+          this.elements.video.srcObject = new MediaStream([e.track]);
+        }
+        this._updateStatus('Connected');
+        this.metrics.connectionState = 'CONNECTED';
+      };
+
+      const inputDc = this.peer.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
+      const keyboardDc = this.peer.createDataChannel('keyboard', { ordered: true });
+      const controlDc = this.peer.createDataChannel('control', { ordered: true });
+      const telemetryDc = this.peer.createDataChannel('telemetry', { ordered: false, maxRetransmits: 0 });
+
+      this.dataChannels = { input: inputDc, keyboard: keyboardDc, control: controlDc, telemetry: telemetryDc };
+
+      inputDc.onopen = () => {
+        this._updateStatus('Connected');
+        this.metrics.connectionState = 'CONNECTED';
+      };
+
+      this.peer.onicecandidate = (e) => {
+        if (e.candidate && this.signalingWs && this.signalingWs.readyState === WebSocket.OPEN) {
+          this.signalingWs.send(JSON.stringify({
+            v: PROTOCOL_VERSION,
+            type: 'ice-candidate',
+            generation: this.generation,
+            payload: e.candidate,
+          }));
+        }
+      };
+
+      const offer = await this.peer.createOffer({ offerToReceiveVideo: true });
+      await this.peer.setLocalDescription(offer);
+
+      this.signalingWs.send(JSON.stringify({
+        v: PROTOCOL_VERSION,
+        type: 'offer',
+        generation: this.generation,
+        payload: { sdp: offer.sdp, iceServers },
+      }));
+    }
+
+    _scheduleReconnect() {
+      if (this.reconnectTimer) return;
+      this.metrics.reconnects++;
+      const delay = BACKOFF_MS[Math.min(this.reconnectAttempt, BACKOFF_MS.length - 1)];
+      this.reconnectAttempt++;
+      this._updateStatus('Reconnecting... (Attempt ' + this.reconnectAttempt + ')');
+
+      this.reconnectTimer = setTimeout(async () => {
+        this.reconnectTimer = null;
+        this.generation++;
+        await this._connectSignaling();
+      }, delay);
+    }
+
+    _updateDebug() {
+      if (!this.elements.debugPanel) return;
+      this.elements.debugPanel.innerHTML =
+        '<div><strong>Flutter Remote V2 Diagnostics</strong></div>' +
+        '<div>Connection: ' + this.metrics.connectionState + '</div>' +
+        '<div>Reconnects: ' + this.metrics.reconnects + '</div>' +
+        '<div>Generation: ' + this.generation + '</div>';
+    }
+  }
+
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    new FlutterRemoteClient();
+  } else {
+    window.addEventListener('DOMContentLoaded', () => new FlutterRemoteClient());
+  }
+})();
+`;
+
+const WEBRTC_CLIENT_SCRIPT_LEGACY = `
 (function() {
   if (window.__flutterRemoteWebRTCInjected) return;
   window.__flutterRemoteWebRTCInjected = true;
 
-  // Pin codec to MJPEG in browser localStorage to prevent H.264 idle frame-stalls and black-screen reconnect loops
-  try {
-    localStorage.setItem('serve-sim:codec', 'mjpeg');
-  } catch (e) {}
+  try { localStorage.setItem('serve-sim:codec', 'mjpeg'); } catch (e) {}
 
   const OrigWebSocket = window.WebSocket;
   let rtcPeer = null;
@@ -182,56 +490,31 @@ const WEBRTC_CLIENT_SCRIPT = `
   let rtcReady = false;
   let signalingWs = null;
 
-  // 1. Direct change-only socket frame listener: paints frames as they change without HTTP stream stalls
   function initChangeSocket() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const streamWs = new OrigWebSocket(proto + '//' + location.host + '/stream-ws');
     streamWs.binaryType = 'blob';
-
     let lastBlobUrl = null;
 
     streamWs.onmessage = (event) => {
       if (!(event.data instanceof Blob)) return;
-
       const newBlobUrl = URL.createObjectURL(event.data);
-
-      // Find preview image or canvas in the DOM
       const img = document.querySelector('img[src*="blob:"], img[src*="/stream"], .simulator-frame img, [data-simulator] img');
       if (img) {
         img.src = newBlobUrl;
-        if (lastBlobUrl) {
-          URL.revokeObjectURL(lastBlobUrl);
-        }
+        if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
         lastBlobUrl = newBlobUrl;
-      } else {
-        const canvas = document.querySelector('canvas');
-        if (canvas) {
-          createImageBitmap(event.data).then((bmp) => {
-            const ctx = canvas.getContext('2d');
-            if (ctx) {
-              ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-            }
-            bmp.close();
-          }).catch(() => {});
-        }
       }
     };
-
-    streamWs.onclose = () => {
-      setTimeout(initChangeSocket, 2000);
-    };
+    streamWs.onclose = () => setTimeout(initChangeSocket, 2000);
   }
-
   try { initChangeSocket(); } catch (e) {}
 
-  // 2. WebRTC DataChannel for ultra-low latency HID input (~30ms)
   async function initWebRTC() {
     try {
       const res = await fetch('/ice-config');
       const iceConfig = await res.json();
-      if (!iceConfig || !iceConfig.iceServers || iceConfig.iceServers.length === 0) {
-        return;
-      }
+      if (!iceConfig || !iceConfig.iceServers || iceConfig.iceServers.length === 0) return;
 
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       signalingWs = new OrigWebSocket(proto + '//' + location.host + '/signal');
@@ -239,36 +522,19 @@ const WEBRTC_CLIENT_SCRIPT = `
       signalingWs.onopen = async () => {
         try {
           rtcPeer = new RTCPeerConnection(iceConfig);
-
           dataChannel = rtcPeer.createDataChannel('hid', { ordered: true });
           dataChannel.binaryType = 'arraybuffer';
-
-          dataChannel.onopen = () => {
-            console.log('[flutter-remote] WebRTC DataChannel active (ultra-low latency HID)');
-            rtcReady = true;
-          };
-
-          dataChannel.onclose = () => {
-            rtcReady = false;
-          };
-
+          dataChannel.onopen = () => { rtcReady = true; };
+          dataChannel.onclose = () => { rtcReady = false; };
           rtcPeer.onicecandidate = (e) => {
             if (e.candidate && signalingWs && signalingWs.readyState === OrigWebSocket.OPEN) {
               signalingWs.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }));
             }
           };
-
           const offer = await rtcPeer.createOffer();
           await rtcPeer.setLocalDescription(offer);
-
-          signalingWs.send(JSON.stringify({
-            type: 'offer',
-            sdp: offer.sdp,
-            iceServers: iceConfig.iceServers
-          }));
-        } catch (err) {
-          console.warn('[flutter-remote WebRTC init error]', err);
-        }
+          signalingWs.send(JSON.stringify({ type: 'offer', sdp: offer.sdp, iceServers: iceConfig.iceServers }));
+        } catch (err) {}
       };
 
       signalingWs.onmessage = async (e) => {
@@ -279,46 +545,26 @@ const WEBRTC_CLIENT_SCRIPT = `
           } else if (msg.type === 'candidate' && rtcPeer && msg.candidate) {
             await rtcPeer.addIceCandidate(new RTCIceCandidate(msg.candidate));
           }
-        } catch (err) {
-          console.warn('[flutter-remote WebRTC signaling message error]', err);
-        }
+        } catch (err) {}
       };
-    } catch (err) {
-      console.warn('[flutter-remote WebRTC error]', err);
-    }
+    } catch (err) {}
   }
-
   initWebRTC();
 
-  // 3. Monkey-patch WebSocket to route touches/typing over WebRTC DataChannel
   window.WebSocket = function(url, protocols) {
     const isHidWs = typeof url === 'string' && (url.endsWith('/ws') || url.includes('/ws?'));
     const ws = protocols ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
-
-    if (!isHidWs) {
-      return ws;
-    }
-
+    if (!isHidWs) return ws;
     const origSend = ws.send.bind(ws);
-
     ws.send = function(data) {
       if (rtcReady && dataChannel && dataChannel.readyState === 'open') {
-        try {
-          dataChannel.send(data);
-          return;
-        } catch (e) {}
+        try { dataChannel.send(data); return; } catch (e) {}
       }
       return origSend(data);
     };
-
     return ws;
   };
-
   window.WebSocket.prototype = OrigWebSocket.prototype;
-  window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
-  window.WebSocket.OPEN = OrigWebSocket.OPEN;
-  window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
-  window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
 })();
 `;
 
@@ -330,9 +576,15 @@ h1{font-size:1.1rem;margin-bottom:.5rem}code{background:#f3f4f6;padding:.15rem .
 <p>This stream is secured by a gate token. Use the full URL provided by <code>flutter-remote up</code>.</p>`;
 
 const server = http.createServer((req, res) => {
-  if (req.url.startsWith('/__flutter-remote/healthz')) {
+  if (req.url.startsWith('/__flutter-remote/healthz') || req.url.startsWith('/healthz')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, target: TARGET_PORT, agent: AGENT_PORT || null }));
+    res.end(JSON.stringify({ ok: true, target: TARGET_PORT, mode: TRANSPORT_MODE, agent: AGENT_PORT || null }));
+    return;
+  }
+
+  if (req.url.startsWith('/readyz')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, ready: true, mode: TRANSPORT_MODE }));
     return;
   }
 
@@ -358,13 +610,23 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // WebRTC client-side HID & Stream script
+  // V2 browser client script
+  if (pathnameOf(req) === '/__flutter-remote/client.js') {
+    res.writeHead(200, {
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Cache-Control': 'public, max-age=3600'
+    });
+    res.end(WEBRTC_CLIENT_SCRIPT_V2);
+    return;
+  }
+
+  // Legacy client-side HID & Stream script (for V1 rollback)
   if (pathnameOf(req) === '/__flutter-remote/webrtc-hid.js') {
     res.writeHead(200, {
       'Content-Type': 'application/javascript; charset=utf-8',
       'Cache-Control': 'public, max-age=3600'
     });
-    res.end(WEBRTC_CLIENT_SCRIPT);
+    res.end(WEBRTC_CLIENT_SCRIPT_LEGACY);
     return;
   }
 
@@ -390,22 +652,15 @@ const server = http.createServer((req, res) => {
   const upstreamHeaders = { ...req.headers };
   upstreamHeaders['x-forwarded-proto'] = 'https';
   upstreamHeaders['x-forwarded-host'] = req.headers.host;
-  // Hop-by-hop: never forward these between proxy hops
   delete upstreamHeaders['connection'];
   delete upstreamHeaders['transfer-encoding'];
   delete upstreamHeaders['te'];
   delete upstreamHeaders['trailer'];
   delete upstreamHeaders['proxy-authorization'];
   delete upstreamHeaders['proxy-connection'];
-
-  // Force upstream to send uncompressed content so:
-  // 1. Script injection into HTML always finds <head> (never gzipped)
-  // 2. MJPEG JPEG boundaries are never mangled by compression
   delete upstreamHeaders['accept-encoding'];
   upstreamHeaders['accept-encoding'] = 'identity';
 
-  // Apply TCP_NODELAY to the client socket immediately so the 101/200 response
-  // header reaches the browser without waiting for Nagle's 40ms batching window.
   if (res.socket) {
     res.socket.setNoDelay(true);
     res.socket.setKeepAlive(true, 10000);
@@ -421,12 +676,9 @@ const server = http.createServer((req, res) => {
     },
     (upstreamRes) => {
       const streaming = isStreamingResponse(upstreamRes);
-
-      // Build response headers
       const resHeaders = { ...upstreamRes.headers };
 
       if (streaming) {
-        // Tell Cloudflare, Nginx, and browser never to buffer or cache
         resHeaders['x-accel-buffering'] = 'no';
         resHeaders['cache-control'] = 'no-cache, no-store, no-transform';
         resHeaders['pragma'] = 'no-cache';
@@ -435,7 +687,11 @@ const server = http.createServer((req, res) => {
         let body = '';
         upstreamRes.on('data', (chunk) => { body += chunk; });
         upstreamRes.on('end', () => {
-          const scriptTag = '<script src="/__flutter-remote/webrtc-hid.js"></script>';
+          const isV1 = TRANSPORT_MODE === 'v1' || TRANSPORT_MODE === 'legacy';
+          const scriptTag = isV1
+            ? '<script src="/__flutter-remote/webrtc-hid.js"></script>'
+            : '<script src="/__flutter-remote/client.js"></script>';
+
           let injected = body;
           if (body.includes('<head>')) {
             injected = body.replace('<head>', `<head>${scriptTag}`);
@@ -455,13 +711,10 @@ const server = http.createServer((req, res) => {
       }
 
       res.writeHead(upstreamRes.statusCode || 502, resHeaders);
-
-      // Pipe directly — no intermediate buffering.
       upstreamRes.pipe(res, { end: true });
     }
   );
 
-  // TCP_NODELAY on the upstream connection
   proxy.on('socket', (sock) => {
     sock.setNoDelay(true);
     sock.setKeepAlive(true, 10000);
@@ -527,5 +780,6 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(PORT, TARGET_HOST, () => {
-  console.log(`[flutter-remote gate] listening on ${TARGET_HOST}:${PORT} -> :${TARGET_PORT}`);
+  console.log(`[flutter-remote gate] listening on ${TARGET_HOST}:${PORT} -> :${TARGET_PORT} (mode: ${TRANSPORT_MODE})`);
 });
+

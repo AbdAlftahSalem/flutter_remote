@@ -59,13 +59,16 @@ This is **NOT** Flutter Web, a static video, or an HTML mock. It is a **real App
                          Auth Gate Proxy
                            (gate.cjs)
                                  │
-                                 ▼
-                           Secure Tunnel
-                           (cloudflared)
-                                 │
+                       ┌─────────┴─────────┐
+                       │                   │
+                 Secure Tunnel        WebRTC Peer
+                 (cloudflared)      (node-datachannel)
+                       │                   │
+                       │ HTTP/WS (V1)      │ DataChannels + Video (V2)
+                       └─────────┬─────────┘
                                  ▼
                          Web Browser (User)
-               (Tap, Drag, Swipe, Scroll, Type)
+               (Direct Video Track + Touch/Key Channels)
 ```
 
 ---
@@ -173,7 +176,8 @@ The browser interface streams the iOS Simulator display with full bidirectional 
 | `--flavor <name>` | _none_ | Flutter flavor (e.g. `staging`, `production`) |
 | `--target <file>` | _none_ | Target entrypoint Dart file (e.g. `lib/main_dev.dart`) |
 | `--dart-define <K=V>` | _none_ | Pass build-time environment variables (repeatable) |
-| `--codec <codec>` | `mjpeg` | Stream codec: `mjpeg` (stable, no black screen reconnects) or `auto` |
+| `--transport <mode>` | `webrtc` | Transport mode: `webrtc` (ultra-low latency DataChannels + Video track) or `http` / `legacy` (V1 fallback) |
+| `--codec <codec>` | `auto` | Stream codec: `auto` (H.264/VP8 WebRTC with adaptive bitrate), `h264`, `vp8`, or `mjpeg` |
 | `--tunnel-protocol <p>` | `quic` | Cloudflare tunnel: `quic` (UDP, better on lossy networks) or `http2` (TCP) |
 | `--fps <n>` | — | _(no-op)_ serve-sim always streams at native 60 FPS |
 | `--quality <n>` | — | _(no-op)_ quality is managed internally by the H.264 hardware encoder |

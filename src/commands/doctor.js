@@ -60,7 +60,22 @@ export async function doctor(cwd) {
     add(WARN, 'GitHub remote', 'none yet — flutter-remote up will create one');
   }
 
-  // 7. Optional local Flutter info
+  // 7. WebRTC & TURN checks
+  try {
+    const ndc = await import('node-datachannel');
+    add(PASS, 'WebRTC (node-datachannel)', 'available');
+  } catch (err) {
+    add(WARN, 'WebRTC (node-datachannel)', 'will be installed automatically on macOS runner');
+  }
+
+  const turnConfigured = Boolean(process.env.FLUTTER_REMOTE_TURN_KEY_ID && process.env.FLUTTER_REMOTE_TURN_KEY_TOKEN);
+  if (turnConfigured) {
+    add(PASS, 'TURN relay credentials', 'configured');
+  } else {
+    add(WARN, 'TURN relay credentials', 'unconfigured (using free Cloudflare STUN fallback, run: flutter-remote turn)');
+  }
+
+  // 8. Optional local Flutter info
   if (has('flutter')) {
     const flVer = sh('flutter', ['--version']);
     const firstLine = flVer.out.split('\n')[0].replace('•', '-');
@@ -72,3 +87,4 @@ export async function doctor(cwd) {
   console.log(checks.join('\n'));
   console.log('');
 }
+

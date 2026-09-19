@@ -1,0 +1,98 @@
+/**
+ * Flutter Remote WebRTC V2 Constants
+ */
+
+export const PROTOCOL_VERSION = 2;
+
+export const CHANNELS = {
+  INPUT: 'input',
+  KEYBOARD: 'keyboard',
+  CONTROL: 'control',
+  TELEMETRY: 'telemetry',
+};
+
+export const CHANNEL_CONFIGS = {
+  [CHANNELS.INPUT]: {
+    ordered: false,
+    maxRetransmits: 0,
+  },
+  [CHANNELS.KEYBOARD]: {
+    ordered: true,
+  },
+  [CHANNELS.CONTROL]: {
+    ordered: true,
+  },
+  [CHANNELS.TELEMETRY]: {
+    ordered: false,
+    maxRetransmits: 0,
+  },
+};
+
+export const CONNECTION_STATES = {
+  IDLE: 'IDLE',
+  CONNECTING: 'CONNECTING',
+  SIGNALING: 'SIGNALING',
+  CHECKING: 'CHECKING',
+  CONNECTED: 'CONNECTED',
+  DEGRADED: 'DEGRADED',
+  RECONNECTING: 'RECONNECTING',
+  FAILED: 'FAILED',
+  CLOSED: 'CLOSED',
+};
+
+export const SESSION_STATES = {
+  CREATING: 'CREATING',
+  BOOTING_SIMULATOR: 'BOOTING_SIMULATOR',
+  STARTING_CAPTURE: 'STARTING_CAPTURE',
+  STARTING_GATEWAY: 'STARTING_GATEWAY',
+  STARTING_TUNNEL: 'STARTING_TUNNEL',
+  READY: 'READY',
+  ACTIVE: 'ACTIVE',
+  DEGRADED: 'DEGRADED',
+  RECONNECTING: 'RECONNECTING',
+  STOPPING: 'STOPPING',
+  STOPPED: 'STOPPED',
+  FAILED: 'FAILED',
+};
+
+export const LIMITS = {
+  MAX_SIGNALING_MESSAGE_SIZE: 1024 * 1024, // 1 MB
+  MAX_INPUT_MESSAGE_SIZE: 16 * 1024,       // 16 KB
+  MAX_CLIPBOARD_MESSAGE_SIZE: 256 * 1024,  // 256 KB
+  BUFFERED_AMOUNT_LOW_THRESHOLD: 64 * 1024, // 64 KB
+  MAX_INPUT_QUEUE_SIZE: 20,
+};
+
+export const TIMEOUTS = {
+  SIMULATOR_BOOT_MS: 120_000,
+  SERVE_SIM_MS: 30_000,
+  SIGNALING_MS: 15_000,
+  WEBRTC_CONNECT_MS: 20_000,
+  FIRST_FRAME_MS: 15_000,
+  HEARTBEAT_INTERVAL_MS: 2_000,
+  HEARTBEAT_TIMEOUT_MS: 6_000,
+  SESSION_GRACE_PERIOD_MS: 45_000,
+  STABLE_CONNECTION_RESET_MS: 5_000,
+};
+
+export const BACKOFF_INTERVALS_MS = [500, 1000, 2000, 4000, 8000, 10000];
+
+export const VIDEO_PRESETS = {
+  LOW: { width: 480, height: 854, fps: 15, bitrateKbps: 600 },
+  MEDIUM: { width: 720, height: 1280, fps: 24, bitrateKbps: 1500 },
+  HIGH: { width: 1080, height: 1920, fps: 30, bitrateKbps: 3000 },
+};
+
+export const CODECS = {
+  H264: 'H264',
+  VP8: 'VP8',
+  AUTO: 'auto',
+  MJPEG: 'mjpeg',
+};
+
+export const PORTS = {
+  GATEWAY: 3199,
+  PREVIEW: 3200,
+  SIGNALING: 3201,
+  AGENT: 4310,
+};
