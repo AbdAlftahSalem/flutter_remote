@@ -8,6 +8,16 @@
  * 4. Fallback /stream-ws endpoint for change-only socket streaming in legacy mode.
  */
 const http = require('node:http');
+const { EventEmitter } = require('node:events');
+const { spawn } = require('node:child_process');
+
+let ffmpegPath = null;
+try {
+  ffmpegPath = require('ffmpeg-static');
+} catch {}
+if (!ffmpegPath) {
+  ffmpegPath = 'ffmpeg';
+}
 
 let ndc;
 let PeerConnection;
@@ -47,126 +57,269 @@ process.on('unhandledRejection', (reason) => {
   console.error('[webrtc-peer unhandledRejection]', reason);
 });
 
-// RFC 6184 / Annex-B NAL unit parser and packetizer
-class H264Packetizer {
-  constructor(payloadType = 98, ssrc = 12345, mtu = 1200) {
-    this.payloadType = payloadType;
-    this.ssrc = ssrc;
-    this.mtu = mtu;
-    this.seq = 1;
-    this.ts = 0;
+// RFC 6184 / Annex-B H.264 Video Encoder & RTP Packetizer
+const NAL_TYPES = {
+  NON_IDR: 1,
+  IDR: 5,
+  SEI: 6,
+  SPS: 7,
+  PPS: 8,
+  FU_A: 28,
+};
+
+class VideoEncoder extends EventEmitter {
+  constructor(options = {}) {
+    super();
+    this.payloadType = options.payloadType || 98;
+    this.ssrc = options.ssrc || 12345;
+    this.mtu = options.mtu || 1200;
+    this.fps = options.fps || 30;
+    this.bitrateKbps = options.bitrateKbps || 2500;
+    this.ffmpegPath = options.ffmpegPath || ffmpegPath;
+
+    this._sequenceNumber = 1;
+    this._timestamp = 0;
+    this._clockRate = 90000;
+
     this.cachedSps = null;
     this.cachedPps = null;
     this.cachedKeyframe = null;
+    this.lastFrameType = null;
+
+    this.ffmpegProc = null;
+    this._nalBuffer = Buffer.alloc(0);
+    this._isEncoding = false;
   }
 
-  parseNals(buf) {
-    if (!Buffer.isBuffer(buf) || buf.length === 0) return [];
-    const nals = [];
-    const len = buf.length;
-    const indices = [];
+  start() {
+    if (this.ffmpegProc) return;
+
+    const args = [
+      '-loglevel', 'error',
+      '-f', 'image2pipe',
+      '-vcodec', 'mjpeg',
+      '-i', 'pipe:0',
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-tune', 'zerolatency',
+      '-pix_fmt', 'yuv420p',
+      '-g', String(this.fps),
+      '-keyint_min', String(this.fps),
+      '-b:v', `${this.bitrateKbps}k`,
+      '-maxrate', `${this.bitrateKbps}k`,
+      '-bufsize', `${this.bitrateKbps * 2}k`,
+      '-f', 'h264',
+      'pipe:1',
+    ];
+
+    try {
+      this.ffmpegProc = spawn(this.ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+      this._isEncoding = true;
+
+      this.ffmpegProc.stdout.on('data', (chunk) => {
+        this._handleEncodedData(chunk);
+      });
+
+      this.ffmpegProc.stderr.on('data', (errData) => {
+        const msg = errData.toString();
+        if (!msg.includes('deprecated') && !msg.includes('EOI missing')) {
+          console.warn('[webrtc-peer encoder warning]', msg);
+        }
+      });
+
+      this.ffmpegProc.on('error', (err) => {
+        console.error('[webrtc-peer encoder error]', err.message);
+        this.close();
+      });
+
+      this.ffmpegProc.on('close', (code) => {
+        this._isEncoding = false;
+        this.ffmpegProc = null;
+      });
+    } catch (err) {
+      console.error('[webrtc-peer encoder spawn error]', err.message);
+      this._isEncoding = false;
+    }
+  }
+
+  encodeFrame(jpegBuffer) {
+    if (!this.ffmpegProc || !this.ffmpegProc.stdin || !this.ffmpegProc.stdin.writable) {
+      this.start();
+    }
+
+    if (this.ffmpegProc && this.ffmpegProc.stdin && this.ffmpegProc.stdin.writable) {
+      try {
+        this.ffmpegProc.stdin.write(jpegBuffer);
+        return true;
+      } catch (err) {
+        console.error('[webrtc-peer encodeFrame error]', err.message);
+        return false;
+      }
+    }
+    return false;
+  }
+
+  _handleEncodedData(chunk) {
+    this._nalBuffer = Buffer.concat([this._nalBuffer, chunk]);
+
+    const nalUnits = this.parseNalUnits(this._nalBuffer);
+    if (nalUnits.length > 1) {
+      const completeNals = nalUnits.slice(0, -1);
+      this.inspectAndCacheNals(completeNals);
+
+      const packets = this.packetizeNalUnits(completeNals, this.fps);
+      if (packets.length > 0) {
+        this.emit('packets', packets);
+      }
+
+      const lastNal = nalUnits[nalUnits.length - 1];
+      const prefix = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+      this._nalBuffer = Buffer.concat([prefix, lastNal.data]);
+    }
+  }
+
+  parseNalUnits(buffer) {
+    if (!Buffer.isBuffer(buffer) || buffer.length === 0) return [];
+
+    const nalUnits = [];
+    const len = buffer.length;
+    const startIndices = [];
 
     for (let i = 0; i < len - 2; i++) {
-      if (buf[i] === 0x00 && buf[i + 1] === 0x00) {
-        if (buf[i + 2] === 0x01) {
-          indices.push({ idx: i, pLen: 3 });
+      if (buffer[i] === 0x00 && buffer[i + 1] === 0x00) {
+        if (buffer[i + 2] === 0x01) {
+          startIndices.push({ index: i, prefixLen: 3 });
           i += 2;
-        } else if (i < len - 3 && buf[i + 2] === 0x00 && buf[i + 3] === 0x01) {
-          indices.push({ idx: i, pLen: 4 });
+        } else if (i < len - 3 && buffer[i + 2] === 0x00 && buffer[i + 3] === 0x01) {
+          startIndices.push({ index: i, prefixLen: 4 });
           i += 3;
         }
       }
     }
 
-    if (indices.length === 0) {
-      return [{ data: buf, type: buf[0] & 0x1f }];
+    if (startIndices.length === 0) {
+      const nalType = buffer[0] & 0x1f;
+      return [{ data: buffer, type: nalType }];
     }
 
-    for (let k = 0; k < indices.length; k++) {
-      const cur = indices[k];
-      const start = cur.idx + cur.pLen;
-      const end = (k + 1 < indices.length) ? indices[k + 1].idx : len;
-      const nal = buf.subarray(start, end);
-      if (nal.length > 0) {
-        nals.push({ data: nal, type: nal[0] & 0x1f });
+    for (let i = 0; i < startIndices.length; i++) {
+      const current = startIndices[i];
+      const start = current.index + current.prefixLen;
+      const end = (i + 1 < startIndices.length) ? startIndices[i + 1].index : len;
+      const nalData = buffer.subarray(start, end);
+
+      if (nalData.length > 0) {
+        const nalType = nalData[0] & 0x1f;
+        nalUnits.push({ data: nalData, type: nalType });
       }
     }
-    return nals;
+
+    return nalUnits;
   }
 
-  inspectNals(nals) {
-    let isKey = false;
-    for (const n of nals) {
-      if (n.type === 7) this.cachedSps = Buffer.from(n.data);
-      else if (n.type === 8) this.cachedPps = Buffer.from(n.data);
-      else if (n.type === 5) isKey = true;
-    }
+  inspectAndCacheNals(nalUnits) {
+    let hasIdr = false;
 
-    if (isKey) {
-      const pfx = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-      const parts = [];
-      if (this.cachedSps) parts.push(pfx, this.cachedSps);
-      if (this.cachedPps) parts.push(pfx, this.cachedPps);
-      for (const n of nals) {
-        if (n.type === 5) parts.push(pfx, n.data);
+    for (const nal of nalUnits) {
+      if (nal.type === NAL_TYPES.SPS) {
+        this.cachedSps = Buffer.from(nal.data);
+      } else if (nal.type === NAL_TYPES.PPS) {
+        this.cachedPps = Buffer.from(nal.data);
+      } else if (nal.type === NAL_TYPES.IDR) {
+        hasIdr = true;
       }
-      this.cachedKeyframe = Buffer.concat(parts);
+    }
+
+    if (hasIdr) {
+      this.lastFrameType = 'keyframe';
+      const partsWithPrefixes = [];
+      const prefix = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+
+      if (this.cachedSps) {
+        partsWithPrefixes.push(prefix, this.cachedSps);
+      }
+      if (this.cachedPps) {
+        partsWithPrefixes.push(prefix, this.cachedPps);
+      }
+      for (const nal of nalUnits) {
+        if (nal.type === NAL_TYPES.IDR) {
+          partsWithPrefixes.push(prefix, nal.data);
+        }
+      }
+
+      this.cachedKeyframe = Buffer.concat(partsWithPrefixes);
+    } else if (nalUnits.some(n => n.type === NAL_TYPES.NON_IDR)) {
+      this.lastFrameType = 'delta';
     }
   }
 
-  packetize(buf, fps = 30) {
-    if (!Buffer.isBuffer(buf) || buf.length === 0) return [];
-    this.ts = (this.ts + Math.round(90000 / fps)) >>> 0;
+  hasKeyframe() {
+    return Boolean(this.cachedKeyframe && this.cachedKeyframe.length > 0);
+  }
 
-    const nals = this.parseNals(buf);
-    if (nals.length > 0) this.inspectNals(nals);
+  getKeyframe() {
+    return this.cachedKeyframe;
+  }
+
+  getKeyframePackets() {
+    if (!this.hasKeyframe()) return [];
+    return this.packetize(this.cachedKeyframe, this.fps);
+  }
+
+  packetizeNalUnits(nalUnits, fps = 30) {
+    const timestampDelta = Math.round(this._clockRate / fps);
+    this._timestamp = (this._timestamp + timestampDelta) >>> 0;
 
     const packets = [];
-    const maxPayload = this.mtu - 12;
-    const units = nals.length > 0 ? nals : [{ data: buf, type: buf[0] & 0x1f }];
+    const maxPayloadSize = this.mtu - 12;
 
-    for (let u = 0; u < units.length; u++) {
-      const nal = units[u];
+    for (let u = 0; u < nalUnits.length; u++) {
+      const nal = nalUnits[u];
       const nalData = nal.data;
-      const isLastNal = (u === units.length - 1);
+      const isLastNal = (u === nalUnits.length - 1);
 
-      if (nalData.length <= maxPayload) {
+      if (nalData.length <= maxPayloadSize) {
         const rtp = Buffer.alloc(12 + nalData.length);
         rtp[0] = 0x80;
         rtp[1] = (isLastNal ? 0x80 : 0x00) | (this.payloadType & 0x7f);
-        rtp.writeUInt16BE(this.seq & 0xffff, 2);
-        this.seq = (this.seq + 1) & 0xffff;
-        rtp.writeUInt32BE(this.ts, 4);
+        rtp.writeUInt16BE(this._sequenceNumber & 0xffff, 2);
+        this._sequenceNumber = (this._sequenceNumber + 1) & 0xffff;
+        rtp.writeUInt32BE(this._timestamp, 4);
         rtp.writeUInt32BE(this.ssrc, 8);
         nalData.copy(rtp, 12);
         packets.push(rtp);
       } else {
         const nalHeader = nalData[0];
         const fnri = nalHeader & 0xe0;
-        const origType = nalHeader & 0x1f;
-        const fuIndicator = fnri | 28; // FU-A
-        const payloadData = nalData.subarray(1);
-        const maxFu = maxPayload - 2;
-        const total = Math.ceil(payloadData.length / maxFu);
+        const originalType = nalHeader & 0x1f;
 
-        for (let i = 0; i < total; i++) {
+        const fuIndicator = fnri | NAL_TYPES.FU_A;
+        const payloadData = nalData.subarray(1);
+        const maxFuPayload = maxPayloadSize - 2;
+        const totalChunks = Math.ceil(payloadData.length / maxFuPayload);
+
+        for (let i = 0; i < totalChunks; i++) {
           const isStart = (i === 0);
-          const isEnd = (i === total - 1);
-          let fuHeader = origType & 0x1f;
+          const isEnd = (i === totalChunks - 1);
+          const isLastPacketOfFrame = isLastNal && isEnd;
+
+          let fuHeader = originalType & 0x1f;
           if (isStart) fuHeader |= 0x80;
           if (isEnd) fuHeader |= 0x40;
 
-          const s = i * maxFu;
-          const e = Math.min(s + maxFu, payloadData.length);
-          const chunk = payloadData.subarray(s, e);
+          const chunkStart = i * maxFuPayload;
+          const chunkEnd = Math.min(chunkStart + maxFuPayload, payloadData.length);
+          const chunk = payloadData.subarray(chunkStart, chunkEnd);
 
           const rtp = Buffer.alloc(12 + 2 + chunk.length);
           rtp[0] = 0x80;
-          rtp[1] = (isLastNal && isEnd ? 0x80 : 0x00) | (this.payloadType & 0x7f);
-          rtp.writeUInt16BE(this.seq & 0xffff, 2);
-          this.seq = (this.seq + 1) & 0xffff;
-          rtp.writeUInt32BE(this.ts, 4);
+          rtp[1] = (isLastPacketOfFrame ? 0x80 : 0x00) | (this.payloadType & 0x7f);
+          rtp.writeUInt16BE(this._sequenceNumber & 0xffff, 2);
+          this._sequenceNumber = (this._sequenceNumber + 1) & 0xffff;
+          rtp.writeUInt32BE(this._timestamp, 4);
           rtp.writeUInt32BE(this.ssrc, 8);
+
           rtp[12] = fuIndicator;
           rtp[13] = fuHeader;
           chunk.copy(rtp, 14);
@@ -174,7 +327,32 @@ class H264Packetizer {
         }
       }
     }
+
     return packets;
+  }
+
+  packetize(frameBuffer, fps = 30) {
+    if (!Buffer.isBuffer(frameBuffer) || frameBuffer.length === 0) {
+      return [];
+    }
+    const nalUnits = this.parseNalUnits(frameBuffer);
+    if (nalUnits.length > 0) {
+      this.inspectAndCacheNals(nalUnits);
+    }
+    const units = (nalUnits.length > 0) ? nalUnits : [{ data: frameBuffer, type: frameBuffer[0] & 0x1f }];
+    return this.packetizeNalUnits(units, fps);
+  }
+
+  close() {
+    this._isEncoding = false;
+    if (this.ffmpegProc) {
+      try {
+        if (this.ffmpegProc.stdin) this.ffmpegProc.stdin.end();
+        this.ffmpegProc.kill('SIGTERM');
+      } catch {}
+      this.ffmpegProc = null;
+    }
+    this._nalBuffer = Buffer.alloc(0);
   }
 }
 
@@ -194,7 +372,17 @@ if (WebSocketServer) {
   const streamWsClients = new Set();
   const activeVideoTracks = new Set();
   let localStreamReq = null;
-  const h264Packetizer = new H264Packetizer(98, 12345, 1200);
+  const videoEncoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
+
+  videoEncoder.on('packets', (rtpPackets) => {
+    for (const track of activeVideoTracks) {
+      try {
+        for (const packet of rtpPackets) {
+          track.sendMessageBinary(packet);
+        }
+      } catch {}
+    }
+  });
 
   function ensureLocalStream() {
     if (localStreamReq || (streamWsClients.size === 0 && activeVideoTracks.size === 0)) return;
@@ -227,16 +415,9 @@ if (WebSocketServer) {
               }
             }
 
-            // 2. Packetize and send to WebRTC video tracks
+            // 2. Feed JPEG into real H.264 VideoEncoder
             if (activeVideoTracks.size > 0) {
-              const rtpPackets = h264Packetizer.packetize(jpeg, 30);
-              for (const track of activeVideoTracks) {
-                try {
-                  for (const packet of rtpPackets) {
-                    track.sendMessageBinary(packet);
-                  }
-                } catch {}
-              }
+              videoEncoder.encodeFrame(jpeg);
             }
 
             buffer = buffer.subarray(eoi + 2);
@@ -396,20 +577,14 @@ if (WebSocketServer) {
               video.addVP8Codec(97);
               videoTrack = peer.addTrack(video);
 
-              // Configure native H.264 packetizer if available
-              if (H264RtpPacketizer && RtpPacketizationConfig) {
-                try {
-                  const rtpCfg = new RtpPacketizationConfig(12345, 'video', 98, 90000);
-                  const pkt = new H264RtpPacketizer('StartSequence', rtpCfg);
-                  videoTrack.setMediaHandler(pkt);
-                } catch {}
-              }
-
+              // NOTE: Do not call videoTrack.setMediaHandler(...).
+              // node-datachannel's setMediaHandler double-packetizes when used with sendMessageBinary.
+              // VideoEncoder outputs RFC 6184 RTP packets sent directly via sendMessageBinary().
               activeVideoTracks.add(videoTrack);
 
               // Send cached keyframe immediately to new subscriber for instant playback (< 2s)
-              if (h264Packetizer.cachedKeyframe) {
-                const keyPackets = h264Packetizer.packetize(h264Packetizer.cachedKeyframe, 30);
+              if (videoEncoder.hasKeyframe()) {
+                const keyPackets = videoEncoder.getKeyframePackets();
                 for (const kp of keyPackets) {
                   try { videoTrack.sendMessageBinary(kp); } catch {}
                 }
@@ -453,8 +628,8 @@ if (WebSocketServer) {
               if (label === 'control') {
                 try {
                   const cmd = JSON.parse(rawMsg.toString());
-                  if (cmd.type === 'request_keyframe' && videoTrack && h264Packetizer.cachedKeyframe) {
-                    const keyPackets = h264Packetizer.packetize(h264Packetizer.cachedKeyframe, 30);
+                  if (cmd.type === 'request_keyframe' && videoTrack && videoEncoder.hasKeyframe()) {
+                    const keyPackets = videoEncoder.getKeyframePackets();
                     for (const kp of keyPackets) {
                       try { videoTrack.sendMessageBinary(kp); } catch {}
                     }
@@ -498,6 +673,9 @@ if (WebSocketServer) {
       if (videoTrack) {
         activeVideoTracks.delete(videoTrack);
         videoTrack = null;
+        if (activeVideoTracks.size === 0 && streamWsClients.size === 0) {
+          videoEncoder.close();
+        }
       }
       if (peer) {
         try { peer.close(); } catch {}
