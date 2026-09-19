@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 6
+// flutter-remote-template-version: 7
 /**
  * flutter-remote auth gate.
  *
@@ -13,17 +13,8 @@
  *      Cloudflare may buffer responses unless we send the right headers.
  *   2. Zero latency on WebSocket HID input (touch/keyboard → simulator).
  *      TCP_NODELAY + raw socket pipe keeps per-frame overhead under 1ms.
- *   3. Survive Cloudflare's 100-second idle timeout on HTTP connections.
- *      serve-sim replays a JPEG every 1s, so the tunnel stays alive as long
- *      as we don't accidentally buffer those keepalive frames.
- *   4. Low-latency WebRTC DataChannel support for direct P2P HID input.
- *      Exposes /ice-config, proxies /signal to webrtc-peer, and injects
- *      webrtc-hid.js into the simulator HTML page.
- *
- * It also multiplexes a second upstream onto the same tunnel: when
- * FLUTTER_REMOTE_AGENT_PORT is set, `/agent-device/*` is routed to the local
- * `agent-device proxy` instead of serve-sim, so one URL carries both the
- * human-facing stream and the agent-facing control API.
+ *   3. Low-latency WebRTC DataChannel for direct P2P HID input.
+ *   4. Direct /stream-ws change-only socket streaming to eliminate black screens.
  */
 const http = require('node:http');
 const net = require('node:net');
@@ -95,7 +86,7 @@ function isStreamingResponse(upstreamRes) {
   return (
     ct.includes('multipart/x-mixed-replace') ||  // MJPEG
     ct.includes('video/') ||                       // H.264 / MP4
-    ct.includes('application/octet-stream') ||     // AVCC binary stream
+    ct.includes('application/octet-stream') ||     // AVCC / raw binary stream
     ct.includes('text/event-stream')               // SSE (logs)
   );
 }
@@ -180,7 +171,7 @@ const WEBRTC_CLIENT_SCRIPT = `
   if (window.__flutterRemoteWebRTCInjected) return;
   window.__flutterRemoteWebRTCInjected = true;
 
-  // Pin codec to MJPEG in browser localStorage to prevent H.264 idle frame-stalls and black-screen reconnect loops on VMs
+  // Pin codec to MJPEG in browser localStorage to prevent H.264 idle frame-stalls and black-screen reconnect loops
   try {
     localStorage.setItem('serve-sim:codec', 'mjpeg');
   } catch (e) {}
@@ -191,6 +182,49 @@ const WEBRTC_CLIENT_SCRIPT = `
   let rtcReady = false;
   let signalingWs = null;
 
+  // 1. Direct change-only socket frame listener: paints frames as they change without HTTP stream stalls
+  function initChangeSocket() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const streamWs = new OrigWebSocket(proto + '//' + location.host + '/stream-ws');
+    streamWs.binaryType = 'blob';
+
+    let lastBlobUrl = null;
+
+    streamWs.onmessage = (event) => {
+      if (!(event.data instanceof Blob)) return;
+
+      const newBlobUrl = URL.createObjectURL(event.data);
+
+      // Find preview image or canvas in the DOM
+      const img = document.querySelector('img[src*="blob:"], img[src*="/stream"], .simulator-frame img, [data-simulator] img');
+      if (img) {
+        img.src = newBlobUrl;
+        if (lastBlobUrl) {
+          URL.revokeObjectURL(lastBlobUrl);
+        }
+        lastBlobUrl = newBlobUrl;
+      } else {
+        const canvas = document.querySelector('canvas');
+        if (canvas) {
+          createImageBitmap(event.data).then((bmp) => {
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+            }
+            bmp.close();
+          }).catch(() => {});
+        }
+      }
+    };
+
+    streamWs.onclose = () => {
+      setTimeout(initChangeSocket, 2000);
+    };
+  }
+
+  try { initChangeSocket(); } catch (e) {}
+
+  // 2. WebRTC DataChannel for ultra-low latency HID input (~30ms)
   async function initWebRTC() {
     try {
       const res = await fetch('/ice-config');
@@ -256,6 +290,7 @@ const WEBRTC_CLIENT_SCRIPT = `
 
   initWebRTC();
 
+  // 3. Monkey-patch WebSocket to route touches/typing over WebRTC DataChannel
   window.WebSocket = function(url, protocols) {
     const isHidWs = typeof url === 'string' && (url.endsWith('/ws') || url.includes('/ws?'));
     const ws = protocols ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
@@ -323,7 +358,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // WebRTC client-side HID script
+  // WebRTC client-side HID & Stream script
   if (pathnameOf(req) === '/__flutter-remote/webrtc-hid.js') {
     res.writeHead(200, {
       'Content-Type': 'application/javascript; charset=utf-8',
@@ -363,6 +398,12 @@ const server = http.createServer((req, res) => {
   delete upstreamHeaders['proxy-authorization'];
   delete upstreamHeaders['proxy-connection'];
 
+  // Force upstream to send uncompressed content so:
+  // 1. Script injection into HTML always finds <head> (never gzipped)
+  // 2. MJPEG JPEG boundaries are never mangled by compression
+  delete upstreamHeaders['accept-encoding'];
+  upstreamHeaders['accept-encoding'] = 'identity';
+
   // Apply TCP_NODELAY to the client socket immediately so the 101/200 response
   // header reaches the browser without waiting for Nagle's 40ms batching window.
   if (res.socket) {
@@ -385,12 +426,10 @@ const server = http.createServer((req, res) => {
       const resHeaders = { ...upstreamRes.headers };
 
       if (streaming) {
-        // For video/MJPEG/SSE: tell Cloudflare, Nginx, and any other reverse proxy
-        // NOT to buffer this response. Without this, Cloudflare buffers ~512KB before
-        // flushing, which causes the black-screen reconnect cycle every 4 seconds.
+        // Tell Cloudflare, Nginx, and browser never to buffer or cache
         resHeaders['x-accel-buffering'] = 'no';
-        resHeaders['cache-control'] = 'no-store, no-transform';
-        // Cloudflare-specific: disable response buffering
+        resHeaders['cache-control'] = 'no-cache, no-store, no-transform';
+        resHeaders['pragma'] = 'no-cache';
         resHeaders['cf-cache-status'] = 'BYPASS';
       } else if ((upstreamRes.headers['content-type'] || '').toLowerCase().includes('text/html')) {
         let body = '';
@@ -406,7 +445,9 @@ const server = http.createServer((req, res) => {
             injected = `${scriptTag}${body}`;
           }
           resHeaders['content-length'] = Buffer.byteLength(injected);
+          resHeaders['cache-control'] = 'no-cache, no-store, must-revalidate';
           delete resHeaders['transfer-encoding'];
+          delete resHeaders['content-encoding'];
           res.writeHead(upstreamRes.statusCode || 200, resHeaders);
           res.end(injected);
         });
@@ -417,20 +458,10 @@ const server = http.createServer((req, res) => {
 
       // Pipe directly — no intermediate buffering.
       upstreamRes.pipe(res, { end: true });
-
-      // For streaming responses, forward backpressure: if the client is slow,
-      // pause upstream to prevent the serve-sim buffer from growing unboundedly.
-      if (streaming) {
-        res.on('drain', () => upstreamRes.resume());
-        upstreamRes.on('data', () => {
-          if (!res.write) return;
-        });
-      }
     }
   );
 
-  // TCP_NODELAY on the upstream connection — prevents Nagle's algorithm from
-  // delaying small writes (JPEG boundary markers, H.264 NAL units).
+  // TCP_NODELAY on the upstream connection
   proxy.on('socket', (sock) => {
     sock.setNoDelay(true);
     sock.setKeepAlive(true, 10000);
@@ -445,33 +476,29 @@ const server = http.createServer((req, res) => {
 
   req.on('error', () => { try { proxy.destroy(); } catch {} });
   res.on('error', () => { try { proxy.destroy(); } catch {} });
+  res.on('close', () => { try { proxy.destroy(); } catch {} });
 
   req.pipe(proxy);
 });
 
-// WebSocket upgrade — raw TCP tunnel for zero-overhead HID input & WebRTC signaling.
+// WebSocket upgrade — raw TCP tunnel for zero-overhead HID input, WebRTC signaling & change streaming.
 server.on('upgrade', (req, socket, head) => {
   if (!authorize(req)) {
     socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
     return;
   }
 
-  // TCP_NODELAY on the browser-facing socket: HID commands (touch, keyboard)
-  // are tiny frames (< 100 bytes). Without NODELAY, Nagle batches them for
-  // up to 40ms — that's 40ms of avoidable input lag per keypress or tap.
   socket.setNoDelay(true);
   socket.setKeepAlive(true, 10000);
 
   const isAgent = isAgentRoute(req);
-  const isSignal = pathnameOf(req) === '/signal';
+  const isSignal = pathnameOf(req) === '/signal' || pathnameOf(req) === '/stream-ws';
   const upstreamPort = isAgent ? AGENT_PORT : (isSignal ? WEBRTC_SIGNAL_PORT : TARGET_PORT);
 
   const upstream = net.connect(upstreamPort, TARGET_HOST, () => {
-    // TCP_NODELAY on the upstream connection too.
     upstream.setNoDelay(true);
     upstream.setKeepAlive(true, 10000);
 
-    // Reconstruct the upgrade request, stripping hop-by-hop headers
     const { connection: _c, 'proxy-connection': _pc, te: _te, ...forwardHeaders } = req.headers;
     const headersStr = Object.entries({
       ...forwardHeaders,
@@ -484,7 +511,6 @@ server.on('upgrade', (req, socket, head) => {
     upstream.write(`${req.method} ${req.url} HTTP/1.1\r\n${headersStr}\r\n\r\n`);
     if (head && head.length) upstream.write(head);
 
-    // Raw TCP splice — zero-copy bidirectional pipe
     upstream.pipe(socket);
     socket.pipe(upstream);
   });

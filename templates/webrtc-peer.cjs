@@ -1,9 +1,10 @@
-// flutter-remote-template-version: 1
+// flutter-remote-template-version: 2
 /**
- * flutter-remote WebRTC Peer Bridge.
+ * flutter-remote WebRTC & WebSocket Bridge.
  *
- * Bridges WebRTC DataChannel HID messages directly to serve-sim's local
- * WebSocket endpoint, bypassing Cloudflare HTTP proxy latency completely.
+ * 1. Bridges WebRTC DataChannel HID messages directly to serve-sim's local /ws endpoint.
+ * 2. Provides a zero-buffering /stream-ws endpoint that listens for simulator frame
+ *    changes and pushes raw JPEG frames directly over WebSocket.
  */
 const http = require('node:http');
 
@@ -50,7 +51,101 @@ const server = http.createServer((req, res) => {
 if (WebSocketServer) {
   const wss = new WebSocketServer({ server });
 
-  wss.on('connection', (ws) => {
+  // ─── Stream WebSocket: Listen for simulator changes & broadcast JPEGs ───
+  const streamWsClients = new Set();
+  let localStreamReq = null;
+
+  function ensureLocalStream() {
+    if (localStreamReq || streamWsClients.size === 0) return;
+
+    console.log('[webrtc-peer] Starting local MJPEG stream consumer from serve-sim');
+    localStreamReq = http.get(
+      {
+        host: TARGET_HOST,
+        port: PREVIEW_PORT,
+        path: '/stream',
+        headers: { 'Accept-Encoding': 'identity' },
+      },
+      (res) => {
+        let buffer = Buffer.alloc(0);
+
+        res.on('data', (chunk) => {
+          buffer = Buffer.concat([buffer, chunk]);
+
+          let soi = buffer.indexOf(Buffer.from([0xff, 0xd8]));
+          while (soi !== -1) {
+            const eoi = buffer.indexOf(Buffer.from([0xff, 0xd9]), soi + 2);
+            if (eoi === -1) break;
+
+            const jpeg = buffer.subarray(soi, eoi + 2);
+
+            // Broadcast raw JPEG frame to all connected WebSocket clients
+            for (const client of streamWsClients) {
+              if (client.readyState === 1 /* OPEN */) {
+                try {
+                  client.send(jpeg);
+                } catch {}
+              }
+            }
+
+            buffer = buffer.subarray(eoi + 2);
+            soi = buffer.indexOf(Buffer.from([0xff, 0xd8]));
+          }
+
+          // Safeguard against memory leak if no valid JPEG boundary found
+          if (buffer.length > 5 * 1024 * 1024) {
+            buffer = Buffer.alloc(0);
+          }
+        });
+
+        res.on('end', () => {
+          localStreamReq = null;
+          if (streamWsClients.size > 0) {
+            setTimeout(ensureLocalStream, 1000);
+          }
+        });
+
+        res.on('error', (err) => {
+          console.error('[webrtc-peer local stream error]', err.message);
+          localStreamReq = null;
+          if (streamWsClients.size > 0) {
+            setTimeout(ensureLocalStream, 1000);
+          }
+        });
+      }
+    );
+
+    localStreamReq.on('error', (err) => {
+      console.error('[webrtc-peer local stream request error]', err.message);
+      localStreamReq = null;
+      if (streamWsClients.size > 0) {
+        setTimeout(ensureLocalStream, 1000);
+      }
+    });
+  }
+
+  wss.on('connection', (ws, req) => {
+    const url = new URL(req.url, 'http://localhost');
+
+    // Handle /stream-ws: Change-only socket frame streaming
+    if (url.pathname === '/stream-ws') {
+      console.log('[webrtc-peer] Client connected to /stream-ws');
+      streamWsClients.add(ws);
+      ensureLocalStream();
+
+      ws.on('close', () => {
+        streamWsClients.delete(ws);
+        if (streamWsClients.size === 0 && localStreamReq) {
+          try {
+            localStreamReq.destroy();
+          } catch {}
+          localStreamReq = null;
+        }
+      });
+      return;
+    }
+
+    // Handle /signal: WebRTC DataChannel signaling
     console.log('[webrtc-peer] Client connected to signaling');
     let peer = null;
     let serveSimWs = null;
