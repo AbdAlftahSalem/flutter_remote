@@ -19,7 +19,7 @@ describe('Workflow & Gate Templates', () => {
 
   test('templates/flutter-remote.yml contains required markers and steps', () => {
     const yml = readFileSync('templates/flutter-remote.yml', 'utf8');
-    assert.ok(yml.includes('# flutter-remote-template-version: 4'));
+    assert.ok(yml.includes('# flutter-remote-template-version: 12'));
     assert.ok(yml.includes('name: flutter-remote'));
     assert.ok(yml.includes('subosito/flutter-action@v2'));
     assert.ok(yml.includes('flutter build'));
@@ -34,6 +34,11 @@ describe('Workflow & Gate Templates', () => {
     assert.equal(res.ok, true, `Syntax error in gate.cjs: ${res.err}`);
   });
 
+  test('templates/webrtc-peer.cjs is valid JavaScript syntax', () => {
+    const res = sh('node', ['--check', 'templates/webrtc-peer.cjs']);
+    assert.equal(res.ok, true, `Syntax error in webrtc-peer.cjs: ${res.err}`);
+  });
+
   test('scaffold writes templates into destination directory', () => {
     const projDir = join(tempDir, 'sample-proj');
     mkdirSync(projDir, { recursive: true });
@@ -43,10 +48,12 @@ describe('Workflow & Gate Templates', () => {
 
     const workflowFile = join(projDir, '.github', 'workflows', 'flutter-remote.yml');
     const gateFile = join(projDir, '.github', 'flutter-remote', 'gate.cjs');
+    const webrtcPeerFile = join(projDir, '.github', 'flutter-remote', 'webrtc-peer.cjs');
     const gitignoreFile = join(projDir, '.gitignore');
 
     assert.ok(existsSync(workflowFile), 'flutter-remote.yml should exist');
     assert.ok(existsSync(gateFile), 'gate.cjs should exist');
+    assert.ok(existsSync(webrtcPeerFile), 'webrtc-peer.cjs should exist');
     assert.ok(existsSync(gitignoreFile), '.gitignore should exist');
 
     const content = readFileSync(workflowFile, 'utf8');

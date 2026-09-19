@@ -29,14 +29,12 @@ ${bold('OPTIONS (flutter-remote up)')}
   --device <name>        iOS Simulator device name              ${dim('default "iPhone 17 Pro"')}
   --runner <label>       macOS runner image (must be ARM64)     ${dim('default macos-26')}
   --flutter-version <v>  Flutter SDK version or channel         ${dim('default: auto-detected or stable')}
-  --build-mode <mode>    debug | profile | release              ${dim('default debug')}
+  --build-mode <mode>    debug                                  ${dim('default debug (simulator only supports debug)')}
   --flavor <name>        Flutter flavor to build
   --target <file>        Target main entrypoint Dart file
   --dart-define <K=V>    Define environment config values       ${dim('(can be repeated)')}
-  --codec <codec>        Stream codec: mjpeg | h264             ${dim('default mjpeg')}
-  --fps <n>              Stream frame rate                      ${dim('default 30')}
-  --quality <n>          Stream quality (0.05 - 1.0)            ${dim('default 0.7')}
-  --max-dimension <n>    Cap stream dimension in pixels         ${dim('default 900')}
+  --codec <codec>        Stream codec: mjpeg | auto             ${dim('default mjpeg (stable, no black screen)')}
+  --tunnel-protocol <p>  quic | http2                           ${dim('default quic (better on lossy networks)')}
   --app-file <path>      Run a prebuilt local .app or archive
   --app <url>            Run a prebuilt simulator .app from URL
   --app-release <name>   Run an asset from flutter-remote-build release
@@ -52,7 +50,7 @@ ${bold('OPTIONS (flutter-remote up)')}
 ${bold('EXAMPLES')}
   ${cyan('flutter-remote up --public --minutes 45')}
   ${cyan('flutter-remote up --device "iPhone 16 Pro"')}
-  ${cyan('flutter-remote up --build-mode profile')}
+  ${cyan('flutter-remote up --build-mode debug')}
   ${cyan('flutter-remote up --flavor staging --target lib/main_staging.dart')}
   ${cyan('flutter-remote up --dart-define API_URL=https://api.example.com')}
   ${cyan('flutter-remote up --agent')}             ${dim('# live stream + agent-device remote control')}
@@ -65,7 +63,7 @@ const NEEDS_VALUE = new Set([
   'minutes', 'device', 'runner', 'flutter-version', 'build-mode', 'flavor', 'target',
   'dart-define', 'codec', 'fps', 'quality', 'max-dimension', 'app-file', 'app',
   'app-release', 'mode', 'repo', 'message', 'account-id', 'access-key-id', 'secret-access-key',
-  'bucket', 'key-id', 'key-token',
+  'bucket', 'key-id', 'key-token', 'tunnel-protocol',
 ]);
 
 export function parseArgs(argv) {
@@ -129,8 +127,11 @@ export async function main(argv) {
   if (flags.transport && !['http', 'webrtc'].includes(flags.transport)) {
     throw new Error(`--transport must be "http" or "webrtc", got "${flags.transport}"`);
   }
-  if (flags.codec && !['mjpeg', 'h264'].includes(flags.codec)) {
-    throw new Error(`--codec must be "mjpeg" or "h264", got "${flags.codec}"`);
+  if (flags['tunnel-protocol'] && !['quic', 'http2'].includes(flags['tunnel-protocol'])) {
+    throw new Error(`--tunnel-protocol must be "quic" or "http2", got "${flags['tunnel-protocol']}"`);
+  }
+  if (flags.codec && !['mjpeg', 'h264', 'auto'].includes(flags.codec)) {
+    throw new Error(`--codec must be "auto", "mjpeg", or "h264", got "${flags.codec}"`);
   }
   if (flags['build-mode'] && !['debug', 'profile', 'release'].includes(flags['build-mode'])) {
     throw new Error(`--build-mode must be "debug", "profile", or "release", got "${flags['build-mode']}"`);

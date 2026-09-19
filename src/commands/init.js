@@ -9,6 +9,7 @@ const TEMPLATES = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'tem
 
 export const WORKFLOW_PATH = '.github/workflows/flutter-remote.yml';
 export const GATE_PATH = '.github/flutter-remote/gate.cjs';
+export const WEBRTC_PEER_PATH = '.github/flutter-remote/webrtc-peer.cjs';
 
 const VERSION_RE = /flutter-remote-template-version:\s*(\d+)/;
 const versionOf = (text) => Number(text.match(VERSION_RE)?.[1] ?? 0);
@@ -22,6 +23,7 @@ export function scaffold(cwd, { force = false } = {}) {
   for (const [rel, src] of [
     [WORKFLOW_PATH, 'flutter-remote.yml'],
     [GATE_PATH, 'gate.cjs'],
+    [WEBRTC_PEER_PATH, 'webrtc-peer.cjs'],
   ]) {
     const dest = join(cwd, rel);
     const templatePath = join(TEMPLATES, src);

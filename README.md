@@ -169,14 +169,15 @@ The browser interface streams the iOS Simulator display with full bidirectional 
 | `--device <name>` | `iPhone 17 Pro` | Simulator device name (auto-falls back if runner differs) |
 | `--runner <label>` | `macos-26` | GitHub macOS runner label (must be ARM64 for serve-sim) |
 | `--flutter-version <v>` | `stable` | Flutter SDK version or channel (e.g. `3.29.0`) |
-| `--build-mode <mode>` | `debug` | Flutter build mode (`debug`, `profile`, `release`) |
+| `--build-mode <mode>` | `debug` | Flutter build mode (`debug` — iOS Simulator only supports debug mode) |
 | `--flavor <name>` | _none_ | Flutter flavor (e.g. `staging`, `production`) |
 | `--target <file>` | _none_ | Target entrypoint Dart file (e.g. `lib/main_dev.dart`) |
 | `--dart-define <K=V>` | _none_ | Pass build-time environment variables (repeatable) |
-| `--codec <codec>` | `mjpeg` | Stream codec (`mjpeg` or `h264`) |
-| `--fps <n>` | `30` | MJPEG streaming frame rate |
-| `--quality <n>` | `0.7` | MJPEG image quality (0.05 to 1.0) |
-| `--max-dimension <n>` | `900` | Max captured dimension in pixels (keeps stream snappy) |
+| `--codec <codec>` | `mjpeg` | Stream codec: `mjpeg` (stable, no black screen reconnects) or `auto` |
+| `--tunnel-protocol <p>` | `quic` | Cloudflare tunnel: `quic` (UDP, better on lossy networks) or `http2` (TCP) |
+| `--fps <n>` | — | _(no-op)_ serve-sim always streams at native 60 FPS |
+| `--quality <n>` | — | _(no-op)_ quality is managed internally by the H.264 hardware encoder |
+| `--max-dimension <n>` | — | _(no-op)_ serve-sim uses the simulator's native resolution |
 | `--app-file <path>` | _none_ | Run a prebuilt `.app` directory or archive directly |
 | `--app <url>` | _none_ | Download and run a prebuilt simulator `.app` from URL |
 | `--public` | `false` | Push to public GitHub repo (unlimited free macOS minutes) |

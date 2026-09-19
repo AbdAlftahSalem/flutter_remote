@@ -8,7 +8,7 @@ import { scaffold, WORKFLOW_PATH } from './init.js';
 import { saveSession } from '../lib/session.js';
 import * as r2 from '../lib/r2.js';
 import * as ghrelease from '../lib/ghrelease.js';
-import { info, ok, warn, step, spinner, bold, dim, cyan, green, red } from '../lib/ui.js';
+import { info, ok, warn, error, step, spinner, bold, dim, cyan, green, red } from '../lib/ui.js';
 
 const WORKFLOW = 'flutter-remote.yml';
 
@@ -120,6 +120,7 @@ export async function up(cwd, flags = {}) {
     device: flags.device ?? 'iPhone 17 Pro',
     mode,
     flutter_version: flutterVersion,
+    // iOS Simulator only supports 'debug' mode in Flutter.
     build_mode: flags['build-mode'] ?? 'debug',
     flavor: flags.flavor ?? '',
     target: flags.target ?? '',
@@ -130,10 +131,18 @@ export async function up(cwd, flags = {}) {
     agent_device: flags.agent ? 'true' : 'false',
     agent_device_version: '0.20.1',
     transport: flags.transport ?? 'http',
+    // 'quic' = QUIC/HTTP3 (UDP-based, handles packet loss better than TCP).
+    // Falls back to http2 automatically if UDP is blocked.
+    tunnel_protocol: flags['tunnel-protocol'] ?? 'quic',
+    // 'mjpeg' → stable, no black-screen reconnect loops on virtual machines.
+    // 'auto' → H.264 hardware (VideoToolbox)
     codec: flags.codec ?? 'mjpeg',
-    max_dimension: String(flags['max-dimension'] ?? 900),
-    video_fps: String(flags.fps ?? 30),
-    video_quality: String(flags.quality ?? 0.7),
+    // Note: serve-sim streams at the simulator's native resolution and 60 FPS.
+    // The flags below are accepted for backward compatibility but are no-ops;
+    // serve-sim does not expose --fps, --quality, or --max-dimension CLI options.
+    max_dimension: String(flags['max-dimension'] ?? 720),
+    video_fps: String(flags.fps ?? 20),
+    video_quality: String(flags.quality ?? 0.5),
     cache: flags.cache === false ? 'false' : 'true',
     runner: flags.runner ?? 'macos-26',
   });
