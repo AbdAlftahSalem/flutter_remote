@@ -102,10 +102,14 @@ class VideoEncoder extends EventEmitter {
     this._auHasVcl = false;
     this._flushTimer = null;
 
-    // Fresh IDR Recovery & Coalescing State
+    // Fresh IDR Recovery, Coalescing & Runtime Force-IDR State
     this._keyframeRequested = false;
     this._pendingKeyframeResolvers = [];
     this._pendingKeyframePromise = null;
+    this._forceKeyframePending = false;
+    this._keyframeTimer = null;
+    this._keyframeTimeoutMs = options.keyframeTimeoutMs || 2000;
+    this._controlChannel = options.controlChannel || null;
 
     this.metrics = {
       inputReceived: 0,
@@ -138,6 +142,7 @@ class VideoEncoder extends EventEmitter {
       '-pix_fmt', 'yuv420p',
       '-g', String(this.fps),
       '-keyint_min', '1',
+      '-forced-idr', '1',
       '-aud', '1',
       '-b:v', `${this.bitrateKbps}k`,
       '-maxrate', `${this.bitrateKbps}k`,
@@ -446,6 +451,11 @@ class VideoEncoder extends EventEmitter {
     }
 
     if (isIdrAU) {
+      if (this._keyframeTimer) {
+        clearTimeout(this._keyframeTimer);
+        this._keyframeTimer = null;
+      }
+
       if (this._keyframeRequested) {
         console.log(`[video] fresh IDR encoded (total keyframes: ${this.metrics.keyframes}, requests: ${this.metrics.keyframeRequests})`);
         this.emit('fresh_keyframe_encoded', {
@@ -455,6 +465,7 @@ class VideoEncoder extends EventEmitter {
           requestCount: this.metrics.keyframeRequests,
         });
         this._keyframeRequested = false;
+        this._forceKeyframePending = false;
       }
 
       if (this._pendingKeyframeResolvers.length > 0) {
@@ -589,14 +600,20 @@ class VideoEncoder extends EventEmitter {
 
   /**
    * Handles client keyframe requests.
-   * Emits keyframe_requested event, coalesces rapid requests, and returns a promise
-   * resolving with the fresh IDR packets when encoded by the live pipeline.
-   * Does NOT replay cachedKeyframe as recovery mechanism.
+   * Emits keyframe_requested event, coalesces rapid requests, triggers runtime force-keyframe
+   * on the live FFmpeg encoder, and returns a promise resolving with fresh IDR packets.
    */
   requestKeyframe() {
     this.metrics.keyframeRequests++;
-    console.log(`[video] keyframe request received (request count: ${this.metrics.keyframeRequests})`);
-    this.emit('keyframe_requested', { count: this.metrics.keyframeRequests });
+
+    console.log(
+      `[video] keyframe request received ` +
+      `(request count: ${this.metrics.keyframeRequests})`
+    );
+
+    this.emit('keyframe_requested', {
+      count: this.metrics.keyframeRequests,
+    });
 
     this._keyframeRequested = true;
 
@@ -604,9 +621,60 @@ class VideoEncoder extends EventEmitter {
       this._pendingKeyframePromise = new Promise((resolve) => {
         this._pendingKeyframeResolvers.push(resolve);
       });
+
+      this._setupKeyframeTimeout();
+      this._forceNextKeyframe();
     }
 
     return this._pendingKeyframePromise;
+  }
+
+  _setupKeyframeTimeout() {
+    if (this._keyframeTimer) {
+      clearTimeout(this._keyframeTimer);
+    }
+    this._keyframeTimer = setTimeout(() => {
+      console.warn('[video] forced IDR timeout');
+      this._forceKeyframePending = false;
+      this._keyframeRequested = false;
+
+      const resolvers = this._pendingKeyframeResolvers;
+      this._pendingKeyframeResolvers = [];
+      this._pendingKeyframePromise = null;
+
+      for (const resolve of resolvers) {
+        try {
+          resolve([]);
+        } catch {}
+      }
+    }, this._keyframeTimeoutMs);
+  }
+
+  _forceNextKeyframe() {
+    if (this._forceKeyframePending) {
+      return;
+    }
+
+    this._forceKeyframePending = true;
+    console.log('[video] forcing next IDR');
+    this.emit('keyframe_forcing');
+
+    this._sendRuntimeForceKeyframe();
+  }
+
+  _sendRuntimeForceKeyframe() {
+    if (this._controlChannel && typeof this._controlChannel.write === 'function') {
+      try {
+        this._controlChannel.write('force_keyframe\n');
+      } catch (err) {
+        console.warn(`[video] failed to force IDR: ${err.message}`);
+      }
+    }
+
+    this.emit('force_idr_command', {
+      timestamp: Date.now(),
+      requestId: this.metrics.keyframeRequests,
+    });
   }
 
   getKeyframePackets() {
@@ -736,6 +804,13 @@ class VideoEncoder extends EventEmitter {
     this._pendingQueue = [];
     this._waitingForDrain = false;
 
+    if (this._keyframeTimer) {
+      clearTimeout(this._keyframeTimer);
+      this._keyframeTimer = null;
+    }
+    this._forceKeyframePending = false;
+    this._keyframeRequested = false;
+
     if (this._pendingKeyframeResolvers.length > 0) {
       for (const resolve of this._pendingKeyframeResolvers) {
         try { resolve([]); } catch {}
@@ -743,7 +818,6 @@ class VideoEncoder extends EventEmitter {
       this._pendingKeyframeResolvers = [];
       this._pendingKeyframePromise = null;
     }
-    this._keyframeRequested = false;
   }
 }
 

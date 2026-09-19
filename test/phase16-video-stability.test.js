@@ -231,7 +231,103 @@ test('Test E — backpressure: bounded queue, stale frame dropping, and latest-f
   assert.equal(writtenBuffers[1].toString(), 'frame-103');
 });
 
-test('Test A (Fresh IDR) — request produces fresh IDR and does not simply return cached keyframe', async () => {
+test('Test 1 (Runtime Force Request) — requestKeyframe() triggers runtime force-IDR mechanism exactly once', () => {
+  const mockControl = {
+    messages: [],
+    write(msg) {
+      this.messages.push(msg);
+      return true;
+    },
+  };
+
+  const encoder = new VideoEncoder({
+    payloadType: 98,
+    ssrc: 12345,
+    mtu: 1200,
+    fps: 30,
+    controlChannel: mockControl,
+  });
+
+  let forceCommandEvent = null;
+  encoder.on('force_idr_command', (evt) => {
+    forceCommandEvent = evt;
+  });
+
+  let keyframeForcingEmitted = false;
+  encoder.on('keyframe_forcing', () => {
+    keyframeForcingEmitted = true;
+  });
+
+  assert.equal(encoder._forceKeyframePending, false);
+  assert.equal(encoder._keyframeRequested, false);
+
+  const promise = encoder.requestKeyframe();
+
+  assert.ok(promise instanceof Promise, 'requestKeyframe must return a Promise');
+  assert.equal(encoder._keyframeRequested, true, '_keyframeRequested must be set');
+  assert.equal(encoder._forceKeyframePending, true, '_forceKeyframePending must be set');
+  assert.equal(keyframeForcingEmitted, true, 'keyframe_forcing event must be emitted');
+  assert.ok(forceCommandEvent, 'force_idr_command event must be emitted');
+  assert.equal(mockControl.messages.length, 1, 'Runtime control channel must receive exactly one command');
+  assert.equal(mockControl.messages[0], 'force_keyframe\n');
+});
+
+test('Test 2 (Coalescing) — p1 === p2 === p3 and only one runtime force command is dispatched', async () => {
+  const mockControl = {
+    messages: [],
+    write(msg) {
+      this.messages.push(msg);
+      return true;
+    },
+  };
+
+  const encoder = new VideoEncoder({
+    payloadType: 98,
+    ssrc: 12345,
+    mtu: 1200,
+    fps: 30,
+    controlChannel: mockControl,
+  });
+
+  let forceCommandCount = 0;
+  encoder.on('force_idr_command', () => {
+    forceCommandCount++;
+  });
+
+  // Multiple requests arrive in rapid succession
+  const p1 = encoder.requestKeyframe();
+  const p2 = encoder.requestKeyframe();
+  const p3 = encoder.requestKeyframe();
+  const p4 = encoder.requestKeyframe();
+
+  // Verify coalescing: All calls return the EXACT same pending promise
+  assert.equal(p1, p2, 'p1 and p2 must be the exact same promise');
+  assert.equal(p2, p3, 'p2 and p3 must be the exact same promise');
+  assert.equal(p3, p4, 'p3 and p4 must be the exact same promise');
+  assert.equal(encoder.metrics.keyframeRequests, 4, 'Metrics must record all 4 incoming requests');
+  assert.equal(encoder._keyframeRequested, true, 'Active requested flag must be true');
+  assert.equal(forceCommandCount, 1, 'Only ONE runtime force command must be dispatched');
+  assert.equal(mockControl.messages.length, 1, 'Only one control command written');
+
+  // Feed one fresh IDR
+  const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+  const sps = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00]), Buffer.alloc(10, 0x11)]);
+  const pps = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x22)]);
+  const idr = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(40, 0x33)]);
+  const delim = Buffer.concat([prefix4, Buffer.from([0x41, 0x88]), Buffer.alloc(10, 0x44)]);
+  encoder.feedStream(Buffer.concat([sps, pps, idr, delim]));
+
+  const [res1, res2, res3, res4] = await Promise.all([p1, p2, p3, p4]);
+  assert.equal(res1, res2);
+  assert.equal(res2, res3);
+  assert.equal(res3, res4);
+  assert.equal(encoder._keyframeRequested, false, 'Keyframe request state must be cleared after resolution');
+  assert.equal(encoder._forceKeyframePending, false, 'Force keyframe pending flag must be cleared');
+  assert.equal(encoder._pendingKeyframeResolvers.length, 0, 'Resolver queue must be empty');
+  assert.equal(encoder._pendingKeyframePromise, null, 'Pending promise must be cleared');
+});
+
+test('Test 3 (Fresh IDR) — resolves only when fresh IDR Access Unit arrives, never using cached keyframe', async () => {
   const encoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
   const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
 
@@ -264,6 +360,15 @@ test('Test A (Fresh IDR) — request produces fresh IDR and does not simply retu
   assert.equal(keyframeRequestedEmitted, true, 'Must emit keyframe_requested event');
   assert.equal(encoder._keyframeRequested, true, 'Must mark _keyframeRequested');
 
+  // Intermediate P-frame arrives - must NOT resolve the recovery promise
+  let prematurelyResolved = false;
+  recoveryPromise.then(() => { prematurelyResolved = true; });
+
+  const nonIdr2 = Buffer.concat([prefix4, Buffer.from([0x41, 0x88]), Buffer.alloc(30, 0x55)]);
+  encoder.feedStream(nonIdr2);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(prematurelyResolved, false, 'Recovery promise must NOT resolve on a P-frame');
+
   // Now feed a fresh IDR (IDR 2) with different data bytes
   const sps2 = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00]), Buffer.alloc(10, 0x77)]);
   const pps2 = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x88)]);
@@ -278,48 +383,16 @@ test('Test A (Fresh IDR) — request produces fresh IDR and does not simply retu
   assert.ok(Array.isArray(recoveryPackets) && recoveryPackets.length >= 3, 'Must resolve with fresh IDR packets');
 
   // Verify that the payload of the fresh IDR contains the new bytes (0x99), not old bytes (0x33)
-  const freshIdrPacket = recoveryPackets.find(p => (p[12] & 0x1f) === NAL_TYPES.IDR);
+  const freshIdrPacket = recoveryPackets.find((p) => (p[12] & 0x1f) === NAL_TYPES.IDR);
   assert.ok(freshIdrPacket, 'Must contain IDR packet');
   assert.ok(freshIdrPacket.includes(0x99), 'Fresh IDR must contain new frame data, not old cached data');
   assert.equal(freshIdrPacket.includes(0x33), false, 'Fresh IDR must not contain old frame data');
   assert.equal(encoder._keyframeRequested, false, 'Pending keyframe request must be cleared');
+  assert.equal(encoder._forceKeyframePending, false, 'Pending force flag must be cleared');
 });
 
-test('Test B (Coalescing) — multiple keyframe requests are coalesced into a single pending request', async () => {
-  const encoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
-  const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-
-  // Multiple requests arrive in rapid succession
-  const p1 = encoder.requestKeyframe();
-  const p2 = encoder.requestKeyframe();
-  const p3 = encoder.requestKeyframe();
-  const p4 = encoder.requestKeyframe();
-
-  // Verify coalescing: All calls return the EXACT same pending promise
-  assert.equal(p1, p2, 'p1 and p2 must be the exact same promise');
-  assert.equal(p2, p3, 'p2 and p3 must be the exact same promise');
-  assert.equal(p3, p4, 'p3 and p4 must be the exact same promise');
-  assert.equal(encoder.metrics.keyframeRequests, 4, 'Metrics must record all 4 incoming requests');
-  assert.equal(encoder._keyframeRequested, true, 'Active requested flag must be true');
-
-  // Feed one fresh IDR
-  const sps = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00]), Buffer.alloc(10, 0x11)]);
-  const pps = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x22)]);
-  const idr = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(40, 0x33)]);
-  const delim = Buffer.concat([prefix4, Buffer.from([0x41, 0x88]), Buffer.alloc(10, 0x44)]);
-  encoder.feedStream(Buffer.concat([sps, pps, idr, delim]));
-
-  const [res1, res2, res3, res4] = await Promise.all([p1, p2, p3, p4]);
-  assert.equal(res1, res2);
-  assert.equal(res2, res3);
-  assert.equal(res3, res4);
-  assert.equal(encoder._keyframeRequested, false, 'Keyframe request state must be cleared after resolution');
-  assert.equal(encoder._pendingKeyframeResolvers.length, 0, 'Resolver queue must be empty (bounded)');
-});
-
-test('Test C (RTP Continuity) — sequence numbers, SSRC, and timestamps advance continuously across recovery IDR', () => {
+test('Test 4 (RTP Continuity) — sequence numbers, SSRC, and timestamps advance continuously across recovery IDR', () => {
   const encoder = new VideoEncoder({ payloadType: 98, ssrc: 8888, mtu: 1200, fps: 30 });
-  const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
 
   // Frame 1: P-frame
   const p1 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x11)]), type: NAL_TYPES.NON_IDR }];
@@ -373,7 +446,7 @@ test('Test C (RTP Continuity) — sequence numbers, SSRC, and timestamps advance
   assert.equal(pkts4[0].readUInt32BE(8), 8888, 'SSRC must remain unchanged');
 });
 
-test('Test D (Marker Bit) — fresh IDR Access Unit sets M=1 only on the final RTP packet', () => {
+test('Test 5 (Marker Bit) — fresh IDR Access Unit sets M=1 only on the final RTP packet', () => {
   // Use mtu = 500 so IDR slice is fragmented into multiple FU-A packets
   const encoder = new VideoEncoder({ payloadType: 98, ssrc: 7777, mtu: 500, fps: 30 });
 
@@ -396,5 +469,33 @@ test('Test D (Marker Bit) — fresh IDR Access Unit sets M=1 only on the final R
   const finalPacket = packets[packets.length - 1];
   const finalMarker = (finalPacket[1] & 0x80) !== 0;
   assert.equal(finalMarker, true, 'Final packet of fresh IDR AU must have Marker bit M=1');
+});
+
+test('Test 6 (Timeout Safety) — missing IDR triggers timeout, clearing pending state and resolving safely', async () => {
+  const encoder = new VideoEncoder({
+    payloadType: 98,
+    ssrc: 12345,
+    mtu: 1200,
+    fps: 30,
+    keyframeTimeoutMs: 50, // Short timeout for test
+  });
+
+  assert.equal(encoder._keyframeRequested, false);
+  assert.equal(encoder._forceKeyframePending, false);
+
+  const promise = encoder.requestKeyframe();
+
+  assert.equal(encoder._keyframeRequested, true);
+  assert.equal(encoder._forceKeyframePending, true);
+  assert.ok(encoder._keyframeTimer !== null, 'Timeout timer must be active');
+
+  // Wait for timeout to expire
+  const packets = await promise;
+
+  assert.deepEqual(packets, [], 'Timeout must safely resolve to empty packet array');
+  assert.equal(encoder._keyframeRequested, false, 'State must be reset');
+  assert.equal(encoder._forceKeyframePending, false, 'State must be reset');
+  assert.equal(encoder._pendingKeyframeResolvers.length, 0, 'Resolvers list must be cleared');
+  assert.equal(encoder._pendingKeyframePromise, null, 'Pending promise must be cleared');
 });
 
