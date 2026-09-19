@@ -60,10 +60,17 @@ process.on('unhandledRejection', (reason) => {
 // RFC 6184 / Annex-B H.264 Video Encoder & RTP Packetizer
 const NAL_TYPES = {
   NON_IDR: 1,
+  PARTITION_A: 2,
+  PARTITION_B: 3,
+  PARTITION_C: 4,
   IDR: 5,
   SEI: 6,
   SPS: 7,
   PPS: 8,
+  AUD: 9,
+  END_SEQUENCE: 10,
+  END_STREAM: 11,
+  FILLER: 12,
   FU_A: 28,
 };
 
@@ -86,8 +93,28 @@ class VideoEncoder extends EventEmitter {
     this.cachedKeyframe = null;
     this.lastFrameType = null;
 
+    this.maxPendingFrames = options.maxPendingFrames || 1;
+    this._pendingQueue = [];
+    this._waitingForDrain = false;
+
+    this._streamBuffer = Buffer.alloc(0);
+    this._pendingAU = [];
+    this._auHasVcl = false;
+    this._flushTimer = null;
+
+    this.metrics = {
+      inputReceived: 0,
+      inputDropped: 0,
+      inputPending: 0,
+      encodedFrames: 0,
+      keyframes: 0,
+      keyframeRequests: 0,
+      totalEncodeLatencyMs: 0,
+      maxEncodeLatencyMs: 0,
+    };
+    this._diagInterval = null;
+
     this.ffmpegProc = null;
-    this._nalBuffer = Buffer.alloc(0);
     this._isEncoding = false;
   }
 
@@ -105,7 +132,8 @@ class VideoEncoder extends EventEmitter {
       '-tune', 'zerolatency',
       '-pix_fmt', 'yuv420p',
       '-g', String(this.fps),
-      '-keyint_min', String(this.fps),
+      '-keyint_min', '1',
+      '-aud', '1',
       '-b:v', `${this.bitrateKbps}k`,
       '-maxrate', `${this.bitrateKbps}k`,
       '-bufsize', `${this.bitrateKbps * 2}k`,
@@ -116,10 +144,13 @@ class VideoEncoder extends EventEmitter {
     try {
       this.ffmpegProc = spawn(this.ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
       this._isEncoding = true;
+      this._waitingForDrain = false;
 
       this.ffmpegProc.stdout.on('data', (chunk) => {
         this._handleEncodedData(chunk);
       });
+
+      this._setupStdin(this.ffmpegProc.stdin);
 
       this.ffmpegProc.stderr.on('data', (errData) => {
         const msg = errData.toString();
@@ -136,46 +167,307 @@ class VideoEncoder extends EventEmitter {
       this.ffmpegProc.on('close', (code) => {
         this._isEncoding = false;
         this.ffmpegProc = null;
+        this._flushPending();
       });
+
+      this._startDiagnostics();
     } catch (err) {
       console.error('[webrtc-peer encoder spawn error]', err.message);
       this._isEncoding = false;
     }
   }
 
+  _setupStdin(stdin) {
+    if (!stdin || typeof stdin.on !== 'function') return;
+    this._hasDrainListener = true;
+    stdin.on('drain', () => {
+      this._waitingForDrain = false;
+      this._flushNextPendingInput();
+    });
+  }
+
   encodeFrame(jpegBuffer) {
+    if (!Buffer.isBuffer(jpegBuffer) || jpegBuffer.length === 0) {
+      return false;
+    }
+
+    this.metrics.inputReceived++;
+
     if (!this.ffmpegProc || !this.ffmpegProc.stdin || !this.ffmpegProc.stdin.writable) {
       this.start();
     }
 
-    if (this.ffmpegProc && this.ffmpegProc.stdin && this.ffmpegProc.stdin.writable) {
-      try {
-        this.ffmpegProc.stdin.write(jpegBuffer);
-        return true;
-      } catch (err) {
-        console.error('[webrtc-peer encodeFrame error]', err.message);
-        return false;
-      }
+    if (!this.ffmpegProc || !this.ffmpegProc.stdin || !this.ffmpegProc.stdin.writable) {
+      return false;
     }
-    return false;
+
+    if (!this._hasDrainListener && this.ffmpegProc.stdin) {
+      this._setupStdin(this.ffmpegProc.stdin);
+    }
+
+    if (this._waitingForDrain) {
+      while (this._pendingQueue.length >= this.maxPendingFrames) {
+        this._pendingQueue.shift();
+        this.metrics.inputDropped++;
+      }
+      this._pendingQueue.push({ buffer: jpegBuffer, ts: Date.now() });
+      this.metrics.inputPending = this._pendingQueue.length;
+      return false;
+    }
+
+    try {
+      const canAcceptMore = this.ffmpegProc.stdin.write(jpegBuffer);
+      if (!canAcceptMore) {
+        this._waitingForDrain = true;
+      }
+      return true;
+    } catch (err) {
+      console.error('[webrtc-peer encodeFrame error]', err.message);
+      return false;
+    }
+  }
+
+  _flushNextPendingInput() {
+    if (this._pendingQueue.length === 0 || !this.ffmpegProc?.stdin?.writable) return;
+
+    const item = this._pendingQueue.shift();
+    this.metrics.inputPending = this._pendingQueue.length;
+
+    try {
+      const canAcceptMore = this.ffmpegProc.stdin.write(item.buffer);
+      if (!canAcceptMore) {
+        this._waitingForDrain = true;
+      }
+    } catch (err) {
+      console.error('[webrtc-peer encodeFrame error]', err.message);
+    }
   }
 
   _handleEncodedData(chunk) {
-    this._nalBuffer = Buffer.concat([this._nalBuffer, chunk]);
+    if (this._flushTimer) {
+      clearTimeout(this._flushTimer);
+      this._flushTimer = null;
+    }
 
-    const nalUnits = this.parseNalUnits(this._nalBuffer);
-    if (nalUnits.length > 1) {
-      const completeNals = nalUnits.slice(0, -1);
-      this.inspectAndCacheNals(completeNals);
+    this._streamBuffer = Buffer.concat([this._streamBuffer, chunk]);
+    const { completeNals, lastStartCode } = this._extractCompleteNalsWithLast();
 
-      const packets = this.packetizeNalUnits(completeNals, this.fps);
-      if (packets.length > 0) {
-        this.emit('packets', packets);
+    for (const nal of completeNals) {
+      if (this._isNewAccessUnit(nal)) {
+        this._emitCurrentAccessUnit();
       }
 
-      const lastNal = nalUnits[nalUnits.length - 1];
-      const prefix = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-      this._nalBuffer = Buffer.concat([prefix, lastNal.data]);
+      this._pendingAU.push(nal);
+      if (nal.type >= 1 && nal.type <= 5) {
+        this._auHasVcl = true;
+      }
+    }
+
+    if (lastStartCode) {
+      this._checkTrailingStartCode(lastStartCode);
+    }
+
+    if (this._auHasVcl && this._isEncoding) {
+      this._flushTimer = setTimeout(() => {
+        this._flushPending();
+      }, 10);
+    }
+  }
+
+  feedStream(chunk) {
+    this._streamBuffer = Buffer.concat([this._streamBuffer, chunk]);
+    const { completeNals, lastStartCode } = this._extractCompleteNalsWithLast();
+    const emittedAUs = [];
+
+    for (const nal of completeNals) {
+      if (this._isNewAccessUnit(nal)) {
+        const au = this._emitCurrentAccessUnit();
+        if (au) emittedAUs.push(au);
+      }
+
+      this._pendingAU.push(nal);
+      if (nal.type >= 1 && nal.type <= 5) {
+        this._auHasVcl = true;
+      }
+    }
+
+    if (lastStartCode) {
+      const au = this._checkTrailingStartCode(lastStartCode);
+      if (au) emittedAUs.push(au);
+    }
+
+    return emittedAUs;
+  }
+
+  _extractCompleteNalsWithLast() {
+    const buffer = this._streamBuffer;
+    if (buffer.length === 0) return { completeNals: [], lastStartCode: null };
+
+    const startCodes = [];
+    const len = buffer.length;
+
+    for (let i = 0; i <= len - 3; i++) {
+      if (buffer[i] === 0x00 && buffer[i + 1] === 0x00) {
+        if (buffer[i + 2] === 0x01) {
+          startCodes.push({ index: i, prefixLen: 3 });
+          i += 2;
+        } else if (i <= len - 4 && buffer[i + 2] === 0x00 && buffer[i + 3] === 0x01) {
+          startCodes.push({ index: i, prefixLen: 4 });
+          i += 3;
+        }
+      }
+    }
+
+    if (startCodes.length === 0) {
+      return { completeNals: [], lastStartCode: null };
+    }
+
+    if (startCodes.length === 1) {
+      if (startCodes[0].index > 0) {
+        this._streamBuffer = buffer.subarray(startCodes[0].index);
+      }
+      return { completeNals: [], lastStartCode: { index: 0, prefixLen: startCodes[0].prefixLen } };
+    }
+
+    const completeNals = [];
+    for (let k = 0; k < startCodes.length - 1; k++) {
+      const current = startCodes[k];
+      const next = startCodes[k + 1];
+      const nalData = buffer.subarray(current.index + current.prefixLen, next.index);
+      if (nalData.length > 0) {
+        const nalType = nalData[0] & 0x1f;
+        completeNals.push({ data: nalData, type: nalType });
+      }
+    }
+
+    const lastStartCode = startCodes[startCodes.length - 1];
+    this._streamBuffer = buffer.subarray(lastStartCode.index);
+
+    return {
+      completeNals,
+      lastStartCode: { index: 0, prefixLen: lastStartCode.prefixLen },
+    };
+  }
+
+  _checkTrailingStartCode(lastStartCode) {
+    const buffer = this._streamBuffer;
+    const trailing = buffer.subarray(lastStartCode.index + lastStartCode.prefixLen);
+    if (trailing.length < 2) return null;
+
+    const nalType = trailing[0] & 0x1f;
+    const isFirstMb = (trailing[1] & 0x80) !== 0;
+
+    let isNewAU = false;
+    if (nalType === NAL_TYPES.AUD) {
+      isNewAU = true;
+    } else if (this._auHasVcl) {
+      if (nalType === NAL_TYPES.SPS || nalType === NAL_TYPES.PPS || nalType === NAL_TYPES.SEI) {
+        isNewAU = true;
+      } else if (nalType >= 1 && nalType <= 5) {
+        if (isFirstMb) {
+          isNewAU = true;
+        } else {
+          const currentHasIdr = this._pendingAU.some(n => n.type === NAL_TYPES.IDR);
+          if (nalType === NAL_TYPES.IDR && !currentHasIdr) isNewAU = true;
+          if (nalType !== NAL_TYPES.IDR && currentHasIdr) isNewAU = true;
+        }
+      }
+    }
+
+    if (isNewAU && this._pendingAU.length > 0) {
+      return this._emitCurrentAccessUnit();
+    }
+    return null;
+  }
+
+  _isNewAccessUnit(nal) {
+    if (this._pendingAU.length === 0) {
+      return false;
+    }
+
+    if (nal.type === NAL_TYPES.AUD) {
+      return true;
+    }
+
+    if (this._auHasVcl) {
+      if (nal.type === NAL_TYPES.SPS || nal.type === NAL_TYPES.PPS || nal.type === NAL_TYPES.SEI) {
+        return true;
+      }
+
+      if (nal.type >= 1 && nal.type <= 5) {
+        if (nal.data.length > 1 && (nal.data[1] & 0x80) !== 0) {
+          return true;
+        }
+
+        const currentHasIdr = this._pendingAU.some(n => n.type === NAL_TYPES.IDR);
+        if (nal.type === NAL_TYPES.IDR && !currentHasIdr) {
+          return true;
+        }
+        if (nal.type !== NAL_TYPES.IDR && currentHasIdr) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  _processNalUnit(nal) {
+    if (this._isNewAccessUnit(nal)) {
+      this._emitCurrentAccessUnit();
+    }
+
+    this._pendingAU.push(nal);
+    if (nal.type >= 1 && nal.type <= 5) {
+      this._auHasVcl = true;
+    }
+  }
+
+  _emitCurrentAccessUnit() {
+    if (this._pendingAU.length === 0) return null;
+
+    const auNals = this._pendingAU;
+    this._pendingAU = [];
+    this._auHasVcl = false;
+
+    this.inspectAndCacheNals(auNals);
+    this.metrics.encodedFrames++;
+
+    const packets = this.packetizeAccessUnit(auNals, this.fps);
+    if (packets.length > 0) {
+      this.emit('packets', packets);
+    }
+    return auNals;
+  }
+
+  _flushPending() {
+    if (this._flushTimer) {
+      clearTimeout(this._flushTimer);
+      this._flushTimer = null;
+    }
+
+    if (this._streamBuffer.length >= 4) {
+      let pfxLen = 0;
+      if (this._streamBuffer[0] === 0 && this._streamBuffer[1] === 0) {
+        if (this._streamBuffer[2] === 1) pfxLen = 3;
+        else if (this._streamBuffer[2] === 0 && this._streamBuffer[3] === 1) pfxLen = 4;
+      }
+      if (pfxLen > 0) {
+        const nalData = this._streamBuffer.subarray(pfxLen);
+        if (nalData.length > 0) {
+          const nalType = nalData[0] & 0x1f;
+          this._streamBuffer = Buffer.alloc(0);
+          if (this._isNewAccessUnit({ data: nalData, type: nalType })) {
+            this._emitCurrentAccessUnit();
+          }
+          this._pendingAU.push({ data: nalData, type: nalType });
+          if (nalType >= 1 && nalType <= 5) this._auHasVcl = true;
+        }
+      }
+    }
+
+    if (this._auHasVcl) {
+      this._emitCurrentAccessUnit();
     }
   }
 
@@ -186,12 +478,12 @@ class VideoEncoder extends EventEmitter {
     const len = buffer.length;
     const startIndices = [];
 
-    for (let i = 0; i < len - 2; i++) {
+    for (let i = 0; i <= len - 3; i++) {
       if (buffer[i] === 0x00 && buffer[i + 1] === 0x00) {
         if (buffer[i + 2] === 0x01) {
           startIndices.push({ index: i, prefixLen: 3 });
           i += 2;
-        } else if (i < len - 3 && buffer[i + 2] === 0x00 && buffer[i + 3] === 0x01) {
+        } else if (i <= len - 4 && buffer[i + 2] === 0x00 && buffer[i + 3] === 0x01) {
           startIndices.push({ index: i, prefixLen: 4 });
           i += 3;
         }
@@ -233,6 +525,7 @@ class VideoEncoder extends EventEmitter {
 
     if (hasIdr) {
       this.lastFrameType = 'keyframe';
+      this.metrics.keyframes++;
       const partsWithPrefixes = [];
       const prefix = Buffer.from([0x00, 0x00, 0x00, 0x01]);
 
@@ -262,30 +555,46 @@ class VideoEncoder extends EventEmitter {
     return this.cachedKeyframe;
   }
 
+  requestKeyframe() {
+    this.metrics.keyframeRequests++;
+    this.emit('keyframe_requested');
+
+    if (this.hasKeyframe()) {
+      return this.getKeyframePackets();
+    }
+    return [];
+  }
+
   getKeyframePackets() {
     if (!this.hasKeyframe()) return [];
     return this.packetize(this.cachedKeyframe, this.fps);
   }
 
-  packetizeNalUnits(nalUnits, fps = 30) {
+  packetizeAccessUnit(accessUnitNals, fps = 30) {
+    if (!Array.isArray(accessUnitNals) || accessUnitNals.length === 0) {
+      return [];
+    }
+
     const timestampDelta = Math.round(this._clockRate / fps);
     this._timestamp = (this._timestamp + timestampDelta) >>> 0;
+    const frameTimestamp = this._timestamp;
 
     const packets = [];
     const maxPayloadSize = this.mtu - 12;
 
-    for (let u = 0; u < nalUnits.length; u++) {
-      const nal = nalUnits[u];
+    for (let u = 0; u < accessUnitNals.length; u++) {
+      const nal = accessUnitNals[u];
       const nalData = nal.data;
-      const isLastNal = (u === nalUnits.length - 1);
+      const isLastNalOfAU = (u === accessUnitNals.length - 1);
 
       if (nalData.length <= maxPayloadSize) {
+        const isLastPacketOfAU = isLastNalOfAU;
         const rtp = Buffer.alloc(12 + nalData.length);
         rtp[0] = 0x80;
-        rtp[1] = (isLastNal ? 0x80 : 0x00) | (this.payloadType & 0x7f);
+        rtp[1] = (isLastPacketOfAU ? 0x80 : 0x00) | (this.payloadType & 0x7f);
         rtp.writeUInt16BE(this._sequenceNumber & 0xffff, 2);
         this._sequenceNumber = (this._sequenceNumber + 1) & 0xffff;
-        rtp.writeUInt32BE(this._timestamp, 4);
+        rtp.writeUInt32BE(frameTimestamp, 4);
         rtp.writeUInt32BE(this.ssrc, 8);
         nalData.copy(rtp, 12);
         packets.push(rtp);
@@ -302,7 +611,7 @@ class VideoEncoder extends EventEmitter {
         for (let i = 0; i < totalChunks; i++) {
           const isStart = (i === 0);
           const isEnd = (i === totalChunks - 1);
-          const isLastPacketOfFrame = isLastNal && isEnd;
+          const isLastPacketOfAU = isLastNalOfAU && isEnd;
 
           let fuHeader = originalType & 0x1f;
           if (isStart) fuHeader |= 0x80;
@@ -314,10 +623,10 @@ class VideoEncoder extends EventEmitter {
 
           const rtp = Buffer.alloc(12 + 2 + chunk.length);
           rtp[0] = 0x80;
-          rtp[1] = (isLastPacketOfFrame ? 0x80 : 0x00) | (this.payloadType & 0x7f);
+          rtp[1] = (isLastPacketOfAU ? 0x80 : 0x00) | (this.payloadType & 0x7f);
           rtp.writeUInt16BE(this._sequenceNumber & 0xffff, 2);
           this._sequenceNumber = (this._sequenceNumber + 1) & 0xffff;
-          rtp.writeUInt32BE(this._timestamp, 4);
+          rtp.writeUInt32BE(frameTimestamp, 4);
           rtp.writeUInt32BE(this.ssrc, 8);
 
           rtp[12] = fuIndicator;
@@ -331,6 +640,10 @@ class VideoEncoder extends EventEmitter {
     return packets;
   }
 
+  packetizeNalUnits(nalUnits, fps = 30) {
+    return this.packetizeAccessUnit(nalUnits, fps);
+  }
+
   packetize(frameBuffer, fps = 30) {
     if (!Buffer.isBuffer(frameBuffer) || frameBuffer.length === 0) {
       return [];
@@ -340,11 +653,32 @@ class VideoEncoder extends EventEmitter {
       this.inspectAndCacheNals(nalUnits);
     }
     const units = (nalUnits.length > 0) ? nalUnits : [{ data: frameBuffer, type: frameBuffer[0] & 0x1f }];
-    return this.packetizeNalUnits(units, fps);
+    return this.packetizeAccessUnit(units, fps);
+  }
+
+  _startDiagnostics() {
+    if (this._diagInterval) return;
+    this._diagInterval = setInterval(() => {
+      if (this.metrics.inputReceived > 0 || this.metrics.encodedFrames > 0) {
+        const avgLatency = this.metrics.encodedFrames > 0
+          ? Math.round(this.metrics.totalEncodeLatencyMs / this.metrics.encodedFrames)
+          : 0;
+        console.log(`[webrtc-peer video] received=${this.metrics.inputReceived} encoded=${this.metrics.encodedFrames} dropped=${this.metrics.inputDropped} pending=${this.metrics.inputPending} keyframes=${this.metrics.keyframes} keyframeRequests=${this.metrics.keyframeRequests}`);
+      }
+    }, 3000);
+    this._diagInterval.unref?.();
   }
 
   close() {
     this._isEncoding = false;
+    if (this._flushTimer) {
+      clearTimeout(this._flushTimer);
+      this._flushTimer = null;
+    }
+    if (this._diagInterval) {
+      clearInterval(this._diagInterval);
+      this._diagInterval = null;
+    }
     if (this.ffmpegProc) {
       try {
         if (this.ffmpegProc.stdin) this.ffmpegProc.stdin.end();
@@ -352,7 +686,11 @@ class VideoEncoder extends EventEmitter {
       } catch {}
       this.ffmpegProc = null;
     }
-    this._nalBuffer = Buffer.alloc(0);
+    this._streamBuffer = Buffer.alloc(0);
+    this._pendingAU = [];
+    this._auHasVcl = false;
+    this._pendingQueue = [];
+    this._waitingForDrain = false;
   }
 }
 
@@ -628,8 +966,8 @@ if (WebSocketServer) {
               if (label === 'control') {
                 try {
                   const cmd = JSON.parse(rawMsg.toString());
-                  if (cmd.type === 'request_keyframe' && videoTrack && videoEncoder.hasKeyframe()) {
-                    const keyPackets = videoEncoder.getKeyframePackets();
+                  if (cmd.type === 'request_keyframe' && videoTrack) {
+                    const keyPackets = videoEncoder.requestKeyframe();
                     for (const kp of keyPackets) {
                       try { videoTrack.sendMessageBinary(kp); } catch {}
                     }
