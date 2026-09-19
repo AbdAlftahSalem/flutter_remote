@@ -217,7 +217,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Installing WebRTC peer dependencies (node-datachannel, ws)..."
-          npm install -g node-datachannel@0.10.2 ws@8.18.0 --prefer-offline
+          npm install -g node-datachannel@0.33.4 ws@8.18.0 --prefer-offline
 
       - name: Start WebRTC peer
         timeout-minutes: 5

@@ -8,7 +8,7 @@ test('Phase 13: templates/flutter-remote.yml pinned dependencies and version 14'
   const ymlContent = readFileSync(ymlPath, 'utf8');
 
   assert.ok(ymlContent.includes('flutter-remote-template-version: 14'), 'Template version must be 14');
-  assert.ok(ymlContent.includes('node-datachannel@0.10.2'), 'node-datachannel must be pinned to 0.10.2');
+  assert.ok(ymlContent.includes('node-datachannel@0.33.4'), 'node-datachannel must be pinned to 0.33.4');
   assert.ok(ymlContent.includes('ws@8.18.0'), 'ws must be pinned to 8.18.0');
   assert.ok(ymlContent.includes('FLUTTER_REMOTE_TRANSPORT'), 'Must pass FLUTTER_REMOTE_TRANSPORT env');
 });
