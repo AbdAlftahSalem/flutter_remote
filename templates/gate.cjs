@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 8
+// flutter-remote-template-version: 9
 /**
  * flutter-remote auth gate.
  *
@@ -148,6 +148,7 @@ function getTurnConfig() {
         });
       }
     );
+
     req.on('error', () => {
       turnFetchPromise = null;
       resolve(defaultStun);
@@ -167,133 +168,121 @@ function getTurnConfig() {
 const WEBRTC_CLIENT_SCRIPT_V2 = `
 (function() {
   'use strict';
-  if (window.__flutterRemoteV2Injected) return;
-  window.__flutterRemoteV2Injected = true;
+  if (window.__flutterRemoteV2Initialized) return;
+  window.__flutterRemoteV2Initialized = true;
 
   const PROTOCOL_VERSION = 2;
   const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
 
-  class FlutterRemoteClient {
+  class ConnectionState {
     constructor() {
-      const urlParams = new URLSearchParams(window.location.search);
-      this.sessionId = urlParams.get('session') || 'active';
-      this.token = urlParams.get('k') || '';
-      this.debugMode = urlParams.get('debug') === '1';
+      this.state = 'IDLE';
       this.generation = 1;
-      this.peer = null;
-      this.signalingWs = null;
-      this.dataChannels = {};
       this.reconnectAttempt = 0;
       this.reconnectTimer = null;
-      this.rtt = 0;
-
-      this.metrics = {
-        rtt: 0,
-        fps: 0,
-        connectionState: 'IDLE',
-        iceState: 'new',
-        reconnects: 0,
-      };
-
-      this.elements = {};
-      this._initDOM();
-      this._initInputEngine();
-      this._connectSignaling();
+      this.listeners = new Set();
     }
-
-    _initDOM() {
-      const container = document.getElementById('flutter-remote-container') || document.body;
-
-      let video = document.getElementById('flutter-remote-video');
-      if (!video) {
-        video = document.createElement('video');
-        video.id = 'flutter-remote-video';
-        video.autoplay = true;
-        video.playsInline = true;
-        video.muted = true;
-        video.style.cssText = 'width:100%;height:100%;object-fit:contain;background:#000;display:block;';
-        container.appendChild(video);
-      }
-      this.elements.video = video;
-
-      let overlay = document.getElementById('flutter-remote-input-overlay');
-      if (!overlay) {
-        overlay = document.createElement('div');
-        overlay.id = 'flutter-remote-input-overlay';
-        overlay.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;touch-action:none;cursor:pointer;z-index:10;';
-        container.style.position = 'relative';
-        container.appendChild(overlay);
-      }
-      this.elements.overlay = overlay;
-
-      let status = document.getElementById('flutter-remote-status');
-      if (!status) {
-        status = document.createElement('div');
-        status.id = 'flutter-remote-status';
-        status.style.cssText = 'position:absolute;top:10px;left:50%;transform:translateX(-50%);padding:6px 14px;background:rgba(0,0,0,0.75);color:#fff;border-radius:20px;font:12px sans-serif;z-index:20;transition:opacity 0.3s;pointer-events:none;';
-        container.appendChild(status);
-      }
-      this.elements.status = status;
-
-      if (this.debugMode) {
-        const debugPanel = document.createElement('div');
-        debugPanel.id = 'flutter-remote-debug-panel';
-        debugPanel.style.cssText = 'position:absolute;bottom:10px;left:10px;padding:10px;background:rgba(0,0,0,0.85);color:#0f0;font:11px monospace;border-radius:6px;z-index:30;pointer-events:none;line-height:1.4;';
-        container.appendChild(debugPanel);
-        this.elements.debugPanel = debugPanel;
-        setInterval(() => this._updateDebug(), 1000);
-      }
-
-      this._updateStatus('Connecting to remote simulator...');
+    set(s) {
+      if (this.state === s) return;
+      this.state = s;
+      for (const fn of this.listeners) { try { fn(this.state, this.generation); } catch {} }
     }
-
-    _updateStatus(text) {
-      if (this.elements.status) {
-        this.elements.status.textContent = text;
-        this.elements.status.style.opacity = '1';
-        if (text === 'Connected') {
-          setTimeout(() => {
-            if (this.elements.status.textContent === 'Connected') {
-              this.elements.status.style.opacity = '0';
-            }
-          }, 2000);
-        }
-      }
+    onChange(fn) { this.listeners.add(fn); }
+    advanceGeneration() { return ++this.generation; }
+    resetBackoff() {
+      this.reconnectAttempt = 0;
+      if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     }
+    scheduleReconnect(cb) {
+      if (this.reconnectTimer) return;
+      this.set('RECONNECTING');
+      const delay = BACKOFF_MS[Math.min(this.reconnectAttempt, BACKOFF_MS.length - 1)];
+      this.reconnectAttempt++;
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        this.advanceGeneration();
+        cb();
+      }, delay);
+    }
+  }
 
-    _initInputEngine() {
-      const overlay = this.elements.overlay;
-      let nextSeq = 1;
-      let pendingMove = null;
-      let rafId = null;
+  class VideoRenderer {
+    constructor(container) {
+      this.container = container;
+      this.video = null;
+      this.firstFrameTime = 0;
+      this.connectTime = Date.now();
+      this._init();
+    }
+    _init() {
+      let v = document.getElementById('flutter-remote-video');
+      if (!v) {
+        v = document.createElement('video');
+        v.id = 'flutter-remote-video';
+        v.autoplay = true;
+        v.playsInline = true;
+        v.muted = true;
+        v.style.cssText = 'width:100%;height:100%;object-fit:contain;background:#000;display:block;';
+        this.container.appendChild(v);
+      }
+      this.video = v;
+      this.video.addEventListener('loadeddata', () => {
+        if (!this.firstFrameTime) this.firstFrameTime = Date.now() - this.connectTime;
+      });
+    }
+    attachStream(s) {
+      this.connectTime = Date.now();
+      this.firstFrameTime = 0;
+      this.video.srcObject = s;
+      this.video.play().catch(() => {});
+    }
+    getBounds() { return this.video.getBoundingClientRect(); }
+    getVideoResolution() {
+      return { width: this.video.videoWidth || 720, height: this.video.videoHeight || 1280 };
+    }
+  }
 
-      const sendPointer = (data) => {
+  class InputController {
+    constructor(container, videoRenderer, dataChannels) {
+      this.container = container;
+      this.videoRenderer = videoRenderer;
+      this.dataChannels = dataChannels;
+      this.overlay = null;
+      this.nextSeq = 1;
+      this.pendingMove = null;
+      this.rafId = null;
+      this._init();
+    }
+    _init() {
+      let o = document.getElementById('flutter-remote-input-overlay');
+      if (!o) {
+        o = document.createElement('div');
+        o.id = 'flutter-remote-input-overlay';
+        o.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;touch-action:none;cursor:pointer;z-index:10;';
+        this.container.style.position = 'relative';
+        this.container.appendChild(o);
+      }
+      this.overlay = o;
+
+      const sendPointer = (evt) => {
         const dc = this.dataChannels.input;
         if (dc && dc.readyState === 'open') {
-          if (dc.bufferedAmount > 65536 && data.event === 'move') return;
-          dc.send(JSON.stringify(data));
+          if (dc.bufferedAmount > 65536 && evt.event === 'move') return;
+          dc.send(JSON.stringify(evt));
         }
       };
 
       const flush = () => {
-        if (pendingMove) {
-          sendPointer(pendingMove);
-          pendingMove = null;
-        }
-        rafId = null;
+        if (this.pendingMove) { sendPointer(this.pendingMove); this.pendingMove = null; }
+        this.rafId = null;
       };
 
       const handlePointer = (e, type) => {
-        const rect = this.elements.video.getBoundingClientRect();
-        const videoWidth = this.elements.video.videoWidth || 720;
-        const videoHeight = this.elements.video.videoHeight || 1280;
+        const rect = this.videoRenderer.getBounds();
+        const { width: vW, height: vH } = this.videoRenderer.getVideoResolution();
         const containerAspect = rect.width / rect.height;
-        const videoAspect = videoWidth / videoHeight;
-
-        let dispW = rect.width;
-        let dispH = rect.height;
-        let offX = 0;
-        let offY = 0;
+        const videoAspect = vW / vH;
+        let dispW = rect.width, dispH = rect.height, offX = 0, offY = 0;
 
         if (containerAspect > videoAspect) {
           dispW = rect.height * videoAspect;
@@ -311,7 +300,7 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
         const evt = {
           v: PROTOCOL_VERSION,
           type: 'pointer',
-          seq: nextSeq++,
+          seq: this.nextSeq++,
           ts: Date.now(),
           event: type,
           pointerId: e.pointerId || 1,
@@ -322,74 +311,208 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
         };
 
         if (type === 'down') {
-          try { overlay.setPointerCapture(e.pointerId); } catch {}
-          if (rafId) { cancelAnimationFrame(rafId); flush(); }
+          try { this.overlay.setPointerCapture(e.pointerId); } catch {}
+          if (this.rafId) { cancelAnimationFrame(this.rafId); flush(); }
           sendPointer(evt);
         } else if (type === 'up' || type === 'cancel') {
-          try { overlay.releasePointerCapture(e.pointerId); } catch {}
-          if (rafId) { cancelAnimationFrame(rafId); flush(); }
+          try { this.overlay.releasePointerCapture(e.pointerId); } catch {}
+          if (this.rafId) { cancelAnimationFrame(this.rafId); flush(); }
           sendPointer(evt);
         } else if (type === 'move') {
-          pendingMove = evt;
-          if (!rafId) rafId = requestAnimationFrame(flush);
+          this.pendingMove = evt;
+          if (!this.rafId) this.rafId = requestAnimationFrame(flush);
         }
       };
 
-      overlay.addEventListener('pointerdown', (e) => handlePointer(e, 'down'));
-      overlay.addEventListener('pointermove', (e) => handlePointer(e, 'move'));
-      overlay.addEventListener('pointerup', (e) => handlePointer(e, 'up'));
-      overlay.addEventListener('pointercancel', (e) => handlePointer(e, 'cancel'));
+      this.overlay.addEventListener('pointerdown', (e) => handlePointer(e, 'down'));
+      this.overlay.addEventListener('pointermove', (e) => handlePointer(e, 'move'));
+      this.overlay.addEventListener('pointerup', (e) => handlePointer(e, 'up'));
+      this.overlay.addEventListener('pointercancel', (e) => handlePointer(e, 'cancel'));
 
-      window.addEventListener('keydown', (e) => {
-        const dc = this.dataChannels.keyboard;
+      this.overlay.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const dc = this.dataChannels.input;
         if (dc && dc.readyState === 'open') {
-          dc.send(JSON.stringify({ v: PROTOCOL_VERSION, type: 'keyboard', seq: nextSeq++, ts: Date.now(), event: 'keydown', key: e.key, code: e.code }));
+          dc.send(JSON.stringify({
+            v: PROTOCOL_VERSION,
+            type: 'scroll',
+            seq: this.nextSeq++,
+            ts: Date.now(),
+            deltaX: e.deltaX,
+            deltaY: e.deltaY,
+          }));
         }
-      });
+      }, { passive: false });
+    }
+  }
 
-      window.addEventListener('keyup', (e) => {
+  class KeyboardController {
+    constructor(dataChannels) {
+      this.dataChannels = dataChannels;
+      this.nextSeq = 1;
+      this._init();
+    }
+    _init() {
+      const sendKey = (e, evtType) => {
         const dc = this.dataChannels.keyboard;
         if (dc && dc.readyState === 'open') {
-          dc.send(JSON.stringify({ v: PROTOCOL_VERSION, type: 'keyboard', seq: nextSeq++, ts: Date.now(), event: 'keyup', key: e.key, code: e.code }));
+          dc.send(JSON.stringify({
+            v: PROTOCOL_VERSION,
+            type: 'keyboard',
+            seq: this.nextSeq++,
+            ts: Date.now(),
+            event: evtType,
+            key: e.key,
+            code: e.code,
+            isComposing: Boolean(e.isComposing),
+          }));
+        }
+      };
+      window.addEventListener('keydown', (e) => sendKey(e, 'keydown'));
+      window.addEventListener('keyup', (e) => sendKey(e, 'keyup'));
+    }
+  }
+
+  class ClipboardController {
+    constructor(dataChannels) {
+      this.dataChannels = dataChannels;
+      this.nextSeq = 1;
+      this._init();
+    }
+    _init() {
+      window.addEventListener('paste', async (e) => {
+        let text = '';
+        if (e.clipboardData) text = e.clipboardData.getData('text/plain');
+        else if (navigator.clipboard && navigator.clipboard.readText) {
+          try { text = await navigator.clipboard.readText(); } catch {}
+        }
+        if (text) {
+          const dc = this.dataChannels.control;
+          if (dc && dc.readyState === 'open') {
+            dc.send(JSON.stringify({ v: PROTOCOL_VERSION, type: 'clipboard', seq: this.nextSeq++, ts: Date.now(), text: String(text) }));
+          }
         }
       });
     }
+  }
+
+  class SessionUI {
+    constructor(container, debugMode) {
+      this.container = container;
+      this.debugMode = debugMode;
+      this.statusEl = null;
+      this.debugPanel = null;
+      this._init();
+    }
+    _init() {
+      let s = document.getElementById('flutter-remote-status');
+      if (!s) {
+        s = document.createElement('div');
+        s.id = 'flutter-remote-status';
+        s.style.cssText = 'position:absolute;top:10px;left:50%;transform:translateX(-50%);padding:6px 14px;background:rgba(0,0,0,0.75);color:#fff;border-radius:20px;font:12px sans-serif;z-index:20;transition:opacity 0.3s;pointer-events:none;';
+        this.container.appendChild(s);
+      }
+      this.statusEl = s;
+
+      if (this.debugMode) {
+        let p = document.getElementById('flutter-remote-debug-panel');
+        if (!p) {
+          p = document.createElement('div');
+          p.id = 'flutter-remote-debug-panel';
+          p.style.cssText = 'position:absolute;bottom:10px;left:10px;padding:10px;background:rgba(0,0,0,0.85);color:#0f0;font:11px monospace;border-radius:6px;z-index:30;pointer-events:none;line-height:1.4;';
+          this.container.appendChild(p);
+        }
+        this.debugPanel = p;
+      }
+    }
+    setStatus(t, autoHide = false) {
+      if (!this.statusEl) return;
+      this.statusEl.textContent = t;
+      this.statusEl.style.opacity = '1';
+      if (autoHide) {
+        setTimeout(() => { if (this.statusEl.textContent === t) this.statusEl.style.opacity = '0'; }, 2000);
+      }
+    }
+    updateDebug(m) {
+      if (!this.debugPanel) return;
+      this.debugPanel.innerHTML =
+        '<div><strong>Flutter Remote V2 Diagnostics</strong></div>' +
+        '<div>Connection: ' + m.connectionState + '</div>' +
+        '<div>ICE: ' + m.iceState + '</div>' +
+        '<div>RTT: ' + m.rtt + ' ms</div>' +
+        '<div>FPS: ' + m.fps + '</div>' +
+        '<div>Reconnects: ' + m.reconnects + '</div>' +
+        '<div>Generation: ' + m.generation + '</div>';
+    }
+  }
+
+  class FlutterRemoteClient {
+    constructor() {
+      const p = new URLSearchParams(window.location.search);
+      this.sessionId = p.get('session') || 'active';
+      this.token = p.get('k') || '';
+      this.debugMode = p.get('debug') === '1';
+
+      this.connectionState = new ConnectionState();
+      this.peer = null;
+      this.signalingWs = null;
+      this.dataChannels = {};
+
+      this.metrics = { rtt: 0, fps: 0, reconnects: 0, connectionState: 'IDLE', iceState: 'new', generation: 1 };
+
+      const c = document.getElementById('flutter-remote-container') || document.body;
+      this.ui = new SessionUI(c, this.debugMode);
+      this.videoRenderer = new VideoRenderer(c);
+      this.inputController = new InputController(c, this.videoRenderer, this.dataChannels);
+      this.keyboardController = new KeyboardController(this.dataChannels);
+      this.clipboardController = new ClipboardController(this.dataChannels);
+
+      this.connectionState.onChange((s, gen) => {
+        this.metrics.connectionState = s;
+        this.metrics.generation = gen;
+        if (s === 'CONNECTING') this.ui.setStatus('Connecting to remote simulator...');
+        else if (s === 'CONNECTED') this.ui.setStatus('Connected', true);
+        else if (s === 'RECONNECTING') this.ui.setStatus('Reconnecting (Gen ' + gen + ')...');
+      });
+
+      window.addEventListener('resize', () => this._handleResize());
+      if (this.debugMode) this._startDebugLoop();
+
+      this._connectSignaling();
+    }
 
     async _connectSignaling() {
+      this.connectionState.set('CONNECTING');
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const url = proto + '//' + location.host + '/signal?session=' + encodeURIComponent(this.sessionId) + '&k=' + encodeURIComponent(this.token);
 
       this.signalingWs = new WebSocket(url);
       this.signalingWs.onopen = async () => {
-        this._updateStatus('Negotiating WebRTC...');
+        this.ui.setStatus('Negotiating WebRTC...');
         await this._initPeer();
       };
 
       this.signalingWs.onmessage = async (e) => {
         try {
           const msg = JSON.parse(e.data);
+          if (msg.generation && msg.generation < this.connectionState.generation) return;
           if (msg.type === 'answer' && this.peer) {
             const sdp = (msg.payload && msg.payload.sdp) || msg.sdp;
             await this.peer.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
           } else if ((msg.type === 'ice-candidate' || msg.type === 'candidate') && this.peer) {
             const cand = msg.payload || msg.candidate;
-            if (cand && cand.candidate) {
-              await this.peer.addIceCandidate(new RTCIceCandidate(cand));
-            }
+            if (cand && cand.candidate) await this.peer.addIceCandidate(new RTCIceCandidate(cand));
           }
-        } catch (err) {
-          console.warn('[flutter-remote client signaling error]', err);
-        }
+        } catch (err) { console.warn('[flutter-remote signaling error]', err); }
       };
 
-      this.signalingWs.onclose = () => {
-        this._scheduleReconnect();
-      };
+      this.signalingWs.onclose = () => this._scheduleReconnect();
     }
 
-    async _initPeer() {
-      if (this.peer) {
+    async _initPeer(isRestart = false) {
+      if (!isRestart && this.peer) {
         try { this.peer.close(); } catch {}
+        this.peer = null;
       }
 
       let iceServers = [{ urls: 'stun:stun.cloudflare.com:3478' }];
@@ -399,83 +522,112 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
         if (data && data.iceServers) iceServers = data.iceServers;
       } catch {}
 
-      this.peer = new RTCPeerConnection({ iceServers });
+      if (!this.peer) {
+        this.peer = new RTCPeerConnection({ iceServers });
 
-      this.peer.ontrack = (e) => {
-        if (e.streams && e.streams[0]) {
-          this.elements.video.srcObject = e.streams[0];
-        } else {
-          this.elements.video.srcObject = new MediaStream([e.track]);
-        }
-        this._updateStatus('Connected');
-        this.metrics.connectionState = 'CONNECTED';
-      };
+        this.peer.ontrack = (e) => {
+          if (e.streams && e.streams[0]) this.videoRenderer.attachStream(e.streams[0]);
+          else this.videoRenderer.attachStream(new MediaStream([e.track]));
+          this.connectionState.set('CONNECTED');
+          this.connectionState.resetBackoff();
+        };
 
-      const inputDc = this.peer.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
-      const keyboardDc = this.peer.createDataChannel('keyboard', { ordered: true });
-      const controlDc = this.peer.createDataChannel('control', { ordered: true });
-      const telemetryDc = this.peer.createDataChannel('telemetry', { ordered: false, maxRetransmits: 0 });
+        this.dataChannels.input = this.peer.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
+        this.dataChannels.keyboard = this.peer.createDataChannel('keyboard', { ordered: true });
+        this.dataChannels.control = this.peer.createDataChannel('control', { ordered: true });
+        this.dataChannels.telemetry = this.peer.createDataChannel('telemetry', { ordered: false, maxRetransmits: 0 });
 
-      this.dataChannels = { input: inputDc, keyboard: keyboardDc, control: controlDc, telemetry: telemetryDc };
+        this.dataChannels.input.onopen = () => {
+          this.connectionState.set('CONNECTED');
+          this.connectionState.resetBackoff();
+        };
 
-      inputDc.onopen = () => {
-        this._updateStatus('Connected');
-        this.metrics.connectionState = 'CONNECTED';
-      };
+        this.peer.onicecandidate = (e) => {
+          if (e.candidate && this.signalingWs && this.signalingWs.readyState === WebSocket.OPEN) {
+            this.signalingWs.send(JSON.stringify({
+              v: PROTOCOL_VERSION,
+              type: 'ice-candidate',
+              sessionId: this.sessionId,
+              generation: this.connectionState.generation,
+              payload: e.candidate,
+            }));
+          }
+        };
 
-      this.peer.onicecandidate = (e) => {
-        if (e.candidate && this.signalingWs && this.signalingWs.readyState === WebSocket.OPEN) {
-          this.signalingWs.send(JSON.stringify({
-            v: PROTOCOL_VERSION,
-            type: 'ice-candidate',
-            generation: this.generation,
-            payload: e.candidate,
-          }));
-        }
-      };
+        this.peer.oniceconnectionstatechange = () => {
+          this.metrics.iceState = this.peer.iceConnectionState;
+          if (this.peer.iceConnectionState === 'disconnected') this._attemptIceRestart();
+          else if (this.peer.iceConnectionState === 'failed') this._scheduleReconnect();
+        };
+      }
 
-      const offer = await this.peer.createOffer({ offerToReceiveVideo: true });
+      const offer = await this.peer.createOffer({ offerToReceiveVideo: true, iceRestart: isRestart });
       await this.peer.setLocalDescription(offer);
 
       this.signalingWs.send(JSON.stringify({
         v: PROTOCOL_VERSION,
         type: 'offer',
-        generation: this.generation,
+        sessionId: this.sessionId,
+        generation: this.connectionState.generation,
         payload: { sdp: offer.sdp, iceServers },
       }));
     }
 
-    _scheduleReconnect() {
-      if (this.reconnectTimer) return;
-      this.metrics.reconnects++;
-      const delay = BACKOFF_MS[Math.min(this.reconnectAttempt, BACKOFF_MS.length - 1)];
-      this.reconnectAttempt++;
-      this._updateStatus('Reconnecting... (Attempt ' + this.reconnectAttempt + ')');
-
-      this.reconnectTimer = setTimeout(async () => {
-        this.reconnectTimer = null;
-        this.generation++;
-        await this._connectSignaling();
-      }, delay);
+    async _attemptIceRestart() {
+      console.log('[flutter-remote] Attempting ICE restart...');
+      try { await this._initPeer(true); } catch { this._scheduleReconnect(); }
     }
 
-    _updateDebug() {
-      if (!this.elements.debugPanel) return;
-      this.elements.debugPanel.innerHTML =
-        '<div><strong>Flutter Remote V2 Diagnostics</strong></div>' +
-        '<div>Connection: ' + this.metrics.connectionState + '</div>' +
-        '<div>Reconnects: ' + this.metrics.reconnects + '</div>' +
-        '<div>Generation: ' + this.generation + '</div>';
+    _scheduleReconnect() {
+      this.metrics.reconnects++;
+      this.connectionState.scheduleReconnect(async () => {
+        try {
+          if (this.signalingWs && this.signalingWs.readyState === WebSocket.OPEN) await this._initPeer(false);
+          else await this._connectSignaling();
+        } catch { this._scheduleReconnect(); }
+      });
+    }
+
+    _handleResize() {
+      const dc = this.dataChannels.control;
+      if (dc && dc.readyState === 'open') {
+        const bounds = this.videoRenderer.getBounds();
+        dc.send(JSON.stringify({
+          v: PROTOCOL_VERSION,
+          type: 'resize',
+          width: Math.round(bounds.width),
+          height: Math.round(bounds.height),
+        }));
+      }
+    }
+
+    _startDebugLoop() {
+      setInterval(async () => {
+        if (this.peer && typeof this.peer.getStats === 'function') {
+          try {
+            const stats = await this.peer.getStats();
+            stats.forEach((r) => {
+              if (r.type === 'candidate-pair' && r.state === 'succeeded') {
+                this.metrics.rtt = Math.round((r.currentRoundTripTime || 0) * 1000);
+              }
+              if (r.type === 'inbound-rtp' && r.kind === 'video') {
+                this.metrics.fps = Math.round(r.framesPerSecond || 0);
+              }
+            });
+          } catch {}
+        }
+        this.ui.updateDebug(this.metrics);
+      }, 1000);
     }
   }
 
   if (document.readyState === 'complete' || document.readyState === 'interactive') {
-    new FlutterRemoteClient();
+    window.__flutterRemoteClient = new FlutterRemoteClient();
   } else {
-    window.addEventListener('DOMContentLoaded', () => new FlutterRemoteClient());
+    window.addEventListener('DOMContentLoaded', () => { window.__flutterRemoteClient = new FlutterRemoteClient(); });
   }
 })();
-`;
+\`;`;
 
 const WEBRTC_CLIENT_SCRIPT_LEGACY = `
 (function() {

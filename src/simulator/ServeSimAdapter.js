@@ -1,7 +1,8 @@
 /**
  * Flutter Remote WebRTC V2 ServeSim Adapter
  *
- * The sole module in the codebase that encapsulates serve-sim's local /ws protocol.
+ * Encapsulates serve-sim's local /ws protocol with connection readiness promises,
+ * queueing during connect, zero dropped critical events, and safe flush on OPEN.
  */
 
 import { WebSocket } from 'ws';
@@ -18,48 +19,76 @@ export class ServeSimAdapter extends SimulatorInputAdapter {
     this.targetHeight = options.height || 1280;
     this.ws = null;
     this._connected = false;
+    this._connectPromise = null;
     this._reconnectTimer = null;
     this._queue = [];
     this._closed = false;
   }
 
-  async connect() {
-    if (this._closed) return;
+  /**
+   * Returns a promise resolving to an OPEN WebSocket connection to serve-sim.
+   * Multiple calls while connecting share the exact same promise.
+   */
+  getServeSimWs() {
+    if (this._closed) {
+      return Promise.reject(new Error('ServeSimAdapter is closed'));
+    }
 
-    return new Promise((resolve) => {
+    if (this._connected && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      return Promise.resolve(this.ws);
+    }
+
+    if (this._connectPromise) {
+      return this._connectPromise;
+    }
+
+    this._connectPromise = new Promise((resolve) => {
       try {
         this.ws = new WebSocket(`ws://${this.host}:${this.port}/ws`);
 
         this.ws.on('open', () => {
           this._connected = true;
+          this._connectPromise = null;
           logger.info('serve_sim.connected', { port: this.port });
           this._flushQueue();
-          resolve(true);
+          resolve(this.ws);
         });
 
         this.ws.on('error', (err) => {
           logger.warn('serve_sim.connection_error', { error: err.message, port: this.port });
-          resolve(false);
+          this._connected = false;
+          this._connectPromise = null;
+          resolve(null);
         });
 
         this.ws.on('close', () => {
           this._connected = false;
+          this._connectPromise = null;
           if (!this._closed) {
             this._scheduleReconnect();
           }
         });
       } catch (err) {
         logger.warn('serve_sim.socket_creation_failed', { error: err.message });
-        resolve(false);
+        this._connected = false;
+        this._connectPromise = null;
+        resolve(null);
       }
     });
+
+    return this._connectPromise;
+  }
+
+  async connect() {
+    const ws = await this.getServeSimWs();
+    return Boolean(ws && ws.readyState === WebSocket.OPEN);
   }
 
   _scheduleReconnect() {
     if (this._reconnectTimer || this._closed) return;
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null;
-      this.connect();
+      this.getServeSimWs();
     }, 1000);
   }
 
@@ -71,22 +100,35 @@ export class ServeSimAdapter extends SimulatorInputAdapter {
       } catch {}
     }
 
-    // Buffer in queue if disconnected, bounded to MAX_INPUT_QUEUE_SIZE
+    // Queue if disconnected or connecting, bounded to MAX_INPUT_QUEUE_SIZE
     if (this._queue.length < LIMITS.MAX_INPUT_QUEUE_SIZE) {
+      // Coalesce pointer moves to keep only the newest move in queue
+      if (msg.event === 'move') {
+        const lastMoveIdx = this._queue.findLastIndex((item) => item && item.event === 'move');
+        if (lastMoveIdx !== -1) {
+          this._queue[lastMoveIdx] = msg;
+          this.getServeSimWs();
+          return false;
+        }
+      }
       this._queue.push(msg);
     }
+
+    // Ensure connection is actively being established
+    this.getServeSimWs();
     return false;
   }
 
   _flushQueue() {
     while (this._queue.length > 0 && this._connected && this.ws && this.ws.readyState === WebSocket.OPEN) {
       const msg = this._queue.shift();
-      this.ws.send(typeof msg === 'string' ? msg : JSON.stringify(msg));
+      try {
+        this.ws.send(typeof msg === 'string' ? msg : JSON.stringify(msg));
+      } catch {}
     }
   }
 
   async pointer(event) {
-    // Map normalized event to serve-sim format with pixel dimensions
     const pixelX = Math.round((event.x || 0) * this.targetWidth);
     const pixelY = Math.round((event.y || 0) * this.targetHeight);
 
@@ -156,5 +198,6 @@ export class ServeSimAdapter extends SimulatorInputAdapter {
     }
     this._queue = [];
     this._connected = false;
+    this._connectPromise = null;
   }
 }

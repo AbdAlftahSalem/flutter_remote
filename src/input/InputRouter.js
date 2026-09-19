@@ -1,8 +1,9 @@
 /**
  * Flutter Remote WebRTC V2 Input Router
  *
- * Receives DataChannel input events, records per-stage timestamps (t1, t2),
- * routes events to the simulator input adapter, and tracks latencies.
+ * Receives DataChannel input events, validates sequence numbers, drops stale
+ * out-of-order pointer moves, records per-stage timestamps (t1, t2),
+ * and routes events to the simulator input adapter.
  */
 
 import { EventEmitter } from 'node:events';
@@ -14,6 +15,8 @@ export class InputRouter extends EventEmitter {
     super();
     this.simulatorAdapter = simulatorAdapter;
     this.latencyTracker = latencyTracker;
+    this.lastSeenPointerSeq = 0;
+    this.droppedStaleMoves = 0;
   }
 
   async handleInputMessage(event) {
@@ -21,6 +24,20 @@ export class InputRouter extends EventEmitter {
 
     const seq = event.seq || 0;
     const t0 = event.ts || Date.now();
+
+    // Out-of-order / stale pointer move check
+    if (event.type === 'pointer') {
+      if (event.event === 'move') {
+        if (seq > 0 && seq <= this.lastSeenPointerSeq) {
+          this.droppedStaleMoves++;
+          this.emit('stale_move_dropped', { seq, lastSeen: this.lastSeenPointerSeq });
+          return;
+        }
+      }
+      if (seq > this.lastSeenPointerSeq) {
+        this.lastSeenPointerSeq = seq;
+      }
+    }
 
     // t1: server receive
     if (this.latencyTracker) {
