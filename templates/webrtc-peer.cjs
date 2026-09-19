@@ -74,6 +74,14 @@ const NAL_TYPES = {
   FU_A: 28,
 };
 
+const RECOVERY_STATES = {
+  NORMAL: 'NORMAL',
+  RECOVERY_REQUESTED: 'RECOVERY_REQUESTED',
+  WAITING_FOR_IDR: 'WAITING_FOR_IDR',
+  IDR_RECEIVED: 'IDR_RECEIVED',
+  ERROR: 'ERROR',
+};
+
 class VideoEncoder extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -102,10 +110,13 @@ class VideoEncoder extends EventEmitter {
     this._auHasVcl = false;
     this._flushTimer = null;
 
-    // Fresh IDR Recovery State
+    // Fresh IDR Recovery State Machine
+    this._recoveryState = RECOVERY_STATES.NORMAL;
+    this._frameId = 0;
+    this._latestFrameId = 0;
     this._latestFrame = null;
     this._pendingKeyframePromise = null;
-    this._recoveryInFlight = false;
+    this._totalRecoveryLatencyMs = 0;
 
     this.metrics = {
       inputReceived: 0,
@@ -116,7 +127,11 @@ class VideoEncoder extends EventEmitter {
       keyframeRequests: 0,
       freshKeyframeRecoveries: 0,
       freshKeyframeFailures: 0,
+      forcedIdrRequests: 0,
+      forcedIdrSuccesses: 0,
+      forcedIdrFailures: 0,
       lastRecoveryLatencyMs: 0,
+      averageRecoveryLatencyMs: 0,
       totalEncodeLatencyMs: 0,
       maxEncodeLatencyMs: 0,
     };
@@ -126,9 +141,10 @@ class VideoEncoder extends EventEmitter {
     this._isEncoding = false;
   }
 
-  start() {
-    if (this.ffmpegProc) return;
-
+  /**
+   * Spawns a continuous FFmpeg H.264 encoding process.
+   */
+  _spawnEncoderProcess() {
     const args = [
       '-loglevel', 'error',
       '-f', 'image2pipe',
@@ -150,8 +166,14 @@ class VideoEncoder extends EventEmitter {
       'pipe:1',
     ];
 
+    return spawn(this.ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+  }
+
+  start() {
+    if (this.ffmpegProc) return;
+
     try {
-      this.ffmpegProc = spawn(this.ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+      this.ffmpegProc = this._spawnEncoderProcess();
       this._isEncoding = true;
       this._waitingForDrain = false;
 
@@ -200,8 +222,23 @@ class VideoEncoder extends EventEmitter {
       return false;
     }
 
-    this._latestFrame = Buffer.from(jpegBuffer);
+    this._frameId++;
+    this._latestFrameId = this._frameId;
+    const frameCopy = Buffer.from(jpegBuffer);
+    frameCopy.id = this._frameId;
+    this._latestFrame = frameCopy;
     this.metrics.inputReceived++;
+
+    // While waiting for IDR recovery on a replacement encoder, buffer in pending queue
+    if (this._recoveryState === RECOVERY_STATES.WAITING_FOR_IDR) {
+      while (this._pendingQueue.length >= this.maxPendingFrames) {
+        this._pendingQueue.shift();
+        this.metrics.inputDropped++;
+      }
+      this._pendingQueue.push({ buffer: jpegBuffer, ts: Date.now() });
+      this.metrics.inputPending = this._pendingQueue.length;
+      return false;
+    }
 
     if (!this.ffmpegProc || !this.ffmpegProc.stdin || !this.ffmpegProc.stdin.writable) {
       this.start();
@@ -277,7 +314,7 @@ class VideoEncoder extends EventEmitter {
       this._checkTrailingStartCode(lastStartCode);
     }
 
-    if (this._auHasVcl && this._isEncoding) {
+    if ((this._auHasVcl || this._streamBuffer.length > 0) && this._isEncoding) {
       this._flushTimer = setTimeout(() => {
         this._flushPending();
       }, 10);
@@ -566,11 +603,8 @@ class VideoEncoder extends EventEmitter {
     return this.cachedKeyframe;
   }
 
-  /**
-   * Handles client keyframe requests.
-   * Emits keyframe_requested event, coalesces rapid requests, triggers runtime force-keyframe
-   * on the live FFmpeg encoder, and returns a promise resolving with fresh IDR packets.
-   */
+
+
   /**
    * Advances and returns the next RTP timestamp based on clock rate and FPS.
    */
@@ -581,151 +615,220 @@ class VideoEncoder extends EventEmitter {
   }
 
   /**
-   * Spawns a dedicated one-shot FFmpeg process to encode the latest JPEG frame into an Annex-B H.264 IDR frame.
+   * Executes controlled main encoder replacement to generate a fresh IDR and align the reference chain.
    */
-  async _encodeFreshIdrFrame() {
+  async _performMainEncoderIdrRecovery() {
     if (!this._latestFrame) {
       throw new Error('No latest JPEG frame available for keyframe recovery');
     }
 
-    const args = [
-      '-loglevel', 'error',
-      '-f', 'image2pipe',
-      '-vcodec', 'mjpeg',
-      '-i', 'pipe:0',
-      '-frames:v', '1',
-      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-tune', 'zerolatency',
-      '-pix_fmt', 'yuv420p',
-      '-g', '1',
-      '-keyint_min', '1',
-      '-forced-idr', '1',
-      '-bf', '0',
-      '-refs', '1',
-      '-aud', '1',
-      '-b:v', `${this.bitrateKbps}k`,
-      '-maxrate', `${this.bitrateKbps}k`,
-      '-bufsize', `${this.bitrateKbps * 2}k`,
-      '-f', 'h264',
-      'pipe:1',
-    ];
+    if (this._recoveryState !== RECOVERY_STATES.NORMAL && this._recoveryState !== RECOVERY_STATES.ERROR) {
+      return [];
+    }
+
+    this._recoveryState = RECOVERY_STATES.RECOVERY_REQUESTED;
+    const startedAt = Date.now();
+    const targetFrame = this._latestFrame;
+    const targetFrameId = targetFrame.id || this._latestFrameId || 1;
+    const targetJpeg = Buffer.isBuffer(targetFrame) ? targetFrame : targetFrame.jpeg;
+
+    console.log(`[video] recovery requested for frameId=${targetFrameId}`);
+    console.log(`[video] forcing next frame to IDR (frameId=${targetFrameId})`);
+    this._recoveryState = RECOVERY_STATES.WAITING_FOR_IDR;
 
     return new Promise((resolve, reject) => {
-      const proc = spawn(this.ffmpegPath, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
+      let nextProc;
+      try {
+        nextProc = this._spawnEncoderProcess();
+      } catch (err) {
+        this._handleRecoveryFailure(err, reject);
+        return;
+      }
 
-      const stdout = [];
-      const stderr = [];
-
-      proc.stdout.on('data', (chunk) => {
-        stdout.push(chunk);
-      });
-
-      proc.stderr.on('data', (chunk) => {
-        stderr.push(chunk);
-      });
-
-      proc.on('error', reject);
-
-      proc.on('close', (code) => {
-        if (code !== 0) {
-          const error = Buffer.concat(stderr).toString();
-          reject(
-            new Error(`Recovery FFmpeg exited with code ${code}: ${error}`)
+      let stdoutBuffer = Buffer.alloc(0);
+      let stderrBuffer = Buffer.alloc(0);
+      let resolved = false;
+      const recoveryTimeout = setTimeout(() => {
+        if (!resolved) {
+          this._handleRecoveryFailure(
+            new Error('Timeout waiting for IDR recovery frame from encoder'),
+            reject,
+            nextProc
           );
-          return;
         }
+      }, 5000);
 
-        const h264 = Buffer.concat(stdout);
-        if (h264.length === 0) {
-          reject(new Error('Recovery FFmpeg produced no H264 output'));
-          return;
+      const onRecoverySuccess = (auNals) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(recoveryTimeout);
+
+        try {
+          this._recoveryState = RECOVERY_STATES.IDR_RECEIVED;
+          console.log(`[video] IDR received for frameId=${targetFrameId}`);
+
+          const hasIdr = auNals.some((n) => n.type === NAL_TYPES.IDR);
+          if (!hasIdr) {
+            throw new Error(
+              `Recovery encoder did not produce IDR. NAL types: ${auNals.map((n) => n.type).join(',')}`
+            );
+          }
+          const hasSps = auNals.some((n) => n.type === NAL_TYPES.SPS);
+          const hasPps = auNals.some((n) => n.type === NAL_TYPES.PPS);
+          if (!hasSps || !hasPps) {
+            throw new Error(
+              `Recovery IDR missing SPS/PPS. SPS=${hasSps} PPS=${hasPps}`
+            );
+          }
+
+          this.inspectAndCacheNals(auNals);
+
+          const packets = this.packetizeAccessUnit(auNals, this.fps);
+          if (!packets || packets.length === 0) {
+            throw new Error('Fresh recovery produced no RTP packets');
+          }
+
+          const latencyMs = Date.now() - startedAt;
+          const seqStart = packets[0].readUInt16BE(2);
+          const seqEnd = packets[packets.length - 1].readUInt16BE(2);
+          const timestamp = packets[0].readUInt32BE(4);
+          const ssrc = this.ssrc;
+
+          console.log(
+            `[video] IDR recovery completed\n` +
+            `frameId=${targetFrameId}\n` +
+            `latencyMs=${latencyMs}\n` +
+            `seqStart=${seqStart}\n` +
+            `seqEnd=${seqEnd}\n` +
+            `timestamp=${timestamp}\n` +
+            `ssrc=${ssrc}`
+          );
+
+          this.metrics.freshKeyframeRecoveries++;
+          this.metrics.forcedIdrSuccesses++;
+          this.metrics.lastRecoveryLatencyMs = latencyMs;
+          this._totalRecoveryLatencyMs = (this._totalRecoveryLatencyMs || 0) + latencyMs;
+          this.metrics.averageRecoveryLatencyMs = Math.round(
+            this._totalRecoveryLatencyMs / this.metrics.forcedIdrSuccesses
+          );
+
+          const oldProc = this.ffmpegProc;
+          this.ffmpegProc = nextProc;
+          this._isEncoding = true;
+          this._waitingForDrain = false;
+          this._streamBuffer = Buffer.alloc(0);
+          this._pendingAU = [];
+          this._auHasVcl = false;
+
+          if (oldProc) {
+            try {
+              if (oldProc.stdin) oldProc.stdin.end();
+              oldProc.kill('SIGTERM');
+            } catch {}
+          }
+
+          nextProc.stdout.removeAllListeners('data');
+          nextProc.stdout.on('data', (chunk) => {
+            this._handleEncodedData(chunk);
+          });
+
+          this._setupStdin(nextProc.stdin);
+
+          nextProc.stderr.removeAllListeners('data');
+          nextProc.stderr.on('data', (errData) => {
+            const msg = errData.toString();
+            if (!msg.includes('deprecated') && !msg.includes('EOI missing')) {
+              console.warn('[webrtc-peer encoder warning]', msg);
+            }
+          });
+
+          nextProc.on('error', (err) => {
+            console.error('[webrtc-peer encoder error]', err.message);
+            this.close();
+          });
+
+          nextProc.on('close', (code) => {
+            if (this.ffmpegProc === nextProc) {
+              this._isEncoding = false;
+              this.ffmpegProc = null;
+              this._flushPending();
+            }
+          });
+
+          this.emit('packets', packets);
+          this.emit('fresh_keyframe_encoded', {
+            packets,
+            recovery: true,
+            latencyMs,
+            frameId: targetFrameId,
+          });
+
+          this._recoveryState = RECOVERY_STATES.NORMAL;
+          this._flushNextPendingInput();
+
+          resolve(packets);
+        } catch (err) {
+          this._handleRecoveryFailure(err, reject, nextProc);
         }
+      };
 
-        resolve(h264);
+      const checkOutput = () => {
+        const nals = this.parseNalUnits(stdoutBuffer);
+        const hasVcl = nals.some((n) => n.type >= 1 && n.type <= 5);
+        if (!hasVcl) return;
+
+        onRecoverySuccess(nals);
+      };
+
+      nextProc.stdout.on('data', (chunk) => {
+        stdoutBuffer = Buffer.concat([stdoutBuffer, chunk]);
+        if (!resolved) {
+          checkOutput();
+        }
       });
 
-      proc.stdin.on('error', () => {});
+      nextProc.stderr.on('data', (chunk) => {
+        stderrBuffer = Buffer.concat([stderrBuffer, chunk]);
+      });
+
+      nextProc.on('error', (err) => {
+        if (!resolved) {
+          this._handleRecoveryFailure(err, reject, nextProc);
+        }
+      });
+
+      nextProc.on('close', (code) => {
+        if (!resolved) {
+          const err = new Error(
+            `Replacement encoder exited with code ${code}: ${stderrBuffer.toString()}`
+          );
+          this._handleRecoveryFailure(err, reject, nextProc);
+        }
+      });
 
       try {
-        proc.stdin.end(this._latestFrame);
+        nextProc.stdin.write(targetJpeg);
       } catch (err) {
-        reject(err);
+        this._handleRecoveryFailure(err, reject, nextProc);
       }
     });
   }
 
-  /**
-   * Encodes a fresh IDR frame, validates SPS/PPS/IDR NAL units, and returns packetized RTP packets.
-   */
-  async _createFreshRecoveryPackets() {
-    const h264 = await this._encodeFreshIdrFrame();
+  _handleRecoveryFailure(err, reject, nextProc = null) {
+    this._recoveryState = RECOVERY_STATES.ERROR;
+    this.metrics.freshKeyframeFailures++;
+    this.metrics.forcedIdrFailures++;
+    console.error(`[video] IDR recovery failed: ${err.message}`);
 
-    const nals = this.parseNalUnits(h264);
-
-    const hasIdr = nals.some((nal) => nal.type === NAL_TYPES.IDR);
-    if (!hasIdr) {
-      throw new Error(
-        `Recovery encoder did not produce IDR. NAL types: ${nals.map((n) => n.type).join(',')}`
-      );
+    if (nextProc) {
+      try {
+        if (nextProc.stdin) nextProc.stdin.end();
+        nextProc.kill('SIGTERM');
+      } catch {}
     }
 
-    const hasSps = nals.some((nal) => nal.type === NAL_TYPES.SPS);
-    const hasPps = nals.some((nal) => nal.type === NAL_TYPES.PPS);
-
-    if (!hasSps || !hasPps) {
-      throw new Error(
-        `Recovery IDR missing SPS/PPS. SPS=${hasSps} PPS=${hasPps}`
-      );
-    }
-
-    this.inspectAndCacheNals(nals);
-    return this.packetizeAccessUnit(nals, this.fps);
-  }
-
-  /**
-   * Executes the fresh keyframe recovery pipeline, emits packets, and tracks metrics.
-   */
-  async _performFreshKeyframeRecovery() {
-    if (this._recoveryInFlight) {
-      return [];
-    }
-
-    this._recoveryInFlight = true;
-    const startedAt = Date.now();
-    console.log('[video] starting fresh IDR recovery');
-
-    try {
-      const packets = await this._createFreshRecoveryPackets();
-
-      if (!packets || packets.length === 0) {
-        throw new Error('Fresh recovery produced no RTP packets');
-      }
-
-      const latencyMs = Date.now() - startedAt;
-      this.metrics.freshKeyframeRecoveries++;
-      this.metrics.lastRecoveryLatencyMs = latencyMs;
-
-      console.log(`[video] fresh recovery completed in ${latencyMs}ms`);
-
-      this.emit('packets', packets);
-      this.emit('fresh_keyframe_encoded', {
-        packets,
-        recovery: true,
-        latencyMs,
-      });
-
-      return packets;
-    } catch (err) {
-      this.metrics.freshKeyframeFailures++;
-      console.error(`[video] fresh IDR recovery failed: ${err.message}`);
-      throw err;
-    } finally {
-      this._recoveryInFlight = false;
-    }
+    this._recoveryState = RECOVERY_STATES.NORMAL;
+    reject(err);
   }
 
   /**
@@ -733,6 +836,7 @@ class VideoEncoder extends EventEmitter {
    */
   requestKeyframe() {
     this.metrics.keyframeRequests++;
+    this.metrics.forcedIdrRequests++;
 
     console.log(
       `[video] keyframe request received ` +
@@ -747,7 +851,7 @@ class VideoEncoder extends EventEmitter {
       return this._pendingKeyframePromise;
     }
 
-    this._pendingKeyframePromise = this._performFreshKeyframeRecovery().finally(() => {
+    this._pendingKeyframePromise = this._performMainEncoderIdrRecovery().finally(() => {
       this._pendingKeyframePromise = null;
     });
 
@@ -883,7 +987,7 @@ class VideoEncoder extends EventEmitter {
     this._pendingQueue = [];
     this._waitingForDrain = false;
 
-    this._recoveryInFlight = false;
+    this._recoveryState = RECOVERY_STATES.NORMAL;
     this._pendingKeyframePromise = null;
   }
 }

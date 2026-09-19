@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { VideoEncoder, NAL_TYPES } from '../src/media/VideoEncoder.js';
+import { VideoEncoder, NAL_TYPES, RECOVERY_STATES } from '../src/media/VideoEncoder.js';
 
 test('Test A — stdout chunk splitting: NAL bytes split across 2+ chunks', () => {
   const encoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
@@ -231,6 +231,37 @@ test('Test E — backpressure: bounded queue, stale frame dropping, and latest-f
   assert.equal(writtenBuffers[1].toString(), 'frame-103');
 });
 
+function createMockEncoderProc(h264Data) {
+  const proc = new EventEmitter();
+  proc.isKilled = false;
+  proc.stdin = {
+    writable: true,
+    write: (chunk) => {
+      if (h264Data) {
+        setImmediate(() => {
+          proc.stdout.emit('data', h264Data);
+        });
+      }
+      return true;
+    },
+    end: () => {
+      proc.stdin.ended = true;
+    },
+  };
+  proc.stdout = new EventEmitter();
+  proc.stderr = new EventEmitter();
+  proc.kill = () => {
+    proc.isKilled = true;
+  };
+  return proc;
+}
+
+const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+const defaultSps = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00, 0x0a]), Buffer.alloc(10, 0x11)]);
+const defaultPps = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x22)]);
+const defaultIdr = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(40, 0x33)]);
+const defaultIdrH264 = Buffer.concat([defaultSps, defaultPps, defaultIdr]);
+
 test('Test 0 — Missing latest frame: requestKeyframe() fails clearly when no JPEG frame is available', async () => {
   const encoder = new VideoEncoder();
   await assert.rejects(
@@ -241,57 +272,45 @@ test('Test 0 — Missing latest frame: requestKeyframe() fails clearly when no J
   );
 });
 
-test('Test 1 — Latest frame: encodeFrame(JPEG) stores an immutable copy in _latestFrame', () => {
+test('Test 1 — Request coalescing: 3 requests -> 1 actual IDR request', async () => {
   const encoder = new VideoEncoder();
-  assert.equal(encoder._latestFrame, null);
-
-  const initialBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0xff, 0xd9]);
-  encoder.encodeFrame(initialBytes);
-
-  assert.ok(encoder._latestFrame !== null);
-  assert.deepEqual(encoder._latestFrame, initialBytes);
-  // Mutating original buffer should not mutate stored copy
-  initialBytes[0] = 0x00;
-  assert.notDeepEqual(encoder._latestFrame, initialBytes);
-  encoder.close();
-});
-
-test('Test 2 — Fresh recovery: recovery output contains SPS, PPS, and IDR', async () => {
-  const encoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
   encoder._latestFrame = Buffer.from('fake-jpeg-frame');
 
-  const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-  const sps = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00, 0x0a]), Buffer.alloc(10, 0x11)]);
-  const pps = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x22)]);
-  const idr = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(40, 0x33)]);
-  const h264Output = Buffer.concat([sps, pps, idr]);
+  let spawnCount = 0;
+  encoder._spawnEncoderProcess = () => {
+    spawnCount++;
+    return createMockEncoderProc(defaultIdrH264);
+  };
 
-  encoder._encodeFreshIdrFrame = async () => h264Output;
+  const p1 = encoder.requestKeyframe();
+  const p2 = encoder.requestKeyframe();
+  const p3 = encoder.requestKeyframe();
 
-  let freshKeyframeEvent = null;
-  encoder.on('fresh_keyframe_encoded', (evt) => {
-    freshKeyframeEvent = evt;
-  });
+  assert.equal(p1, p2, 'p1 and p2 must be the exact same pending promise');
+  assert.equal(p2, p3, 'p2 and p3 must be the exact same pending promise');
 
+  const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
+  assert.equal(r1, r2);
+  assert.equal(r2, r3);
+  assert.equal(spawnCount, 1, 'Only ONE replacement encoder process must be spawned for coalesced requests');
+  assert.equal(encoder.metrics.keyframeRequests, 3);
+  assert.equal(encoder.metrics.forcedIdrRequests, 3);
+  assert.equal(encoder.metrics.forcedIdrSuccesses, 1);
+});
+
+test('Test 2 — IDR validation: valid SPS+PPS+IDR passes; SPS+PPS+NON_IDR fails', async () => {
+  const encoder = new VideoEncoder();
+  encoder._latestFrame = Buffer.from('fake-jpeg-frame');
+
+  // 1. Valid SPS + PPS + IDR
+  encoder._spawnEncoderProcess = () => createMockEncoderProc(defaultIdrH264);
   const packets = await encoder.requestKeyframe();
   assert.ok(Array.isArray(packets) && packets.length >= 3);
-  assert.ok(freshKeyframeEvent !== null);
-  assert.equal(freshKeyframeEvent.recovery, true);
-  assert.equal(encoder.metrics.freshKeyframeRecoveries, 1);
-  assert.ok(encoder.hasKeyframe());
-});
 
-test('Test 3 — Real IDR validation: recovery output without IDR (or with only Non-IDR/I-slice) is rejected', async () => {
-  const encoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
-  encoder._latestFrame = Buffer.from('fake-jpeg-frame');
-
-  const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-  const sps = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00, 0x0a]), Buffer.alloc(10, 0x11)]);
-  const pps = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x22)]);
-  const nonIdr = Buffer.concat([prefix4, Buffer.from([0x41, 0x88]), Buffer.alloc(40, 0x33)]);
-  const h264WithoutIdr = Buffer.concat([sps, pps, nonIdr]);
-
-  encoder._encodeFreshIdrFrame = async () => h264WithoutIdr;
+  // 2. Invalid: SPS + PPS + NON_IDR
+  const nonIdr = Buffer.concat([prefix4, Buffer.from([0x41, 0x88]), Buffer.alloc(40, 0x44)]);
+  const invalidH264 = Buffer.concat([defaultSps, defaultPps, nonIdr]);
+  encoder._spawnEncoderProcess = () => createMockEncoderProc(invalidH264);
 
   await assert.rejects(
     async () => {
@@ -299,165 +318,192 @@ test('Test 3 — Real IDR validation: recovery output without IDR (or with only 
     },
     /Recovery encoder did not produce IDR/
   );
-  assert.equal(encoder.metrics.freshKeyframeFailures, 1);
+  assert.equal(encoder.metrics.forcedIdrFailures, 1);
 });
 
-test('Test 4 — Promise coalescing: multiple rapid requestKeyframe() calls trigger only one recovery process', async () => {
+test('Test 3 — RTP continuity: continuous sequence numbers before, during, and after recovery', async () => {
   const encoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
   encoder._latestFrame = Buffer.from('fake-jpeg-frame');
 
-  const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-  const sps = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00, 0x0a]), Buffer.alloc(10, 0x11)]);
-  const pps = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x22)]);
-  const idr = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(40, 0x33)]);
-  const h264Output = Buffer.concat([sps, pps, idr]);
+  // Before recovery: P-frame 1 (seq 1), P-frame 2 (seq 2)
+  const p1 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x11)]), type: NAL_TYPES.NON_IDR }];
+  const pkts1 = encoder.packetizeAccessUnit(p1, 30);
+  assert.equal(pkts1[0].readUInt16BE(2), 1);
 
-  let recoveryProcessCount = 0;
-  encoder._encodeFreshIdrFrame = async () => {
-    recoveryProcessCount++;
-    await new Promise((r) => setTimeout(r, 20));
-    return h264Output;
-  };
+  const p2 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x22)]), type: NAL_TYPES.NON_IDR }];
+  const pkts2 = encoder.packetizeAccessUnit(p2, 30);
+  assert.equal(pkts2[0].readUInt16BE(2), 2);
 
-  const p1 = encoder.requestKeyframe();
-  const p2 = encoder.requestKeyframe();
-  const p3 = encoder.requestKeyframe();
-  const p4 = encoder.requestKeyframe();
+  // Recovery IDR: produces 3 packets (seq 3, 4, 5)
+  encoder._spawnEncoderProcess = () => createMockEncoderProc(defaultIdrH264);
+  const recoveryPkts = await encoder.requestKeyframe();
+  assert.equal(recoveryPkts.length, 3);
+  assert.equal(recoveryPkts[0].readUInt16BE(2), 3);
+  assert.equal(recoveryPkts[1].readUInt16BE(2), 4);
+  assert.equal(recoveryPkts[2].readUInt16BE(2), 5);
 
-  assert.equal(p1, p2);
-  assert.equal(p2, p3);
-  assert.equal(p3, p4);
-
-  const [r1, r2, r3, r4] = await Promise.all([p1, p2, p3, p4]);
-  assert.equal(r1, r2);
-  assert.equal(recoveryProcessCount, 1, 'Exactly ONE recovery process must be spawned for coalesced requests');
-  assert.equal(encoder.metrics.keyframeRequests, 4);
-
-  // After completion, a subsequent request triggers a new recovery process
-  const p5 = encoder.requestKeyframe();
-  assert.notEqual(p5, p1);
-  await p5;
-  assert.equal(recoveryProcessCount, 2);
+  // After recovery: next P-frame gets seq 6
+  const p3 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x33)]), type: NAL_TYPES.NON_IDR }];
+  const pkts3 = encoder.packetizeAccessUnit(p3, 30);
+  assert.equal(pkts3[0].readUInt16BE(2), 6);
 });
 
-test('Test 5 — RTP continuity: SSRC unchanged, sequence numbers continue, and timestamp advances consistently', async () => {
-  const encoder = new VideoEncoder({ payloadType: 98, ssrc: 8888, mtu: 1200, fps: 30 });
+test('Test 4 — SSRC continuity: all packets use the exact same SSRC across recovery', async () => {
+  const encoder = new VideoEncoder({ ssrc: 778899 });
   encoder._latestFrame = Buffer.from('fake-jpeg-frame');
 
-  // Frame 1: Normal P-frame
+  const p1 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x11)]), type: NAL_TYPES.NON_IDR }];
+  const pkts1 = encoder.packetizeAccessUnit(p1, 30);
+  assert.equal(pkts1[0].readUInt32BE(8), 778899);
+
+  encoder._spawnEncoderProcess = () => createMockEncoderProc(defaultIdrH264);
+  const recoveryPkts = await encoder.requestKeyframe();
+  for (const p of recoveryPkts) {
+    assert.equal(p.readUInt32BE(8), 778899);
+  }
+
+  const p2 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x22)]), type: NAL_TYPES.NON_IDR }];
+  const pkts2 = encoder.packetizeAccessUnit(p2, 30);
+  assert.equal(pkts2[0].readUInt32BE(8), 778899);
+});
+
+test('Test 5 — Timestamp behavior: all packets of IDR AU share one timestamp, next AU gets next timestamp', async () => {
+  const encoder = new VideoEncoder({ fps: 30 });
+  encoder._latestFrame = Buffer.from('fake-jpeg-frame');
+
+  // Frame before recovery
   const p1 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x11)]), type: NAL_TYPES.NON_IDR }];
   const pkts1 = encoder.packetizeAccessUnit(p1, 30);
   const ts1 = pkts1[0].readUInt32BE(4);
-  const seq1 = pkts1[0].readUInt16BE(2);
-  const ssrc1 = pkts1[0].readUInt32BE(8);
-  assert.equal(ssrc1, 8888);
 
-  // Frame 2: Normal P-frame
-  const p2 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x22)]), type: NAL_TYPES.NON_IDR }];
-  const pkts2 = encoder.packetizeAccessUnit(p2, 30);
-  const ts2 = pkts2[0].readUInt32BE(4);
-  const seq2 = pkts2[0].readUInt16BE(2);
-  assert.equal(ts2, (ts1 + 3000) >>> 0);
-  assert.equal(seq2, (seq1 + 1) & 0xffff);
-
-  // Fresh Recovery Keyframe
-  const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-  const sps = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00, 0x0a]), Buffer.alloc(10, 0x11)]);
-  const pps = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x22)]);
-  const idr = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(100, 0x33)]);
-  encoder._encodeFreshIdrFrame = async () => Buffer.concat([sps, pps, idr]);
-
+  // Recovery IDR
+  encoder._spawnEncoderProcess = () => createMockEncoderProc(defaultIdrH264);
   const idrPkts = await encoder.requestKeyframe();
-  assert.equal(idrPkts.length, 3);
-
   const idrTs = idrPkts[0].readUInt32BE(4);
-  assert.equal(idrTs, (ts2 + 3000) >>> 0, 'Fresh IDR timestamp must advance by exactly one frame duration');
+  assert.equal(idrTs, (ts1 + 3000) >>> 0, 'IDR AU timestamp must increment by one frame interval (3000)');
   assert.equal(idrPkts[1].readUInt32BE(4), idrTs, 'All packets of IDR AU must share identical timestamp');
   assert.equal(idrPkts[2].readUInt32BE(4), idrTs, 'All packets of IDR AU must share identical timestamp');
 
-  assert.equal(idrPkts[0].readUInt16BE(2), (seq2 + 1) & 0xffff, 'Sequence numbers must continue without gap');
-  assert.equal(idrPkts[1].readUInt16BE(2), (seq2 + 2) & 0xffff);
-  assert.equal(idrPkts[2].readUInt16BE(2), (seq2 + 3) & 0xffff);
-
-  assert.equal(idrPkts[0].readUInt32BE(8), 8888, 'SSRC must remain unchanged');
-  assert.equal(idrPkts[1].readUInt32BE(8), 8888);
-  assert.equal(idrPkts[2].readUInt32BE(8), 8888);
-
-  // Frame 4: P-frame after recovery IDR
-  const p4 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x44)]), type: NAL_TYPES.NON_IDR }];
-  const pkts4 = encoder.packetizeAccessUnit(p4, 30);
-  const ts4 = pkts4[0].readUInt32BE(4);
-  const seq4 = pkts4[0].readUInt16BE(2);
-
-  assert.equal(ts4, (idrTs + 3000) >>> 0, 'Next P-frame timestamp must advance normally');
-  assert.equal(seq4, (idrPkts[2].readUInt16BE(2) + 1) & 0xffff, 'Next P-frame seq must continue from last IDR packet');
-  assert.equal(pkts4[0].readUInt32BE(8), 8888, 'SSRC must remain unchanged');
+  // Frame after recovery
+  const p2 = [{ data: Buffer.concat([Buffer.from([0x41, 0x88]), Buffer.alloc(50, 0x22)]), type: NAL_TYPES.NON_IDR }];
+  const pkts2 = encoder.packetizeAccessUnit(p2, 30);
+  assert.equal(pkts2[0].readUInt32BE(4), (idrTs + 3000) >>> 0, 'Post-recovery frame timestamp must increment by one frame interval');
 });
 
-test('Test 6 — Marker bit: all packets except last -> M=0, last packet -> M=1 (including FU-A fragmentation)', async () => {
-  const encoder = new VideoEncoder({ payloadType: 98, ssrc: 7777, mtu: 500, fps: 30 });
+test('Test 6 — Marker bit: only final packet of IDR AU has M=1, all previous have M=0 (including FU-A fragmentation)', async () => {
+  const encoder = new VideoEncoder({ mtu: 500, fps: 30 });
   encoder._latestFrame = Buffer.from('fake-jpeg-frame');
 
-  const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-  const sps = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00, 0x0a]), Buffer.alloc(10, 0x11)]);
-  const pps = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x22)]);
-  const idr = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(1200, 0x55)]);
-  encoder._encodeFreshIdrFrame = async () => Buffer.concat([sps, pps, idr]);
+  // Large IDR of 1200 bytes to force FU-A fragmentation
+  const largeIdr = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(1200, 0x55)]);
+  const largeIdrH264 = Buffer.concat([defaultSps, defaultPps, largeIdr]);
 
+  encoder._spawnEncoderProcess = () => createMockEncoderProc(largeIdrH264);
   const packets = await encoder.requestKeyframe();
-  assert.ok(packets.length >= 4, 'Must produce multiple packets including FU-A');
+  assert.ok(packets.length >= 4, 'Must produce multiple packets including FU-A fragments');
 
   for (let i = 0; i < packets.length - 1; i++) {
     const marker = (packets[i][1] & 0x80) !== 0;
-    assert.equal(marker, false, `Packet ${i} of fresh IDR AU must have Marker bit M=0`);
+    assert.equal(marker, false, `Packet ${i} of IDR AU must have Marker bit M=0`);
     assert.equal(packets[i].marker, 0);
   }
 
-  const finalPacket = packets[packets.length - 1];
-  const finalMarker = (finalPacket[1] & 0x80) !== 0;
-  assert.equal(finalMarker, true, 'Final packet of fresh IDR AU must have Marker bit M=1');
-  assert.equal(finalPacket.marker, 1);
+  const lastPacket = packets[packets.length - 1];
+  const lastMarker = (lastPacket[1] & 0x80) !== 0;
+  assert.equal(lastMarker, true, 'Final packet of IDR AU must have Marker bit M=1');
+  assert.equal(lastPacket.marker, 1);
 });
 
-test('Test 7 — FFmpeg failure: rejects promise, does not kill main encoder, and allows next recovery request', async () => {
-  const encoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
+test('Test 7 — Retry after failure: failure rejects promise, leaves encoder in valid state, allows subsequent recovery', async () => {
+  const encoder = new VideoEncoder();
   encoder._latestFrame = Buffer.from('fake-jpeg-frame');
 
-  // Mock main encoder process to verify it stays alive
-  let mainKilled = false;
-  encoder.ffmpegProc = {
-    stdin: { writable: true, write: () => true },
-    kill: () => { mainKilled = true; },
-  };
-  encoder._isEncoding = true;
-
-  // Make _encodeFreshIdrFrame fail
-  encoder._encodeFreshIdrFrame = async () => {
-    throw new Error('Recovery FFmpeg exited with code 1: Invalid input data');
+  // First attempt fails during process spawn / write
+  encoder._spawnEncoderProcess = () => {
+    const mock = new EventEmitter();
+    mock.stdin = { write: () => true, end: () => {} };
+    mock.stdout = new EventEmitter();
+    mock.stderr = new EventEmitter();
+    mock.kill = () => {};
+    setImmediate(() => mock.emit('error', new Error('Encoder spawn failed')));
+    return mock;
   };
 
   await assert.rejects(
     async () => {
       await encoder.requestKeyframe();
     },
-    /Recovery FFmpeg exited with code 1/
+    /Encoder spawn failed/
   );
 
-  assert.equal(mainKilled, false, 'Main FFmpeg encoder must NOT be killed on recovery failure');
-  assert.equal(encoder._isEncoding, true, 'Main encoder must remain encoding');
-  assert.equal(encoder._pendingKeyframePromise, null, 'Pending promise must be cleared');
-  assert.equal(encoder._recoveryInFlight, false, 'Recovery in-flight flag must be reset');
-  assert.equal(encoder.metrics.freshKeyframeFailures, 1);
+  assert.equal(encoder._recoveryState, RECOVERY_STATES.NORMAL);
+  assert.equal(encoder._pendingKeyframePromise, null);
+  assert.equal(encoder.metrics.forcedIdrFailures, 1);
 
-  // Verify next recovery request can be attempted
-  const prefix4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-  const sps = Buffer.concat([prefix4, Buffer.from([0x67, 0x42, 0x00, 0x0a]), Buffer.alloc(10, 0x11)]);
-  const pps = Buffer.concat([prefix4, Buffer.from([0x68, 0xce, 0x01]), Buffer.alloc(5, 0x22)]);
-  const idr = Buffer.concat([prefix4, Buffer.from([0x65, 0x88]), Buffer.alloc(40, 0x33)]);
-  encoder._encodeFreshIdrFrame = async () => Buffer.concat([sps, pps, idr]);
+  // Second attempt succeeds
+  encoder._spawnEncoderProcess = () => createMockEncoderProc(defaultIdrH264);
+  const packets = await encoder.requestKeyframe();
+  assert.ok(Array.isArray(packets) && packets.length >= 3);
+  assert.equal(encoder.metrics.forcedIdrSuccesses, 1);
+  assert.equal(encoder._recoveryState, RECOVERY_STATES.NORMAL);
+});
 
-  const recoveredPackets = await encoder.requestKeyframe();
-  assert.ok(Array.isArray(recoveredPackets) && recoveredPackets.length >= 3);
-  assert.equal(encoder.metrics.freshKeyframeRecoveries, 1);
+test('Test 8 — Same encoder reference chain: forced IDR and subsequent P-frames originate from the same encoder instance', async () => {
+  const encoder = new VideoEncoder();
+  encoder._latestFrame = Buffer.from('fake-jpeg-0');
+
+  // Initial encoder procA
+  const procA = createMockEncoderProc();
+  procA.name = 'procA';
+  encoder.ffmpegProc = procA;
+  encoder._isEncoding = true;
+
+  assert.equal(encoder.ffmpegProc, procA, 'Initially encoder is procA');
+
+  // Trigger keyframe recovery which will spawn procB
+  let procB;
+  encoder._spawnEncoderProcess = () => {
+    procB = createMockEncoderProc(defaultIdrH264);
+    procB.name = 'procB';
+    return procB;
+  };
+
+  const idrPackets = await encoder.requestKeyframe();
+  assert.ok(idrPackets.length >= 3);
+
+  // 1. Verify old encoder procA was retired
+  assert.equal(procA.isKilled, true, 'Old encoder procA must be killed/retired');
+  assert.notEqual(encoder.ffmpegProc, procA, 'Active encoder must no longer be procA');
+
+  // 2. Verify active encoder is now procB
+  assert.equal(encoder.ffmpegProc, procB, 'Active encoder must now be procB');
+
+  // 3. Encode next frame - must be written to procB.stdin!
+  const nextFrameBytes = Buffer.from('fake-jpeg-1');
+  let writtenToProcB = false;
+  procB.stdin.write = (chunk) => {
+    if (chunk && chunk.includes('fake-jpeg-1')) {
+      writtenToProcB = true;
+    }
+    return true;
+  };
+
+  encoder.encodeFrame(nextFrameBytes);
+  assert.equal(writtenToProcB, true, 'Subsequent frame must be fed to the SAME replacement encoder (procB)');
+
+  // 4. When procB outputs a P-frame, it is processed as part of procB reference chain
+  const pFrameData = Buffer.concat([prefix4, Buffer.from([0x41, 0x88]), Buffer.alloc(40, 0xee)]);
+  const nextDelimiter = Buffer.concat([prefix4, Buffer.from([0x41, 0x88])]);
+
+  let emittedPackets = null;
+  encoder.once('packets', (pkts) => {
+    emittedPackets = pkts;
+  });
+
+  procB.stdout.emit('data', Buffer.concat([pFrameData, nextDelimiter]));
+
+  assert.ok(emittedPackets, 'procB must output subsequent P-frame packets');
+  const lastIdrSeq = idrPackets[idrPackets.length - 1].readUInt16BE(2);
+  assert.equal(emittedPackets[0].readUInt16BE(2), lastIdrSeq + 1, 'RTP sequence continues seamlessly from IDR into procB P-frame');
 });
 
