@@ -46,6 +46,7 @@ try {
 }
 
 const PREVIEW_PORT = Number(process.env.FLUTTER_REMOTE_TARGET_PORT || process.env.PREVIEW_PORT || 3200);
+const STREAM_PATH = process.env.FLUTTER_REMOTE_STREAM_PATH || '/stream.mjpeg?raw=1';
 const SIGNAL_PORT = Number(process.env.FLUTTER_REMOTE_WEBRTC_SIGNAL_PORT || 3201);
 const TRANSPORT_MODE = process.env.FLUTTER_REMOTE_TRANSPORT || 'webrtc';
 const TARGET_HOST = '127.0.0.1';
@@ -173,37 +174,63 @@ class VideoEncoder extends EventEmitter {
     if (this.ffmpegProc) return;
 
     try {
-      this.ffmpegProc = this._spawnEncoderProcess();
+      const proc = this._spawnEncoderProcess();
+      this.ffmpegProc = proc;
       this._isEncoding = true;
       this._waitingForDrain = false;
 
-      this.ffmpegProc.stdout.on('data', (chunk) => {
+      console.log(`[ffmpeg] encoder started pid=${proc.pid}`);
+
+      proc.stdout.on('data', (chunk) => {
+        if (this.ffmpegProc !== proc) return;
         this._handleEncodedData(chunk);
       });
 
-      this._setupStdin(this.ffmpegProc.stdin);
+      this._setupStdin(proc.stdin);
 
-      this.ffmpegProc.stderr.on('data', (errData) => {
-        const msg = errData.toString();
-        if (!msg.includes('deprecated') && !msg.includes('EOI missing')) {
-          console.warn('[webrtc-peer encoder warning]', msg);
+      let lastStderrMsg = '';
+      let repeatCount = 0;
+      proc.stderr.on('data', (errData) => {
+        const msg = errData.toString().trim();
+        if (!msg) return;
+        if (msg.includes('deprecated') || msg.includes('EOI missing')) return;
+
+        if (msg === lastStderrMsg) {
+          repeatCount++;
+          if (repeatCount % 50 === 0) {
+            console.error(`[ffmpeg] ${msg} (repeated ${repeatCount} times)`);
+          }
+          return;
         }
+        lastStderrMsg = msg;
+        repeatCount = 0;
+        console.error(`[ffmpeg] ${msg}`);
       });
 
-      this.ffmpegProc.on('error', (err) => {
-        console.error('[webrtc-peer encoder error]', err.message);
+      proc.on('error', (err) => {
+        console.error(`[ffmpeg] encoder error pid=${proc.pid}: ${err.message}`);
         this.close();
       });
 
-      this.ffmpegProc.on('close', (code) => {
+      proc.on('close', (code, signal) => {
+        if (this.ffmpegProc !== proc) {
+          console.log(`[ffmpeg] retired encoder closed pid=${proc.pid}`);
+          return;
+        }
+
         this._isEncoding = false;
         this.ffmpegProc = null;
         this._flushPending();
+
+        console.log(
+          `[ffmpeg] active encoder closed pid=${proc.pid} ` +
+          `code=${code} signal=${signal}`
+        );
       });
 
       this._startDiagnostics();
     } catch (err) {
-      console.error('[webrtc-peer encoder spawn error]', err.message);
+      console.error('[ffmpeg] encoder spawn error:', err.message);
       this._isEncoding = false;
     }
   }
@@ -228,6 +255,13 @@ class VideoEncoder extends EventEmitter {
     frameCopy.id = this._frameId;
     this._latestFrame = frameCopy;
     this.metrics.inputReceived++;
+
+    if (this.metrics.inputReceived <= 3 || this.metrics.inputReceived % 60 === 0) {
+      console.log(
+        `[video] received=${this.metrics.inputReceived} encoded=${this.metrics.encodedFrames} ` +
+        `keyframes=${this.metrics.keyframes} dropped=${this.metrics.inputDropped}`
+      );
+    }
 
     // While waiting for IDR recovery on a replacement encoder, buffer in pending queue
     if (this._recoveryState === RECOVERY_STATES.WAITING_FOR_IDR) {
@@ -640,6 +674,7 @@ class VideoEncoder extends EventEmitter {
       let nextProc;
       try {
         nextProc = this._spawnEncoderProcess();
+        console.log(`[ffmpeg] encoder started pid=${nextProc.pid}`);
       } catch (err) {
         this._handleRecoveryFailure(err, reject);
         return;
@@ -729,30 +764,51 @@ class VideoEncoder extends EventEmitter {
 
           nextProc.stdout.removeAllListeners('data');
           nextProc.stdout.on('data', (chunk) => {
+            if (this.ffmpegProc !== nextProc) return;
             this._handleEncodedData(chunk);
           });
 
           this._setupStdin(nextProc.stdin);
 
           nextProc.stderr.removeAllListeners('data');
+          let lastStderrMsg = '';
+          let repeatCount = 0;
           nextProc.stderr.on('data', (errData) => {
-            const msg = errData.toString();
-            if (!msg.includes('deprecated') && !msg.includes('EOI missing')) {
-              console.warn('[webrtc-peer encoder warning]', msg);
+            const msg = errData.toString().trim();
+            if (!msg) return;
+            if (msg.includes('deprecated') || msg.includes('EOI missing')) return;
+
+            if (msg === lastStderrMsg) {
+              repeatCount++;
+              if (repeatCount % 50 === 0) {
+                console.error(`[ffmpeg] ${msg} (repeated ${repeatCount} times)`);
+              }
+              return;
             }
+            lastStderrMsg = msg;
+            repeatCount = 0;
+            console.error(`[ffmpeg] ${msg}`);
           });
 
           nextProc.on('error', (err) => {
-            console.error('[webrtc-peer encoder error]', err.message);
+            console.error(`[ffmpeg] encoder error pid=${nextProc.pid}: ${err.message}`);
             this.close();
           });
 
-          nextProc.on('close', (code) => {
-            if (this.ffmpegProc === nextProc) {
-              this._isEncoding = false;
-              this.ffmpegProc = null;
-              this._flushPending();
+          nextProc.on('close', (code, signal) => {
+            if (this.ffmpegProc !== nextProc) {
+              console.log(`[ffmpeg] retired encoder closed pid=${nextProc.pid}`);
+              return;
             }
+
+            this._isEncoding = false;
+            this.ffmpegProc = null;
+            this._flushPending();
+
+            console.log(
+              `[ffmpeg] active encoder closed pid=${nextProc.pid} ` +
+              `code=${code} signal=${signal}`
+            );
           });
 
           this.emit('packets', packets);
@@ -955,10 +1011,7 @@ class VideoEncoder extends EventEmitter {
     if (this._diagInterval) return;
     this._diagInterval = setInterval(() => {
       if (this.metrics.inputReceived > 0 || this.metrics.encodedFrames > 0) {
-        const avgLatency = this.metrics.encodedFrames > 0
-          ? Math.round(this.metrics.totalEncodeLatencyMs / this.metrics.encodedFrames)
-          : 0;
-        console.log(`[webrtc-peer video] received=${this.metrics.inputReceived} encoded=${this.metrics.encodedFrames} dropped=${this.metrics.inputDropped} pending=${this.metrics.inputPending} keyframes=${this.metrics.keyframes} keyframeRequests=${this.metrics.keyframeRequests}`);
+        console.log(`[video] received=${this.metrics.inputReceived} encoded=${this.metrics.encodedFrames} keyframes=${this.metrics.keyframes} dropped=${this.metrics.inputDropped}`);
       }
     }, 3000);
     this._diagInterval.unref?.();
@@ -1020,18 +1073,41 @@ if (WebSocketServer) {
     }
   });
 
+  let jpegFrameCount = 0;
+
   function ensureLocalStream() {
     if (localStreamReq || (streamWsClients.size === 0 && activeVideoTracks.size === 0)) return;
 
-    console.log('[webrtc-peer] Starting local stream consumer from serve-sim');
+    console.log('[webrtc-peer] starting serve-sim stream consumer');
+    console.log(
+      `[webrtc-peer] Connecting to serve-sim stream: ` +
+      `http://${TARGET_HOST}:${PREVIEW_PORT}${STREAM_PATH}`
+    );
     localStreamReq = http.get(
       {
         host: TARGET_HOST,
         port: PREVIEW_PORT,
-        path: '/stream',
+        path: STREAM_PATH,
         headers: { 'Accept-Encoding': 'identity' },
       },
       (res) => {
+        console.log(
+          `[webrtc-peer] serve-sim stream response: ` +
+          `status=${res.statusCode} ` +
+          `content-type=${res.headers['content-type'] || 'unknown'}`
+        );
+
+        if (res.statusCode !== 200) {
+          console.error(
+            `[webrtc-peer] serve-sim stream failed:\n` +
+            `host=${TARGET_HOST}\n` +
+            `port=${PREVIEW_PORT}\n` +
+            `path=${STREAM_PATH}\n` +
+            `status=${res.statusCode}\n` +
+            `content-type=${res.headers['content-type'] || 'unknown'}`
+          );
+        }
+
         let buffer = Buffer.alloc(0);
 
         res.on('data', (chunk) => {
@@ -1043,6 +1119,13 @@ if (WebSocketServer) {
             if (eoi === -1) break;
 
             const jpeg = buffer.subarray(soi, eoi + 2);
+            jpegFrameCount++;
+
+            if (jpegFrameCount <= 3 || jpegFrameCount % 60 === 0) {
+              console.log(
+                `[video] JPEG frames=${jpegFrameCount} size=${jpeg.length}`
+              );
+            }
 
             // 1. Broadcast raw JPEG to WebSocket clients (legacy fallback)
             for (const client of streamWsClients) {
@@ -1111,7 +1194,7 @@ if (WebSocketServer) {
     }
 
     // Handle /signal: WebRTC Media & DataChannel signaling
-    console.log('[webrtc-peer] Client connected to signaling');
+    console.log('[webrtc-peer] WebRTC client connected');
     let peer = null;
     let videoTrack = null;
     let serveSimWs = null;
@@ -1181,6 +1264,7 @@ if (WebSocketServer) {
         const msg = JSON.parse(data.toString());
 
         if (msg.type === 'offer') {
+          console.log('[webrtc-peer] WebRTC offer received');
           if (!PeerConnection) {
             console.error('[webrtc-peer] Cannot create peer: node-datachannel unavailable');
             return;
@@ -1212,11 +1296,8 @@ if (WebSocketServer) {
               video.addH264Codec(98);
               video.addVP8Codec(97);
               videoTrack = peer.addTrack(video);
-
-              // NOTE: Do not call videoTrack.setMediaHandler(...).
-              // node-datachannel's setMediaHandler double-packetizes when used with sendMessageBinary.
-              // VideoEncoder outputs RFC 6184 RTP packets sent directly via sendMessageBinary().
               activeVideoTracks.add(videoTrack);
+              console.log('[webrtc-peer] video track ready');
 
               // Send cached keyframe immediately to new subscriber for instant playback (< 2s)
               if (videoEncoder.hasKeyframe()) {
@@ -1325,5 +1406,7 @@ if (WebSocketServer) {
 }
 
 server.listen(SIGNAL_PORT, TARGET_HOST, () => {
-  console.log(`[webrtc-peer] listening on ${TARGET_HOST}:${SIGNAL_PORT} -> serve-sim :${PREVIEW_PORT} (mode: ${TRANSPORT_MODE})`);
+  console.log(`[webrtc-peer] listening on ${TARGET_HOST}:${SIGNAL_PORT}`);
+  console.log(`[webrtc-peer] target serve-sim: ${TARGET_HOST}:${PREVIEW_PORT}`);
+  console.log(`[webrtc-peer] stream path: ${STREAM_PATH}`);
 });

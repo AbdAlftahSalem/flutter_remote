@@ -189,6 +189,7 @@ jobs:
           echo "iOS Simulator is booted and ready."
 
       - name: Start serve-sim
+        id: serve_sim
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -204,13 +205,49 @@ jobs:
           )
 
           echo "Starting serve-sim with codec=$CODEC args: ${ARGS[*]}"
-          npx --yes serve-sim "${ARGS[@]}" "${{ steps.sim.outputs.udid }}"
+          SERVE_SIM_OUT=$(npx --yes serve-sim "${ARGS[@]}" "${{ steps.sim.outputs.udid }}" || true)
+          echo "serve-sim raw output: $SERVE_SIM_OUT"
 
           for i in {1..30}; do
             if nc -z 127.0.0.1 "$PREVIEW_PORT" 2>/dev/null; then break; fi
             sleep 0.2
           done
           echo "serve-sim started on port $PREVIEW_PORT"
+
+          # Extract streamUrl if reported by serve-sim, otherwise derive from simulator UDID
+          STREAM_PATH=$(node -e '
+            const out = process.argv[1] || "";
+            const udid = process.argv[2] || "";
+            let streamUrl = "";
+            try {
+              const parsed = JSON.parse(out);
+              streamUrl = parsed.streamUrl || parsed.url || "";
+            } catch {
+              const match = out.match(/"streamUrl"\s*:\s*"([^"]+)"/) || out.match(/http:\/\/[^\s]+/);
+              if (match) streamUrl = match[1] || match[0];
+            }
+            if (streamUrl) {
+              try {
+                const u = new URL(streamUrl);
+                let p = u.pathname;
+                if (!p.includes("stream.mjpeg")) {
+                  p = p.replace(/\/?$/, "/stream.mjpeg");
+                }
+                p += (p.includes("?") ? "&" : "?") + "raw=1";
+                console.log(p);
+                process.exit(0);
+              } catch {}
+            }
+            if (udid) {
+              console.log(`/helper/${udid}/stream.mjpeg?raw=1`);
+            } else {
+              console.log("/stream.mjpeg?raw=1");
+            }
+          ' "$SERVE_SIM_OUT" "${{ steps.sim.outputs.udid }}")
+
+          echo "Derived stream path: $STREAM_PATH"
+          echo "stream_path=$STREAM_PATH" >> "$GITHUB_OUTPUT"
+          echo "FLUTTER_REMOTE_STREAM_PATH=$STREAM_PATH" >> "$GITHUB_ENV"
 
       - name: Install WebRTC peer dependencies
         timeout-minutes: 5
@@ -225,6 +262,7 @@ jobs:
           FLUTTER_REMOTE_TARGET_PORT: ${{ env.PREVIEW_PORT }}
           FLUTTER_REMOTE_WEBRTC_SIGNAL_PORT: "3201"
           FLUTTER_REMOTE_TRANSPORT: ${{ inputs.transport }}
+          FLUTTER_REMOTE_STREAM_PATH: ${{ steps.serve_sim.outputs.stream_path || env.FLUTTER_REMOTE_STREAM_PATH || format('/helper/{0}/stream.mjpeg?raw=1', steps.sim.outputs.udid) }}
         run: |
           set -euo pipefail
           export NODE_PATH="$(npm root -g)"
@@ -239,6 +277,9 @@ jobs:
             sleep 0.2
           done
           echo "WebRTC peer bridge running on port 3201"
+          echo "--- WebRTC peer startup log ---"
+          cat webrtc-peer.log || true
+          echo "--- End WebRTC peer startup log ---"
 
       - name: Start auth gate
         timeout-minutes: 5
@@ -498,7 +539,10 @@ jobs:
         run: |
           MINUTES='${{ inputs.minutes }}'
           echo "Stream is active. Holding session open for $MINUTES minutes..."
+          tail -f webrtc-peer.log &
+          TAIL_PID=$!
           sleep $((MINUTES * 60))
+          kill $TAIL_PID 2>/dev/null || true
 
       - name: Mark session ended
         if: always()

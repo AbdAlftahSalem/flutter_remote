@@ -147,37 +147,66 @@ export class VideoEncoder extends EventEmitter {
     if (this.ffmpegProc) return;
 
     try {
-      this.ffmpegProc = this._spawnEncoderProcess();
+      const proc = this._spawnEncoderProcess();
+      this.ffmpegProc = proc;
       this._isEncoding = true;
       this._waitingForDrain = false;
 
-      this.ffmpegProc.stdout.on('data', (chunk) => {
+      console.log(`[ffmpeg] encoder started pid=${proc.pid}`);
+
+      proc.stdout.on('data', (chunk) => {
+        if (this.ffmpegProc !== proc) return;
         this._handleEncodedData(chunk);
       });
 
-      this._setupStdin(this.ffmpegProc.stdin);
+      this._setupStdin(proc.stdin);
 
-      this.ffmpegProc.stderr.on('data', (errData) => {
-        const msg = errData.toString();
-        if (!msg.includes('deprecated') && !msg.includes('EOI missing')) {
-          this.emit('encoder_warning', msg);
+      let lastStderrMsg = '';
+      let repeatCount = 0;
+      proc.stderr.on('data', (errData) => {
+        const msg = errData.toString().trim();
+        if (!msg) return;
+        if (msg.includes('deprecated') || msg.includes('EOI missing')) return;
+
+        if (msg === lastStderrMsg) {
+          repeatCount++;
+          if (repeatCount % 50 === 0) {
+            console.error(`[ffmpeg] ${msg} (repeated ${repeatCount} times)`);
+          }
+          return;
         }
+        lastStderrMsg = msg;
+        repeatCount = 0;
+        console.error(`[ffmpeg] ${msg}`);
+        this.emit('encoder_warning', msg);
       });
 
-      this.ffmpegProc.on('error', (err) => {
+      proc.on('error', (err) => {
+        console.error(`[ffmpeg] encoder error pid=${proc.pid}: ${err.message}`);
         this.emit('encoder_error', err);
         this.close();
       });
 
-      this.ffmpegProc.on('close', (code) => {
+      proc.on('close', (code, signal) => {
+        if (this.ffmpegProc !== proc) {
+          console.log(`[ffmpeg] retired encoder closed pid=${proc.pid}`);
+          return;
+        }
+
         this._isEncoding = false;
         this.ffmpegProc = null;
         this._flushPending();
+
+        console.log(
+          `[ffmpeg] active encoder closed pid=${proc.pid} ` +
+          `code=${code} signal=${signal}`
+        );
         this.emit('encoder_closed', code);
       });
 
       this._startDiagnostics();
     } catch (err) {
+      console.error('[ffmpeg] encoder spawn error:', err.message);
       this.emit('encoder_error', err);
       this._isEncoding = false;
     }
@@ -206,6 +235,13 @@ export class VideoEncoder extends EventEmitter {
     frameCopy.id = this._frameId;
     this._latestFrame = frameCopy;
     this.metrics.inputReceived++;
+
+    if (this.metrics.inputReceived <= 3 || this.metrics.inputReceived % 60 === 0) {
+      console.log(
+        `[video] received=${this.metrics.inputReceived} encoded=${this.metrics.encodedFrames} ` +
+        `keyframes=${this.metrics.keyframes} dropped=${this.metrics.inputDropped}`
+      );
+    }
 
     // While waiting for IDR recovery on a replacement encoder, buffer in pending queue
     if (this._recoveryState === RECOVERY_STATES.WAITING_FOR_IDR) {
@@ -645,6 +681,7 @@ export class VideoEncoder extends EventEmitter {
       let nextProc;
       try {
         nextProc = this._spawnEncoderProcess();
+        console.log(`[ffmpeg] encoder started pid=${nextProc.pid}`);
       } catch (err) {
         this._handleRecoveryFailure(err, reject);
         return;
@@ -740,6 +777,7 @@ export class VideoEncoder extends EventEmitter {
           // Wire nextProc stdout into continuous stream parser
           nextProc.stdout.removeAllListeners('data');
           nextProc.stdout.on('data', (chunk) => {
+            if (this.ffmpegProc !== nextProc) return;
             this._handleEncodedData(chunk);
           });
 
@@ -748,25 +786,47 @@ export class VideoEncoder extends EventEmitter {
 
           // Wire nextProc stderr & error/close
           nextProc.stderr.removeAllListeners('data');
+          let lastStderrMsg = '';
+          let repeatCount = 0;
           nextProc.stderr.on('data', (errData) => {
-            const msg = errData.toString();
+            const msg = errData.toString().trim();
+            if (!msg) return;
             if (!msg.includes('deprecated') && !msg.includes('EOI missing')) {
+              if (msg === lastStderrMsg) {
+                repeatCount++;
+                if (repeatCount % 50 === 0) {
+                  console.error(`[ffmpeg] ${msg} (repeated ${repeatCount} times)`);
+                }
+                return;
+              }
+              lastStderrMsg = msg;
+              repeatCount = 0;
+              console.error(`[ffmpeg] ${msg}`);
               this.emit('encoder_warning', msg);
             }
           });
 
           nextProc.on('error', (err) => {
+            console.error(`[ffmpeg] encoder error pid=${nextProc.pid}: ${err.message}`);
             this.emit('encoder_error', err);
             this.close();
           });
 
-          nextProc.on('close', (code) => {
-            if (this.ffmpegProc === nextProc) {
-              this._isEncoding = false;
-              this.ffmpegProc = null;
-              this._flushPending();
-              this.emit('encoder_closed', code);
+          nextProc.on('close', (code, signal) => {
+            if (this.ffmpegProc !== nextProc) {
+              console.log(`[ffmpeg] retired encoder closed pid=${nextProc.pid}`);
+              return;
             }
+
+            this._isEncoding = false;
+            this.ffmpegProc = null;
+            this._flushPending();
+
+            console.log(
+              `[ffmpeg] active encoder closed pid=${nextProc.pid} ` +
+              `code=${code} signal=${signal}`
+            );
+            this.emit('encoder_closed', code);
           });
 
           // Emit packets for WebRTC track
