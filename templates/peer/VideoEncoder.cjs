@@ -1,42 +1,30 @@
+// flutter-remote-template-version: 4
 /**
- * Flutter Remote WebRTC V3 Real Video Encoder
+ * Flutter Remote WebRTC V3 Real Video Encoder (CommonJS)
  *
- * Provides genuine H.264 video encoding:
- *   1. Real H.264 video encoding from image frames (JPEG / MJPEG) using FFmpeg (libx264 zerolatency).
- *   2. Annex-B NAL unit parsing (3-byte & 4-byte start codes across chunk boundaries).
- *   3. Access Unit (frame) demarcation and grouping (SPS, PPS, SEI, IDR / slices).
- *   4. Delegates RTP packetization to RtpPacketizer.
- *   5. Delegates keyframe recovery to KeyframeController.
- *   6. FFmpeg stdin backpressure management with bounded latest-frame priority queue.
- *   7. Fresh IDR keyframe recovery maintaining reference chain.
+ * For standalone remote runner execution.
  */
 
-import { EventEmitter } from 'node:events';
-import { spawn } from 'node:child_process';
-import { RtpPacketizer, NAL_TYPES } from './RtpPacketizer.js';
-import { KeyframeController, RECOVERY_STATES } from './KeyframeController.js';
+const { EventEmitter } = require('node:events');
+const { spawn } = require('node:child_process');
+const { RtpPacketizer, NAL_TYPES } = require('./RtpPacketizer.cjs');
+const { KeyframeController, RECOVERY_STATES } = require('./KeyframeController.cjs');
 
-export { NAL_TYPES, RECOVERY_STATES };
-
-let resolvedFfmpegPath = null;
+let ffmpegPath = 'ffmpeg';
 try {
-  const ffmpegStatic = await import('ffmpeg-static');
-  resolvedFfmpegPath = ffmpegStatic.default || ffmpegStatic;
-} catch {
-  resolvedFfmpegPath = 'ffmpeg';
-}
+  ffmpegPath = require('ffmpeg-static') || 'ffmpeg';
+} catch {}
 
-export class VideoEncoder extends EventEmitter {
+class VideoEncoder extends EventEmitter {
   constructor(options = {}) {
     super();
-    this.payloadType = options.payloadType || 98; // 98 for H.264
+    this.payloadType = options.payloadType || 98;
     this.ssrc = options.ssrc || 12345;
-    this.mtu = options.mtu || 1200; // Safe MTU for UDP
+    this.mtu = options.mtu || 1200;
     this.fps = options.fps || 30;
     this.bitrateKbps = options.bitrateKbps || 2500;
-    this.ffmpegPath = options.ffmpegPath || resolvedFfmpegPath;
+    this.ffmpegPath = options.ffmpegPath || ffmpegPath;
 
-    // Submodules
     this.rtpPacketizer = new RtpPacketizer({
       payloadType: this.payloadType,
       ssrc: this.ssrc,
@@ -48,23 +36,19 @@ export class VideoEncoder extends EventEmitter {
       spawnEncoderFn: () => this._spawnEncoderProcess(),
     });
 
-    // Forward keyframe controller events
-    this.keyframeController.on('keyframe_requested', (data) => this.emit('keyframe_requested', data));
-    this.keyframeController.on('fresh_keyframe_encoded', (data) => this.emit('fresh_keyframe_encoded', data));
+    this.keyframeController.on('keyframe_requested', (d) => this.emit('keyframe_requested', d));
+    this.keyframeController.on('fresh_keyframe_encoded', (d) => this.emit('fresh_keyframe_encoded', d));
 
-    // Backpressure & Bounded Queue
     this.maxPendingFrames = options.maxPendingFrames || 1;
     this._pendingQueue = [];
     this._waitingForDrain = false;
     this._hasDrainListener = false;
 
-    // Stream Parser & Access Unit Demarcation State
     this._streamBuffer = Buffer.alloc(0);
     this._pendingAU = [];
     this._auHasVcl = false;
     this._flushTimer = null;
 
-    // Frame tracking for recovery
     this._frameId = 0;
     this._latestFrameId = 0;
     this._latestFrame = null;
@@ -79,38 +63,36 @@ export class VideoEncoder extends EventEmitter {
     this.metrics.maxEncodeLatencyMs = 0;
     this._diagInterval = null;
 
-    // FFmpeg process
     this.ffmpegProc = null;
     this._isEncoding = false;
   }
 
-  // Delegated getters & setters for backwards compatibility
   get cachedSps() { return this.keyframeController.cachedSps; }
-  set cachedSps(val) { this.keyframeController.cachedSps = val; }
+  set cachedSps(v) { this.keyframeController.cachedSps = v; }
 
   get cachedPps() { return this.keyframeController.cachedPps; }
-  set cachedPps(val) { this.keyframeController.cachedPps = val; }
+  set cachedPps(v) { this.keyframeController.cachedPps = v; }
 
   get cachedKeyframe() { return this.keyframeController.cachedKeyframe; }
-  set cachedKeyframe(val) { this.keyframeController.cachedKeyframe = val; }
+  set cachedKeyframe(v) { this.keyframeController.cachedKeyframe = v; }
 
   get lastFrameType() { return this.keyframeController.lastFrameType; }
-  set lastFrameType(val) { this.keyframeController.lastFrameType = val; }
+  set lastFrameType(v) { this.keyframeController.lastFrameType = v; }
 
   get _recoveryState() { return this.keyframeController.state; }
-  set _recoveryState(val) { this.keyframeController.state = val; }
+  set _recoveryState(v) { this.keyframeController.state = v; }
 
   get _pendingKeyframePromise() { return this.keyframeController.pendingKeyframePromise; }
-  set _pendingKeyframePromise(val) { this.keyframeController.pendingKeyframePromise = val; }
+  set _pendingKeyframePromise(v) { this.keyframeController.pendingKeyframePromise = v; }
 
   get _sequenceNumber() { return this.rtpPacketizer._sequenceNumber; }
-  set _sequenceNumber(val) { this.rtpPacketizer._sequenceNumber = val; }
+  set _sequenceNumber(v) { this.rtpPacketizer._sequenceNumber = v; }
 
   get _timestamp() { return this.rtpPacketizer._timestamp; }
-  set _timestamp(val) { this.rtpPacketizer._timestamp = val; }
+  set _timestamp(v) { this.rtpPacketizer._timestamp = v; }
 
   get _clockRate() { return this.rtpPacketizer._clockRate; }
-  set _clockRate(val) { this.rtpPacketizer._clockRate = val; }
+  set _clockRate(v) { this.rtpPacketizer._clockRate = v; }
 
   _nextRtpTimestamp(fps = this.fps) {
     return this.rtpPacketizer.nextRtpTimestamp(fps);
@@ -142,14 +124,10 @@ export class VideoEncoder extends EventEmitter {
   }
 
   packetize(frameBuffer, fps = this.fps) {
-    if (!Buffer.isBuffer(frameBuffer) || frameBuffer.length === 0) {
-      return [];
-    }
+    if (!Buffer.isBuffer(frameBuffer) || frameBuffer.length === 0) return [];
     const nalUnits = this.parseNalUnits(frameBuffer);
-    if (nalUnits.length > 0) {
-      this.inspectAndCacheNals(nalUnits);
-    }
-    const units = (nalUnits.length > 0) ? nalUnits : [{ data: frameBuffer, type: frameBuffer[0] & 0x1f }];
+    if (nalUnits.length > 0) this.inspectAndCacheNals(nalUnits);
+    const units = nalUnits.length > 0 ? nalUnits : [{ data: frameBuffer, type: frameBuffer[0] & 0x1f }];
     return this.packetizeAccessUnit(units, fps);
   }
 
@@ -203,9 +181,6 @@ export class VideoEncoder extends EventEmitter {
     Object.assign(this.metrics, this.keyframeController.metrics);
   }
 
-  /**
-   * Spawns a continuous FFmpeg H.264 encoding process.
-   */
   _spawnEncoderProcess() {
     const args = [
       '-loglevel', 'error',
@@ -279,11 +254,9 @@ export class VideoEncoder extends EventEmitter {
           console.log(`[ffmpeg] retired encoder closed pid=${proc.pid}`);
           return;
         }
-
         this._isEncoding = false;
         this.ffmpegProc = null;
         this._flushPending();
-
         console.log(`[ffmpeg] active encoder closed pid=${proc.pid} code=${code} signal=${signal}`);
         this.emit('encoder_closed', code);
       });
@@ -306,9 +279,7 @@ export class VideoEncoder extends EventEmitter {
   }
 
   encodeFrame(jpegBuffer) {
-    if (!Buffer.isBuffer(jpegBuffer) || jpegBuffer.length === 0) {
-      return false;
-    }
+    if (!Buffer.isBuffer(jpegBuffer) || jpegBuffer.length === 0) return false;
 
     this._frameId++;
     this._latestFrameId = this._frameId;
@@ -372,15 +343,11 @@ export class VideoEncoder extends EventEmitter {
 
   _flushNextPendingInput() {
     if (this._pendingQueue.length === 0 || !this.ffmpegProc?.stdin?.writable) return;
-
     const item = this._pendingQueue.shift();
     this.metrics.inputPending = this._pendingQueue.length;
-
     try {
       const canAcceptMore = this.ffmpegProc.stdin.write(item.buffer);
-      if (!canAcceptMore) {
-        this._waitingForDrain = true;
-      }
+      if (!canAcceptMore) this._waitingForDrain = true;
     } catch (err) {
       this.emit('encoder_error', err);
     }
@@ -399,21 +366,14 @@ export class VideoEncoder extends EventEmitter {
       if (this._isNewAccessUnit(nal)) {
         this._emitCurrentAccessUnit();
       }
-
       this._pendingAU.push(nal);
-      if (nal.type >= 1 && nal.type <= 5) {
-        this._auHasVcl = true;
-      }
+      if (nal.type >= 1 && nal.type <= 5) this._auHasVcl = true;
     }
 
-    if (lastStartCode) {
-      this._checkTrailingStartCode(lastStartCode);
-    }
+    if (lastStartCode) this._checkTrailingStartCode(lastStartCode);
 
     if ((this._auHasVcl || this._streamBuffer.length > 0) && this._isEncoding) {
-      this._flushTimer = setTimeout(() => {
-        this._flushPending();
-      }, 10);
+      this._flushTimer = setTimeout(() => this._flushPending(), 10);
     }
   }
 
@@ -427,11 +387,8 @@ export class VideoEncoder extends EventEmitter {
         const au = this._emitCurrentAccessUnit();
         if (au) emittedAUs.push(au);
       }
-
       this._pendingAU.push(nal);
-      if (nal.type >= 1 && nal.type <= 5) {
-        this._auHasVcl = true;
-      }
+      if (nal.type >= 1 && nal.type <= 5) this._auHasVcl = true;
     }
 
     if (lastStartCode) {
@@ -461,9 +418,7 @@ export class VideoEncoder extends EventEmitter {
       }
     }
 
-    if (startCodes.length === 0) {
-      return { completeNals: [], lastStartCode: null };
-    }
+    if (startCodes.length === 0) return { completeNals: [], lastStartCode: null };
 
     if (startCodes.length === 1) {
       if (startCodes[0].index > 0) {
@@ -478,18 +433,14 @@ export class VideoEncoder extends EventEmitter {
       const next = startCodes[k + 1];
       const nalData = buffer.subarray(current.index + current.prefixLen, next.index);
       if (nalData.length > 0) {
-        const nalType = nalData[0] & 0x1f;
-        completeNals.push({ data: nalData, type: nalType });
+        completeNals.push({ data: nalData, type: nalData[0] & 0x1f });
       }
     }
 
     const lastStartCode = startCodes[startCodes.length - 1];
     this._streamBuffer = buffer.subarray(lastStartCode.index);
 
-    return {
-      completeNals,
-      lastStartCode: { index: 0, prefixLen: lastStartCode.prefixLen },
-    };
+    return { completeNals, lastStartCode: { index: 0, prefixLen: lastStartCode.prefixLen } };
   }
 
   _checkTrailingStartCode(lastStartCode) {
@@ -525,30 +476,24 @@ export class VideoEncoder extends EventEmitter {
 
   _isNewAccessUnit(nal) {
     if (this._pendingAU.length === 0) return false;
-
     if (nal.type === NAL_TYPES.AUD) return true;
 
     if (this._auHasVcl) {
       if (nal.type === NAL_TYPES.SPS || nal.type === NAL_TYPES.PPS || nal.type === NAL_TYPES.SEI) {
         return true;
       }
-
       if (nal.type >= 1 && nal.type <= 5) {
-        if (nal.data.length > 1 && (nal.data[1] & 0x80) !== 0) {
-          return true;
-        }
+        if (nal.data.length > 1 && (nal.data[1] & 0x80) !== 0) return true;
         const currentHasIdr = this._pendingAU.some((n) => n.type === NAL_TYPES.IDR);
         if (nal.type === NAL_TYPES.IDR && !currentHasIdr) return true;
         if (nal.type !== NAL_TYPES.IDR && currentHasIdr) return true;
       }
     }
-
     return false;
   }
 
   _emitCurrentAccessUnit() {
     if (this._pendingAU.length === 0) return null;
-
     const auNals = this._pendingAU;
     this._pendingAU = [];
     this._auHasVcl = false;
@@ -560,7 +505,6 @@ export class VideoEncoder extends EventEmitter {
     if (packets.length > 0) {
       this.emit('packets', packets);
     }
-
     return auNals;
   }
 
@@ -615,8 +559,7 @@ export class VideoEncoder extends EventEmitter {
     }
 
     if (startCodes.length === 0) {
-      const nalType = buffer[0] & 0x1f;
-      return [{ data: buffer, type: nalType }];
+      return [{ data: buffer, type: buffer[0] & 0x1f }];
     }
 
     for (let k = 0; k < startCodes.length; k++) {
@@ -624,10 +567,8 @@ export class VideoEncoder extends EventEmitter {
       const start = current.index + current.prefixLen;
       const end = (k + 1 < startCodes.length) ? startCodes[k + 1].index : len;
       const nalData = buffer.subarray(start, end);
-
       if (nalData.length > 0) {
-        const nalType = nalData[0] & 0x1f;
-        nalUnits.push({ data: nalData, type: nalType });
+        nalUnits.push({ data: nalData, type: nalData[0] & 0x1f });
       }
     }
 
@@ -673,3 +614,9 @@ export class VideoEncoder extends EventEmitter {
     this.keyframeController.reset();
   }
 }
+
+module.exports = {
+  NAL_TYPES,
+  RECOVERY_STATES,
+  VideoEncoder,
+};
