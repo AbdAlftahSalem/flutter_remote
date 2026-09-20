@@ -29,6 +29,7 @@ export function scaffold(cwd, { force = false } = {}) {
     ['.github/flutter-remote/peer/VideoEncoder.cjs', 'peer/VideoEncoder.cjs'],
     ['.github/flutter-remote/peer/ServeSimConsumer.cjs', 'peer/ServeSimConsumer.cjs'],
     ['.github/flutter-remote/peer/PeerSession.cjs', 'peer/PeerSession.cjs'],
+    ['.github/flutter-remote/peer/DataChannelRouter.cjs', 'peer/DataChannelRouter.cjs'],
     ['.github/flutter-remote/peer/Metrics.cjs', 'peer/Metrics.cjs'],
   ]) {
     const dest = join(cwd, rel);

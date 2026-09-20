@@ -29,7 +29,9 @@ export class ClipboardController {
       }
     };
 
-    window.addEventListener('paste', this._onPaste);
+    if (typeof window !== 'undefined') {
+      window.addEventListener('paste', this._onPaste);
+    }
   }
 
   sendClipboard(text) {
@@ -43,7 +45,7 @@ export class ClipboardController {
   }
 
   destroy() {
-    if (this._onPaste) {
+    if (typeof window !== 'undefined' && this._onPaste) {
       window.removeEventListener('paste', this._onPaste);
       this._onPaste = null;
     }

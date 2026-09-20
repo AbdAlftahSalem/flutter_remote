@@ -23,13 +23,13 @@ const NAL_TYPES = {
 
 class RtpPacketizer {
   constructor(options = {}) {
-    this.payloadType = options.payloadType || 98;
-    this.ssrc = options.ssrc || 12345;
-    this.mtu = options.mtu || 1200;
-    this._clockRate = options.clockRate || 90000;
+    this.payloadType = options.payloadType ?? 98;
+    this.ssrc = options.ssrc ?? 12345;
+    this.mtu = options.mtu ?? 1200;
+    this._clockRate = options.clockRate ?? 90000;
 
-    this._sequenceNumber = options.initialSeq || 1;
-    this._timestamp = options.initialTimestamp || 0;
+    this._sequenceNumber = options.initialSeq ?? 1;
+    this._timestamp = options.initialTimestamp ?? 0;
   }
 
   nextRtpTimestamp(fps = 30) {

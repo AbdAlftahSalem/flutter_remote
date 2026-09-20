@@ -2,7 +2,14 @@
  * Flutter Remote WebRTC V3 WebRTCStatsCollector
  *
  * Collects, normalizes, and samples WebRTC statistics at ~1000ms intervals.
- * Correctly computes packet loss rate using sample deltas instead of cumulative counts.
+ * Correctly computes packet loss over the latest sampling interval using sample deltas
+ * instead of cumulative counts.
+ *
+ * Prioritizes candidate-pair selection:
+ *   1. Selected candidate pair (via transport.selectedCandidatePairId or pair.selected)
+ *   2. Active candidate pair (pair.active or pair.nominated && pair.state === 'succeeded')
+ *   3. Succeeded candidate pair (pair.state === 'succeeded')
+ *   4. null (safe fallback without throwing)
  */
 
 export class WebRTCStatsCollector {
@@ -42,7 +49,7 @@ export class WebRTCStatsCollector {
       packets: {
         received: 0,
         lost: 0,
-        lossRate: 0, // 0.0 to 1.0
+        lossRate: 0, // 0.0 to 1.0 (packet loss over the latest sampling interval)
         lossPercentage: '0.00%',
       },
     };
@@ -62,8 +69,86 @@ export class WebRTCStatsCollector {
     }
   }
 
+  /**
+   * Resolves the active/selected candidate pair with graceful fallbacks:
+   * 1. Selected candidate pair (transport.selectedCandidatePairId or pair.selected === true)
+   * 2. Active candidate pair (pair.active === true or pair.nominated === true && pair.state === 'succeeded')
+   * 3. Succeeded candidate pair (pair.state === 'succeeded')
+   * 4. null
+   */
+  getSelectedCandidatePair(stats) {
+    if (!stats) return null;
+
+    const reports = [];
+    const reportsById = new Map();
+
+    if (typeof stats.forEach === 'function') {
+      stats.forEach((report, key) => {
+        if (!report) return;
+        reports.push(report);
+        if (report.id) {
+          reportsById.set(report.id, report);
+        } else if (key) {
+          reportsById.set(key, report);
+        }
+      });
+    } else if (Array.isArray(stats)) {
+      for (const report of stats) {
+        if (!report) return;
+        reports.push(report);
+        if (report.id) reportsById.set(report.id, report);
+      }
+    }
+
+    // 1. Check transport report for selectedCandidatePairId
+    for (const report of reports) {
+      if (report && report.type === 'transport' && report.selectedCandidatePairId) {
+        const pair = reportsById.get(report.selectedCandidatePairId);
+        if (pair) return pair;
+      }
+    }
+
+    // Check if any candidate pair has selected === true
+    for (const report of reports) {
+      if (report && report.type === 'candidate-pair' && report.selected === true) {
+        return report;
+      }
+    }
+
+    // 2. Check for active/nominated candidate pair
+    for (const report of reports) {
+      if (report && report.type === 'candidate-pair') {
+        if (report.active === true || (report.nominated === true && report.state === 'succeeded')) {
+          return report;
+        }
+      }
+    }
+
+    // 3. Fallback to any succeeded candidate pair
+    for (const report of reports) {
+      if (report && report.type === 'candidate-pair' && report.state === 'succeeded') {
+        return report;
+      }
+    }
+
+    // 4. No candidate pair available
+    return null;
+  }
+
   async sample() {
-    const rawStats = await this.peerConnectionManager.getStats();
+    let rawStats = null;
+    try {
+      if (this.peerConnectionManager) {
+        if (typeof this.peerConnectionManager.getStats === 'function') {
+          rawStats = await this.peerConnectionManager.getStats();
+        } else if (this.peerConnectionManager.peer && typeof this.peerConnectionManager.peer.getStats === 'function') {
+          rawStats = await this.peerConnectionManager.peer.getStats();
+        }
+      }
+    } catch {
+      return this.metrics;
+    }
+
     if (!rawStats) return this.metrics;
 
     const now = Date.now();
@@ -78,14 +163,40 @@ export class WebRTCStatsCollector {
     let framesDropped = 0;
     let jitter = 0;
 
-    rawStats.forEach((report) => {
-      // Candidate pair for RTT & candidate type
-      if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-        rtt = Math.round((report.currentRoundTripTime || 0) * 1000);
+    // Index reports by id for relation lookups
+    const reportsById = new Map();
+    const reports = [];
+    if (typeof rawStats.forEach === 'function') {
+      rawStats.forEach((report, key) => {
+        if (!report) return;
+        reports.push(report);
+        if (report.id) reportsById.set(report.id, report);
+        else if (key) reportsById.set(key, report);
+      });
+    } else if (Array.isArray(rawStats)) {
+      for (const report of rawStats) {
+        if (!report) continue;
+        reports.push(report);
+        if (report.id) reportsById.set(report.id, report);
       }
+    }
 
-      // Local / remote candidates
-      if (report.type === 'remote-candidate') {
+    // Hierarchical candidate pair selection
+    const candidatePair = this.getSelectedCandidatePair(rawStats);
+    if (candidatePair) {
+      rtt = Math.round((candidatePair.currentRoundTripTime || 0) * 1000);
+      if (candidatePair.remoteCandidateId) {
+        const remoteReport = reportsById.get(candidatePair.remoteCandidateId);
+        if (remoteReport && remoteReport.candidateType) {
+          candidateType = remoteReport.candidateType;
+        }
+      }
+    }
+
+    // Process reports
+    for (const report of reports) {
+      // Fallback candidate type if not resolved via candidate-pair relation
+      if (candidateType === 'unknown' && report.type === 'remote-candidate') {
         candidateType = report.candidateType || candidateType;
       }
 
@@ -100,9 +211,9 @@ export class WebRTCStatsCollector {
         framesDropped = report.framesDropped || 0;
         jitter = Math.round((report.jitter || 0) * 1000);
       }
-    });
+    }
 
-    // Delta calculations
+    // Delta-based packet loss calculation over the latest sampling interval
     let bitrate = 0;
     let lossRate = 0;
 
@@ -111,18 +222,13 @@ export class WebRTCStatsCollector {
       if (timeDeltaSec > 0) {
         const bytesDelta = Math.max(0, bytesReceived - this.prevStats.bytesReceived);
         bitrate = Math.round((bytesDelta * 8) / (timeDeltaSec * 1000)); // kbps
-
-        // Delta-based packet loss calculation:
-        // lostDelta = currentLost - previousLost
-        // receivedDelta = currentReceived - previousReceived
-        // totalDelta = lostDelta + receivedDelta
-        // lossRate = totalDelta > 0 ? lostDelta / totalDelta : 0
-        const lostDelta = Math.max(0, packetsLost - this.prevStats.packetsLost);
-        const receivedDelta = Math.max(0, packetsReceived - this.prevStats.packetsReceived);
-        const totalDelta = lostDelta + receivedDelta;
-
-        lossRate = totalDelta > 0 ? (lostDelta / totalDelta) : 0;
       }
+
+      const lostDelta = Math.max(0, packetsLost - this.prevStats.packetsLost);
+      const receivedDelta = Math.max(0, packetsReceived - this.prevStats.packetsReceived);
+      const totalDelta = lostDelta + receivedDelta;
+
+      lossRate = totalDelta > 0 ? (lostDelta / totalDelta) : 0;
     }
 
     // Update previous stats
@@ -135,13 +241,16 @@ export class WebRTCStatsCollector {
       framesDecoded,
     };
 
+    const iceState = (this.peerConnectionManager && (this.peerConnectionManager.iceConnectionState || this.peerConnectionManager.iceState)) || 'new';
+    const connectionState = (this.peerConnectionManager && this.peerConnectionManager.connectionState) || 'new';
+
     // Update normalized metrics
     this.metrics = {
       timestamp: now,
       connection: {
         rtt,
-        iceState: this.peerConnectionManager.iceConnectionState,
-        connectionState: this.peerConnectionManager.connectionState,
+        iceState,
+        connectionState,
         candidateType,
       },
       video: {

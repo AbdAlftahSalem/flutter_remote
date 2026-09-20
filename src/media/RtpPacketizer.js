@@ -27,13 +27,13 @@ export const NAL_TYPES = {
 
 export class RtpPacketizer {
   constructor(options = {}) {
-    this.payloadType = options.payloadType || 98; // 98 for H.264
-    this.ssrc = options.ssrc || 12345;
-    this.mtu = options.mtu || 1200; // Safe MTU for UDP
-    this._clockRate = options.clockRate || 90000; // 90kHz standard video clock
+    this.payloadType = options.payloadType ?? 98; // 98 for H.264
+    this.ssrc = options.ssrc ?? 12345;
+    this.mtu = options.mtu ?? 1200; // Safe MTU for UDP
+    this._clockRate = options.clockRate ?? 90000; // 90kHz standard video clock
 
-    this._sequenceNumber = options.initialSeq || 1;
-    this._timestamp = options.initialTimestamp || 0;
+    this._sequenceNumber = options.initialSeq ?? 1;
+    this._timestamp = options.initialTimestamp ?? 0;
   }
 
   /**

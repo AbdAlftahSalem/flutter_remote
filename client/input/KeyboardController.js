@@ -33,18 +33,22 @@ export class KeyboardController {
     this._onKeyDown = (e) => sendKey(e, 'keydown');
     this._onKeyUp = (e) => sendKey(e, 'keyup');
 
-    window.addEventListener('keydown', this._onKeyDown);
-    window.addEventListener('keyup', this._onKeyUp);
+    if (typeof window !== 'undefined') {
+      window.addEventListener('keydown', this._onKeyDown);
+      window.addEventListener('keyup', this._onKeyUp);
+    }
   }
 
   destroy() {
-    if (this._onKeyDown) {
-      window.removeEventListener('keydown', this._onKeyDown);
-      this._onKeyDown = null;
-    }
-    if (this._onKeyUp) {
-      window.removeEventListener('keyup', this._onKeyUp);
-      this._onKeyUp = null;
+    if (typeof window !== 'undefined') {
+      if (this._onKeyDown) {
+        window.removeEventListener('keydown', this._onKeyDown);
+        this._onKeyDown = null;
+      }
+      if (this._onKeyUp) {
+        window.removeEventListener('keyup', this._onKeyUp);
+        this._onKeyUp = null;
+      }
     }
   }
 }

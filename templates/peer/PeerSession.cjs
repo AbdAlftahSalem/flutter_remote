@@ -9,6 +9,8 @@
  *   4. Control channel commands (request_keyframe)
  */
 
+const { DataChannelRouter } = require('./DataChannelRouter.cjs');
+
 class PeerSession {
   constructor(options = {}) {
     this.ws = options.ws;
@@ -20,6 +22,7 @@ class PeerSession {
 
     this.peer = null;
     this.videoTrack = null;
+    this.router = new DataChannelRouter();
   }
 
   handleOffer(msg) {
@@ -98,7 +101,13 @@ class PeerSession {
     this.peer.onDataChannel((dc) => {
       const label = dc.getLabel ? dc.getLabel() : 'input';
       console.log('[webrtc-peer] DataChannel opened:', label);
+      this.router.registerChannel(label, dc);
       this.serveSimConsumer.initServeSimWs();
+
+      if (this.serveSimConsumer.serveSimWs) {
+        this.router.setServeSimWs(this.serveSimConsumer.serveSimWs);
+        this.router.start();
+      }
 
       dc.onMessage((rawMsg) => {
         if (label === 'control') {
@@ -112,18 +121,6 @@ class PeerSession {
         }
         this.serveSimConsumer.sendToServeSim(rawMsg);
       });
-
-      if (this.serveSimConsumer.serveSimWs) {
-        this.serveSimConsumer.serveSimWs.on('message', (simMsg) => {
-          try {
-            if (typeof dc.sendMessageBinary === 'function' && Buffer.isBuffer(simMsg)) {
-              dc.sendMessageBinary(simMsg);
-            } else if (typeof dc.sendMessage === 'function') {
-              dc.sendMessage(simMsg);
-            }
-          } catch {}
-        });
-      }
     });
 
     const offerSdp = (msg.payload && msg.payload.sdp) || msg.sdp;
@@ -140,6 +137,7 @@ class PeerSession {
   }
 
   close() {
+    this.router.stop();
     if (this.videoTrack) {
       this.activeVideoTracks.delete(this.videoTrack);
       this.videoTrack = null;
