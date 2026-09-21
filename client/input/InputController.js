@@ -17,6 +17,7 @@ export class InputController {
     this.protocolVersion = options.protocolVersion || 2;
     this.overlay = null;
     this.nextSeq = 1;
+    this.lastInteractionTime = 0;
 
     // Pointer move coalescing
     this.pendingMove = null;
@@ -27,7 +28,13 @@ export class InputController {
     this.pendingWheelDeltaY = 0;
     this.wheelRafId = null;
 
-    this._initOverlay();
+    if (typeof document !== 'undefined') {
+      this._initOverlay();
+    }
+  }
+
+  getLastInteractionTime() {
+    return this.lastInteractionTime;
   }
 
   _initOverlay() {
@@ -52,6 +59,7 @@ export class InputController {
   }
 
   _handlePointer(e, type) {
+    this.lastInteractionTime = Date.now();
     const rect = this.videoRenderer.getBounds();
     const { width: vW, height: vH } = this.videoRenderer.getVideoResolution();
     const containerAspect = rect.width / rect.height;
@@ -117,6 +125,7 @@ export class InputController {
 
   _handleWheel(e) {
     e.preventDefault();
+    this.lastInteractionTime = Date.now();
 
     // Accumulate wheel delta
     this.pendingWheelDeltaX += e.deltaX;

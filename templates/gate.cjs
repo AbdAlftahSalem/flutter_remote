@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 10
+// flutter-remote-template-version: 11
 /**
  * flutter-remote auth gate.
  *
@@ -212,7 +212,9 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       this.onFirstFrame = onFirstFrame || (() => {});
       this.video = null;
       this.firstFrameTime = 0;
+      this.lastFramePresentedTime = 0;
       this.connectTime = Date.now();
+      this._rvfcId = null;
       this._init();
     }
     _init() {
@@ -228,18 +230,39 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       }
       this.video = v;
       this.video.addEventListener('loadeddata', () => {
+        this.lastFramePresentedTime = Date.now();
         if (!this.firstFrameTime) {
           this.firstFrameTime = Date.now() - this.connectTime;
           this.onFirstFrame(this.firstFrameTime);
         }
       });
+      this.video.addEventListener('timeupdate', () => {
+        this.lastFramePresentedTime = Date.now();
+      });
     }
     attachStream(s) {
       this.connectTime = Date.now();
       this.firstFrameTime = 0;
+      this.lastFramePresentedTime = 0;
       this.video.srcObject = s;
       this.video.play().catch(() => {});
+
+      const onFrame = () => {
+        if (!this.video) return;
+        this.lastFramePresentedTime = Date.now();
+        if (!this.firstFrameTime) {
+          this.firstFrameTime = Date.now() - this.connectTime;
+          this.onFirstFrame(this.firstFrameTime);
+        }
+        if (typeof this.video.requestVideoFrameCallback === 'function') {
+          this._rvfcId = this.video.requestVideoFrameCallback(onFrame);
+        }
+      };
+      if (typeof this.video.requestVideoFrameCallback === 'function') {
+        this._rvfcId = this.video.requestVideoFrameCallback(onFrame);
+      }
     }
+    getLastFramePresentedTime() { return this.lastFramePresentedTime; }
     getBounds() { return this.video.getBoundingClientRect(); }
     getVideoResolution() {
       return { width: this.video.videoWidth || 720, height: this.video.videoHeight || 1280 };
@@ -255,8 +278,10 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       this.nextSeq = 1;
       this.pendingMove = null;
       this.rafId = null;
+      this.lastInteractionTime = 0;
       this._init();
     }
+    getLastInteractionTime() { return this.lastInteractionTime; }
     _init() {
       let o = document.getElementById('flutter-remote-input-overlay');
       if (!o) {
@@ -282,6 +307,7 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       };
 
       const handlePointer = (e, type) => {
+        this.lastInteractionTime = Date.now();
         const rect = this.videoRenderer.getBounds();
         const { width: vW, height: vH } = this.videoRenderer.getVideoResolution();
         const containerAspect = rect.width / rect.height;
@@ -466,6 +492,8 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
 
       const c = document.getElementById('flutter-remote-container') || document.body;
       this._videoFrameCheckTimer = null;
+      this._lastKeyframeRequestTime = 0;
+      this._stallWatchdogTimer = null;
       this.ui = new SessionUI(c, this.debugMode);
       this.videoRenderer = new VideoRenderer(c, () => {
         if (this._videoFrameCheckTimer) {
@@ -541,6 +569,7 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
           else this.videoRenderer.attachStream(new MediaStream([e.track]));
           this.connectionState.set('CONNECTED');
           this.connectionState.resetBackoff();
+          this._startWatchdog();
 
           if (this._videoFrameCheckTimer) clearTimeout(this._videoFrameCheckTimer);
           this._videoFrameCheckTimer = setTimeout(() => {
@@ -604,6 +633,66 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
           else await this._connectSignaling();
         } catch { this._scheduleReconnect(); }
       });
+    }
+
+    requestKeyframe(reason = 'manual') {
+      const now = Date.now();
+      if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 1000) return false;
+      this._lastKeyframeRequestTime = now;
+      console.log('[flutter-remote] Requesting keyframe recovery (reason: ' + reason + ')');
+      const dc = this.dataChannels.control;
+      if (dc && dc.readyState === 'open') {
+        dc.send(JSON.stringify({
+          v: PROTOCOL_VERSION,
+          type: 'request_keyframe',
+          reason: reason,
+          ts: now,
+        }));
+        return true;
+      }
+      return false;
+    }
+
+    _startWatchdog() {
+      if (this._stallWatchdogTimer) return;
+      this._stallWatchdogTimer = setInterval(() => {
+        this._checkVideoHealth();
+      }, 500);
+    }
+
+    _stopWatchdog() {
+      if (this._stallWatchdogTimer) {
+        clearInterval(this._stallWatchdogTimer);
+        this._stallWatchdogTimer = null;
+      }
+    }
+
+    _checkVideoHealth() {
+      if (this.connectionState.state !== 'CONNECTED' || !this.videoRenderer) return;
+      const now = Date.now();
+      const lastFrameTime = this.videoRenderer.getLastFramePresentedTime();
+      const firstFrameTime = this.videoRenderer.firstFrameTime;
+
+      if (!firstFrameTime) {
+        if (now - this.videoRenderer.connectTime > 1500) {
+          this.requestKeyframe('initial_track_timeout');
+        }
+        return;
+      }
+
+      if (this.inputController) {
+        const lastInteraction = this.inputController.getLastInteractionTime();
+        if (lastInteraction > 0 && (now - lastInteraction < 2000)) {
+          if (now - lastFrameTime > 1000) {
+            this.requestKeyframe('interaction_stall');
+            return;
+          }
+        }
+      }
+
+      if (lastFrameTime > 0 && (now - lastFrameTime > 2000)) {
+        this.requestKeyframe('video_freeze');
+      }
     }
 
     _handleResize() {

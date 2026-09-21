@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 4
+// flutter-remote-template-version: 5
 /**
  * Flutter Remote WebRTC V3 PeerSession (CommonJS)
  *
@@ -114,7 +114,7 @@ class PeerSession {
           try {
             const cmd = JSON.parse(rawMsg.toString());
             if (cmd.type === 'request_keyframe') {
-              this.videoEncoder.requestKeyframe();
+              this.videoEncoder.requestKeyframe(cmd.reason || 'client_request');
               return;
             }
           } catch {}

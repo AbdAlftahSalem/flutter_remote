@@ -92,6 +92,15 @@ export class DataChannelManager {
     return this.send('control', message);
   }
 
+  requestKeyframe(reason = 'manual') {
+    return this.sendControl({
+      v: 2,
+      type: 'request_keyframe',
+      reason,
+      ts: Date.now(),
+    });
+  }
+
   sendTelemetry(message) {
     return this.send('telemetry', message);
   }

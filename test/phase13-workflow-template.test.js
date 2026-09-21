@@ -13,11 +13,11 @@ test('Phase 13: templates/flutter-remote.yml pinned dependencies and version 15'
   assert.ok(ymlContent.includes('FLUTTER_REMOTE_TRANSPORT'), 'Must pass FLUTTER_REMOTE_TRANSPORT env');
 });
 
-test('Phase 13: templates/gate.cjs version 10 and V2 client serving', () => {
+test('Phase 13: templates/gate.cjs version 11 and V2 client serving', () => {
   const gatePath = join(process.cwd(), 'templates', 'gate.cjs');
   const gateContent = readFileSync(gatePath, 'utf8');
 
-  assert.ok(gateContent.includes('flutter-remote-template-version: 10'), 'Gate template version must be 10');
+  assert.ok(gateContent.includes('flutter-remote-template-version: 11'), 'Gate template version must be 11');
   assert.ok(gateContent.includes('/__flutter-remote/client.js'), 'Must serve V2 client at /__flutter-remote/client.js');
   assert.ok(gateContent.includes('/readyz'), 'Must implement /readyz health check');
 });

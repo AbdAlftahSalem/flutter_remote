@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 4
+// flutter-remote-template-version: 5
 /**
  * Flutter Remote WebRTC V3 Real Video Encoder (CommonJS)
  *
@@ -132,12 +132,31 @@ class VideoEncoder extends EventEmitter {
   }
 
   requestKeyframe() {
+    // 1. Immediately emit cached keyframe packets if available for instant unfreeze (< 10ms)
+    if (this.hasKeyframe()) {
+      const cachedPackets = this.getKeyframePackets(this.fps);
+      if (cachedPackets && cachedPackets.length > 0) {
+        console.log('[video] instantly dispatched cached keyframe packets for quick unfreeze');
+        this.emit('packets', cachedPackets);
+      }
+    }
+
+    // 2. Request fresh IDR from KeyframeController and emit fresh packets upon resolution
     const p = this.keyframeController.requestKeyframe(
       this._latestFrame,
       (nextProc) => this._promoteReplacementEncoder(nextProc),
       (buf) => this.parseNalUnits(buf),
       this.fps
     );
+
+    p.then((packets) => {
+      if (packets && packets.length > 0) {
+        this.emit('packets', packets);
+      }
+    }).catch((err) => {
+      console.warn('[video] fresh keyframe recovery failed:', err.message);
+    });
+
     this._syncMetrics();
     return p;
   }

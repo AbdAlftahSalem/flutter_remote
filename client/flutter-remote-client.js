@@ -75,6 +75,8 @@ export class FlutterRemoteClient {
     this.debugOverlay = (container && this.debugMode) ? new DebugOverlay(container) : null;
 
     this._videoFrameCheckTimer = null;
+    this._lastKeyframeRequestTime = 0;
+    this._stallWatchdogTimer = null;
 
     // Video Module
     this.videoRenderer = container
@@ -221,6 +223,7 @@ export class FlutterRemoteClient {
     }
     this.connectionState.set('CONNECTED');
     this.reconnectController.reset();
+    this._startWatchdog();
 
     if (this._videoFrameCheckTimer) {
       clearTimeout(this._videoFrameCheckTimer);
@@ -336,6 +339,67 @@ export class FlutterRemoteClient {
     }
   }
 
+  requestKeyframe(reason = 'manual') {
+    const now = Date.now();
+    if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 1000) {
+      return false;
+    }
+    this._lastKeyframeRequestTime = now;
+    console.log(`[flutter-remote] Requesting keyframe recovery (reason: ${reason})`);
+    if (this.dataChannelManager) {
+      return this.dataChannelManager.requestKeyframe(reason);
+    }
+    return false;
+  }
+
+  _startWatchdog() {
+    if (this._stallWatchdogTimer) return;
+    this._stallWatchdogTimer = setInterval(() => {
+      this._checkVideoHealth();
+    }, 500);
+  }
+
+  _stopWatchdog() {
+    if (this._stallWatchdogTimer) {
+      clearInterval(this._stallWatchdogTimer);
+      this._stallWatchdogTimer = null;
+    }
+  }
+
+  _checkVideoHealth() {
+    if (this.connectionState.state !== 'CONNECTED' || !this.videoRenderer) {
+      return;
+    }
+
+    const now = Date.now();
+    const lastFrameTime = this.videoRenderer.getLastFramePresentedTime();
+    const firstFrameTime = this.videoRenderer.firstFrameTime;
+
+    // 1. Initial track timeout: track attached but first frame never presented after 1.5s
+    if (!firstFrameTime) {
+      if (now - this.videoRenderer.connectTime > 1500) {
+        this.requestKeyframe('initial_track_timeout');
+      }
+      return;
+    }
+
+    // 2. Active interaction stall: user swiping/interacting but video frozen > 1000ms
+    if (this.inputController) {
+      const lastInteraction = this.inputController.getLastInteractionTime();
+      if (lastInteraction > 0 && (now - lastInteraction < 2000)) {
+        if (now - lastFrameTime > 1000) {
+          this.requestKeyframe('interaction_stall');
+          return;
+        }
+      }
+    }
+
+    // 3. Playback freeze: stream was active but presentation stopped > 2000ms
+    if (lastFrameTime > 0 && (now - lastFrameTime > 2000)) {
+      this.requestKeyframe('video_freeze');
+    }
+  }
+
   destroy() {
     if (this._destroyed) return;
     this._destroyed = true;
@@ -349,6 +413,7 @@ export class FlutterRemoteClient {
       clearTimeout(this._videoFrameCheckTimer);
       this._videoFrameCheckTimer = null;
     }
+    this._stopWatchdog();
     if (this.statsCollector) {
       this.statsCollector.stop();
     }

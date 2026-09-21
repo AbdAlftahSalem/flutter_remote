@@ -160,12 +160,28 @@ export class VideoEncoder extends EventEmitter {
   }
 
   requestKeyframe() {
+    // 1. Immediately emit cached keyframe packets if available for instant unfreeze (< 10ms)
+    if (this.hasKeyframe()) {
+      const cachedPackets = this.getKeyframePackets(this.fps);
+      if (cachedPackets && cachedPackets.length > 0) {
+        this.emit('packets', cachedPackets);
+      }
+    }
+
+    // 2. Request fresh IDR from KeyframeController and emit fresh packets upon resolution
     const p = this.keyframeController.requestKeyframe(
       this._latestFrame,
       (nextProc) => this._promoteReplacementEncoder(nextProc),
       (buf) => this.parseNalUnits(buf),
       this.fps
     );
+
+    p.then((packets) => {
+      if (packets && packets.length > 0) {
+        this.emit('packets', packets);
+      }
+    }).catch(() => {});
+
     this._syncMetrics();
     return p;
   }
