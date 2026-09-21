@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 9
+// flutter-remote-template-version: 10
 /**
  * flutter-remote auth gate.
  *
@@ -207,8 +207,9 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
   }
 
   class VideoRenderer {
-    constructor(container) {
+    constructor(container, onFirstFrame) {
       this.container = container;
+      this.onFirstFrame = onFirstFrame || (() => {});
       this.video = null;
       this.firstFrameTime = 0;
       this.connectTime = Date.now();
@@ -227,7 +228,10 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       }
       this.video = v;
       this.video.addEventListener('loadeddata', () => {
-        if (!this.firstFrameTime) this.firstFrameTime = Date.now() - this.connectTime;
+        if (!this.firstFrameTime) {
+          this.firstFrameTime = Date.now() - this.connectTime;
+          this.onFirstFrame(this.firstFrameTime);
+        }
       });
     }
     attachStream(s) {
@@ -461,8 +465,15 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       this.metrics = { rtt: 0, fps: 0, reconnects: 0, connectionState: 'IDLE', iceState: 'new', generation: 1 };
 
       const c = document.getElementById('flutter-remote-container') || document.body;
+      this._videoFrameCheckTimer = null;
       this.ui = new SessionUI(c, this.debugMode);
-      this.videoRenderer = new VideoRenderer(c);
+      this.videoRenderer = new VideoRenderer(c, () => {
+        if (this._videoFrameCheckTimer) {
+          clearTimeout(this._videoFrameCheckTimer);
+          this._videoFrameCheckTimer = null;
+        }
+        if (this.ui) this.ui.setStatus('Connected', true);
+      });
       this.inputController = new InputController(c, this.videoRenderer, this.dataChannels);
       this.keyboardController = new KeyboardController(this.dataChannels);
       this.clipboardController = new ClipboardController(this.dataChannels);
@@ -530,6 +541,13 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
           else this.videoRenderer.attachStream(new MediaStream([e.track]));
           this.connectionState.set('CONNECTED');
           this.connectionState.resetBackoff();
+
+          if (this._videoFrameCheckTimer) clearTimeout(this._videoFrameCheckTimer);
+          this._videoFrameCheckTimer = setTimeout(() => {
+            if (this.videoRenderer && !this.videoRenderer.firstFrameTime && this.connectionState.state === 'CONNECTED') {
+              if (this.ui) this.ui.setStatus('Connected, waiting for video feed...');
+            }
+          }, 5000);
         };
 
         this.dataChannels.input = this.peer.createDataChannel('input', { ordered: false, maxRetransmits: 0 });

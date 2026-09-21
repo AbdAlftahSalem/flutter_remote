@@ -1,8 +1,12 @@
 /**
  * Flutter Remote WebRTC V3 MediaPipeline
  *
- * Coordinates the full video streaming pipeline:
- *   serve-sim MJPEG -> FrameController -> VideoEncoder -> WebRTC VideoTrack
+ * NOTE / ARCHITECTURE:
+ * This module and other files under `src/media/*` serve as unit-testable reference
+ * implementations. The actual runtime code that executes on the remote macOS GitHub Actions
+ * runner is bundled under `templates/peer/*.cjs` and deployed into `.github/flutter-remote/`
+ * by `flutter-remote init`.
+ * Modifying `src/media/*` will NOT affect live runner streaming behavior.
  */
 
 import { EventEmitter } from 'node:events';

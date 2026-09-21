@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 4
+// flutter-remote-template-version: 5
 /**
  * Flutter Remote WebRTC V3 ServeSimConsumer (CommonJS)
  *
@@ -22,6 +22,9 @@ class ServeSimConsumer {
 
     this.localStreamReq = null;
     this.jpegFrameCount = 0;
+    this.frameWarningTimer = null;
+    this.reconnectTimer = null;
+    this._closed = false;
 
     // WebSocket bridge state
     this.serveSimWs = null;
@@ -30,7 +33,7 @@ class ServeSimConsumer {
   }
 
   ensureLocalStream() {
-    if (this.localStreamReq || (this.streamWsClients.size === 0 && this.activeVideoTracks.size === 0)) {
+    if (this._closed || this.localStreamReq || (this.streamWsClients.size === 0 && this.activeVideoTracks.size === 0)) {
       return;
     }
 
@@ -62,6 +65,19 @@ class ServeSimConsumer {
           );
         }
 
+        if (res.statusCode === 200) {
+          if (this.frameWarningTimer) {
+            clearTimeout(this.frameWarningTimer);
+          }
+          this.frameWarningTimer = setTimeout(() => {
+            if (this.jpegFrameCount === 0) {
+              console.warn(
+                `[webrtc-peer] [video] WARNING: Connected to serve-sim stream: http://${this.targetHost}:${this.previewPort}${this.streamPath} but 0 JPEG frames parsed after 5s — check --codec (expected mjpeg)!`
+              );
+            }
+          }, 5000);
+        }
+
         let buffer = Buffer.alloc(0);
 
         res.on('data', (chunk) => {
@@ -71,6 +87,11 @@ class ServeSimConsumer {
           while (soi !== -1) {
             const eoi = buffer.indexOf(Buffer.from([0xff, 0xd9]), soi + 2);
             if (eoi === -1) break;
+
+            if (this.frameWarningTimer) {
+              clearTimeout(this.frameWarningTimer);
+              this.frameWarningTimer = null;
+            }
 
             const jpeg = buffer.subarray(soi, eoi + 2);
             this.jpegFrameCount++;
@@ -100,28 +121,48 @@ class ServeSimConsumer {
           }
         });
 
-        res.on('end', () => {
-          this.localStreamReq = null;
-          if (this.streamWsClients.size > 0 || this.activeVideoTracks.size > 0) {
-            setTimeout(() => this.ensureLocalStream(), 1000);
+        const scheduleReconnect = () => {
+          if (!this._closed && !this.reconnectTimer && (this.streamWsClients.size > 0 || this.activeVideoTracks.size > 0)) {
+            this.reconnectTimer = setTimeout(() => {
+              this.reconnectTimer = null;
+              this.ensureLocalStream();
+            }, 1000);
           }
+        };
+
+        res.on('end', () => {
+          if (this.frameWarningTimer) {
+            clearTimeout(this.frameWarningTimer);
+            this.frameWarningTimer = null;
+          }
+          this.localStreamReq = null;
+          scheduleReconnect();
         });
 
         res.on('error', (err) => {
+          if (this.frameWarningTimer) {
+            clearTimeout(this.frameWarningTimer);
+            this.frameWarningTimer = null;
+          }
           console.error('[webrtc-peer local stream error]', err.message);
           this.localStreamReq = null;
-          if (this.streamWsClients.size > 0 || this.activeVideoTracks.size > 0) {
-            setTimeout(() => this.ensureLocalStream(), 1000);
-          }
+          scheduleReconnect();
         });
       }
     );
 
     this.localStreamReq.on('error', (err) => {
+      if (this.frameWarningTimer) {
+        clearTimeout(this.frameWarningTimer);
+        this.frameWarningTimer = null;
+      }
       console.error('[webrtc-peer local stream request error]', err.message);
       this.localStreamReq = null;
-      if (this.streamWsClients.size > 0 || this.activeVideoTracks.size > 0) {
-        setTimeout(() => this.ensureLocalStream(), 1000);
+      if (!this._closed && !this.reconnectTimer && (this.streamWsClients.size > 0 || this.activeVideoTracks.size > 0)) {
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null;
+          this.ensureLocalStream();
+        }, 1000);
       }
     });
   }
@@ -183,6 +224,15 @@ class ServeSimConsumer {
   }
 
   close() {
+    this._closed = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.frameWarningTimer) {
+      clearTimeout(this.frameWarningTimer);
+      this.frameWarningTimer = null;
+    }
     if (this.localStreamReq) {
       try { this.localStreamReq.destroy(); } catch {}
       this.localStreamReq = null;

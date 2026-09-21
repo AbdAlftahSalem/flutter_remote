@@ -74,10 +74,17 @@ export class FlutterRemoteClient {
     this.ui = container ? new SessionUI(container) : null;
     this.debugOverlay = (container && this.debugMode) ? new DebugOverlay(container) : null;
 
+    this._videoFrameCheckTimer = null;
+
     // Video Module
     this.videoRenderer = container
       ? new VideoRenderer(container, {
           onFirstFrame: (firstFrameTime) => {
+            if (this._videoFrameCheckTimer) {
+              clearTimeout(this._videoFrameCheckTimer);
+              this._videoFrameCheckTimer = null;
+            }
+            if (this.ui) this.ui.setStatus('Connected', true);
             this.metrics.firstFrameTime = firstFrameTime;
             this._updateDebug();
           },
@@ -214,6 +221,16 @@ export class FlutterRemoteClient {
     }
     this.connectionState.set('CONNECTED');
     this.reconnectController.reset();
+
+    if (this._videoFrameCheckTimer) {
+      clearTimeout(this._videoFrameCheckTimer);
+    }
+    this._videoFrameCheckTimer = setTimeout(() => {
+      if (this.videoRenderer && !this.videoRenderer.firstFrameTime && this.connectionState.state === 'CONNECTED') {
+        if (this.ui) this.ui.setStatus('Connected, waiting for video feed...');
+        console.warn('[flutter-remote] WebRTC connected, but 0 video frames decoded after 5s');
+      }
+    }, 5000);
   }
 
   _handleIceCandidate(candidate) {
@@ -328,6 +345,10 @@ export class FlutterRemoteClient {
       this._boundResize = null;
     }
 
+    if (this._videoFrameCheckTimer) {
+      clearTimeout(this._videoFrameCheckTimer);
+      this._videoFrameCheckTimer = null;
+    }
     if (this.statsCollector) {
       this.statsCollector.stop();
     }

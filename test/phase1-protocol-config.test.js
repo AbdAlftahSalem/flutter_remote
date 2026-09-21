@@ -11,6 +11,7 @@ test('Phase 1: Configuration precedence and resolution', () => {
   // 1. Defaults
   const def = resolveConfig({}, {});
   assert.equal(def.transport, 'webrtc');
+  assert.equal(def.codec, 'mjpeg');
   assert.equal(def.fps, 30);
   assert.equal(def.ports.gateway, 3199);
 

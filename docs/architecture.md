@@ -164,3 +164,22 @@ Sampled at 1Hz by `WebRTCStatsCollector`:
 - **RTP**: Total packets sent, frames packetized, IDR frames count.
 - **System**: Resident memory (RSS MB), heap used (MB), uptime (seconds).
 - **Endpoint**: Available via `GET /metrics` in JSON format.
+
+---
+
+## Runner Deployment vs. Reference Pipeline
+
+A critical architectural distinction in `flutter-remote`:
+
+| Component | Location | Role & Execution Environment |
+|---|---|---|
+| **Live Runner Templates** | `templates/peer/*.cjs`, `templates/webrtc-peer.cjs`, `templates/gate.cjs` | Bundled and deployed directly onto the remote macOS GitHub Actions runner via `scaffold()` (`.github/flutter-remote/`). This is the **actual runtime code** that streams video and bridges input during live sessions. |
+| **Reference / Unit Pipeline** | `src/media/*`, `src/simulator/ServeSimAdapter.js` | ESM reference implementations used for unit tests, protocol assertions, and local component validation. Modifying `src/media/*` does NOT affect live runner streaming. |
+
+### Codec & Video Ingest Invariant
+
+1. **Default Codec is MJPEG**: `flutter-remote up`, `defaultConfig.js`, and `templates/flutter-remote.yml` default to `mjpeg`.
+2. **Video Ingest**: `serve-sim` emits an MJPEG stream (`/stream.mjpeg?raw=1`), which `ServeSimConsumer.cjs` parses by detecting JPEG SOI (`0xFFD8`) and EOI (`0xFFD9`) markers. The parsed JPEG frames are fed to `VideoEncoder.cjs` (FFmpeg `image2pipe/mjpeg` → `libx264`) and packetized via `RtpPacketizer.cjs` over RFC 6184.
+3. **`auto` Normalization**: If `auto` is passed, the CLI and workflow normalize it to `mjpeg` to prevent requesting raw hardware streams that lack a JPEG SOI/EOI boundary.
+4. **Zero-Frame Diagnostics**: If connected to `serve-sim` at HTTP 200 but 0 JPEG frames are parsed after 5 seconds, a loud warning is emitted (`[video] WARNING: 0 JPEG frames parsed after 5s — check --codec`). The browser client also displays `"Connected, waiting for video feed..."` if video frames are not decoded within 5 seconds of WebRTC connection.
+

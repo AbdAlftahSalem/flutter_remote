@@ -1,6 +1,10 @@
 /**
  * Flutter Remote WebRTC V2 ServeSim Adapter
  *
+ * NOTE / ARCHITECTURE:
+ * This module is a reference and test adapter. The live runner component consuming serve-sim
+ * on macOS GitHub Actions runners is located at `templates/peer/ServeSimConsumer.cjs`.
+ *
  * Encapsulates serve-sim's local /ws protocol with connection readiness promises,
  * queueing during connect, zero dropped critical events, and safe flush on OPEN.
  */

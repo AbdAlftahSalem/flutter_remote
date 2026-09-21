@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 4
+// flutter-remote-template-version: 5
 /**
  * flutter-remote WebRTC V3 Thin Peer Bridge Bootstrap.
  *
@@ -95,11 +95,18 @@ function createVideoTrack(peer) {
 const server = http.createServer((req, res) => {
   if (req.url === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, peer: 'running', mode: TRANSPORT_MODE, targetPort: PREVIEW_PORT }));
+    res.end(JSON.stringify({
+      ok: true,
+      peer: 'running',
+      mode: TRANSPORT_MODE,
+      targetPort: PREVIEW_PORT,
+      jpegFrameCount: serveSimConsumer.jpegFrameCount,
+    }));
     return;
   }
   if (req.url === '/metrics') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
+    serverMetrics.framePipeline.framesReceived = serveSimConsumer.jpegFrameCount;
     res.end(JSON.stringify(serverMetrics.getSnapshot()));
     return;
   }

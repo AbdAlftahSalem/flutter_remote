@@ -1,6 +1,12 @@
 /**
  * Flutter Remote WebRTC V3 Real Video Encoder
  *
+ * NOTE / ARCHITECTURE:
+ * This module is a reference and unit-testable implementation. The live encoder that runs
+ * on the remote macOS GitHub Actions runner is located at `templates/peer/VideoEncoder.cjs`
+ * (bundled and deployed to `.github/flutter-remote/peer/VideoEncoder.cjs`).
+ * Edits here do not affect live runner streaming sessions.
+ *
  * Provides genuine H.264 video encoding:
  *   1. Real H.264 video encoding from image frames (JPEG / MJPEG) using FFmpeg (libx264 zerolatency).
  *   2. Annex-B NAL unit parsing (3-byte & 4-byte start codes across chunk boundaries).
