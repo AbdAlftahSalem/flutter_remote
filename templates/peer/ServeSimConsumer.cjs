@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 5
+// flutter-remote-template-version: 6
 /**
  * Flutter Remote WebRTC V3 ServeSimConsumer (CommonJS)
  *
@@ -33,9 +33,10 @@ class ServeSimConsumer {
   }
 
   ensureLocalStream() {
-    if (this._closed || this.localStreamReq || (this.streamWsClients.size === 0 && this.activeVideoTracks.size === 0)) {
+    if (this.localStreamReq || (this.streamWsClients.size === 0 && this.activeVideoTracks.size === 0)) {
       return;
     }
+    this._closed = false;
 
     console.log('[webrtc-peer] starting serve-sim stream consumer');
     console.log(
@@ -234,8 +235,9 @@ class ServeSimConsumer {
       this.frameWarningTimer = null;
     }
     if (this.localStreamReq) {
-      try { this.localStreamReq.destroy(); } catch {}
+      const req = this.localStreamReq;
       this.localStreamReq = null;
+      try { req.destroy(); } catch {}
     }
     if (this.serveSimWs) {
       try { this.serveSimWs.close(); } catch {}
