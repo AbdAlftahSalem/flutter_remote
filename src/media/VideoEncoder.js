@@ -21,8 +21,19 @@ import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
 import { RtpPacketizer, NAL_TYPES } from './RtpPacketizer.js';
 import { KeyframeController, RECOVERY_STATES } from './KeyframeController.js';
+import { BaseVideoEncoder } from './BaseVideoEncoder.js';
+import { HardwareH264Encoder } from './HardwareH264Encoder.js';
+import { SoftwareH264Encoder } from './SoftwareH264Encoder.js';
+import { detectH264Encoder } from './EncoderDetector.js';
 
-export { NAL_TYPES, RECOVERY_STATES };
+export {
+  NAL_TYPES,
+  RECOVERY_STATES,
+  BaseVideoEncoder,
+  HardwareH264Encoder,
+  SoftwareH264Encoder,
+  detectH264Encoder,
+};
 
 let resolvedFfmpegPath = null;
 try {
@@ -32,14 +43,31 @@ try {
   resolvedFfmpegPath = 'ffmpeg';
 }
 
+export async function createVideoEncoder(options = {}) {
+  let encoderName = options.encoderName || options.encoder;
+  if (!encoderName || encoderName === 'auto') {
+    const detected = await detectH264Encoder(options.ffmpegPath || resolvedFfmpegPath);
+    encoderName = detected.name;
+  }
+  if (encoderName === 'h264_videotoolbox') {
+    return new HardwareH264Encoder({ ...options, ffmpegPath: options.ffmpegPath || resolvedFfmpegPath });
+  }
+  return new SoftwareH264Encoder({ ...options, ffmpegPath: options.ffmpegPath || resolvedFfmpegPath });
+}
+
 export class VideoEncoder extends EventEmitter {
   constructor(options = {}) {
     super();
+    this.codec = options.codec || 'H264';
+    this.encoderName = options.encoderName || (options.isHardware ? 'h264_videotoolbox' : 'libx264');
+    this.isHardware = this.encoderName === 'h264_videotoolbox';
     this.payloadType = options.payloadType || 98; // 98 for H.264
     this.ssrc = options.ssrc || 12345;
     this.mtu = options.mtu || 1200; // Safe MTU for UDP
     this.fps = options.fps || 30;
     this.bitrateKbps = options.bitrateKbps || 2500;
+    this.width = options.width || 720;
+    this.height = options.height || 1280;
     this.ffmpegPath = options.ffmpegPath || resolvedFfmpegPath;
 
     // Submodules
@@ -57,6 +85,7 @@ export class VideoEncoder extends EventEmitter {
     // Forward keyframe controller events
     this.keyframeController.on('keyframe_requested', (data) => this.emit('keyframe_requested', data));
     this.keyframeController.on('fresh_keyframe_encoded', (data) => this.emit('fresh_keyframe_encoded', data));
+
 
     // Backpressure & Bounded Queue
     this.maxPendingFrames = options.maxPendingFrames || 1;
@@ -225,11 +254,72 @@ export class VideoEncoder extends EventEmitter {
     Object.assign(this.metrics, this.keyframeController.metrics);
   }
 
-  /**
-   * Spawns a continuous FFmpeg H.264 encoding process.
-   */
-  _spawnEncoderProcess() {
-    const args = [
+  get resolution() {
+    return { width: this.width, height: this.height };
+  }
+
+  get health() {
+    return {
+      running: this._isEncoding && Boolean(this.ffmpegProc),
+      pid: this.ffmpegProc?.pid || null,
+      waitingForDrain: this._waitingForDrain,
+      queueDepth: this._pendingQueue.length,
+      recoveryState: this.keyframeController.state,
+      encoderName: this.encoderName,
+      isHardware: this.isHardware,
+    };
+  }
+
+  setBitrate(bitrateKbps) {
+    const num = Number(bitrateKbps);
+    if (num > 0 && num !== this.bitrateKbps) {
+      this.bitrateKbps = num;
+      this.emit('quality_changed', { bitrateKbps: this.bitrateKbps, fps: this.fps });
+    }
+  }
+
+  setFramerate(fps) {
+    const num = Number(fps);
+    if (num > 0 && num !== this.fps) {
+      this.fps = num;
+      this.emit('quality_changed', { bitrateKbps: this.bitrateKbps, fps: this.fps });
+    }
+  }
+
+  setResolution(width, height) {
+    if (width > 0 && height > 0) {
+      this.width = width;
+      this.height = height;
+    }
+  }
+
+  encode(frame) {
+    return this.encodeFrame(frame);
+  }
+
+  buildFfmpegArgs() {
+    if (this.encoderName === 'h264_videotoolbox') {
+      return [
+        '-loglevel', 'error',
+        '-f', 'image2pipe',
+        '-vcodec', 'mjpeg',
+        '-i', 'pipe:0',
+        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+        '-c:v', 'h264_videotoolbox',
+        '-realtime', '1',
+        '-pix_fmt', 'yuv420p',
+        '-g', String(this.fps),
+        '-forced-idr', '1',
+        '-aud', '1',
+        '-b:v', `${this.bitrateKbps}k`,
+        '-maxrate', `${this.bitrateKbps}k`,
+        '-bufsize', `${this.bitrateKbps * 2}k`,
+        '-f', 'h264',
+        'pipe:1',
+      ];
+    }
+
+    return [
       '-loglevel', 'error',
       '-f', 'image2pipe',
       '-vcodec', 'mjpeg',
@@ -249,7 +339,10 @@ export class VideoEncoder extends EventEmitter {
       '-f', 'h264',
       'pipe:1',
     ];
+  }
 
+  _spawnEncoderProcess() {
+    const args = this.buildFfmpegArgs();
     return spawn(this.ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
   }
 
@@ -334,9 +427,8 @@ export class VideoEncoder extends EventEmitter {
 
     this._frameId++;
     this._latestFrameId = this._frameId;
-    const frameCopy = Buffer.from(jpegBuffer);
-    frameCopy.id = this._frameId;
-    this._latestFrame = frameCopy;
+    jpegBuffer.id = this._frameId;
+    this._latestFrame = jpegBuffer;
     this.metrics.inputReceived++;
 
     if (this.metrics.inputReceived <= 3 || this.metrics.inputReceived % 60 === 0) {
@@ -414,7 +506,11 @@ export class VideoEncoder extends EventEmitter {
       this._flushTimer = null;
     }
 
-    this._streamBuffer = Buffer.concat([this._streamBuffer, chunk]);
+    if (this._streamBuffer.length === 0) {
+      this._streamBuffer = chunk;
+    } else {
+      this._streamBuffer = Buffer.concat([this._streamBuffer, chunk]);
+    }
     const { completeNals, lastStartCode } = this._extractCompleteNalsWithLast();
 
     for (const nal of completeNals) {
@@ -440,7 +536,11 @@ export class VideoEncoder extends EventEmitter {
   }
 
   feedStream(chunk) {
-    this._streamBuffer = Buffer.concat([this._streamBuffer, chunk]);
+    if (this._streamBuffer.length === 0) {
+      this._streamBuffer = chunk;
+    } else {
+      this._streamBuffer = Buffer.concat([this._streamBuffer, chunk]);
+    }
     const { completeNals, lastStartCode } = this._extractCompleteNalsWithLast();
     const emittedAUs = [];
 

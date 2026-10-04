@@ -10,7 +10,7 @@
  */
 
 const http = require('node:http');
-const { VideoEncoder } = require('./peer/VideoEncoder.cjs');
+const { VideoEncoder, detectH264Encoder } = require('./peer/VideoEncoder.cjs');
 const { ServeSimConsumer } = require('./peer/ServeSimConsumer.cjs');
 const { PeerSession } = require('./peer/PeerSession.cjs');
 const { ServerMetrics } = require('./peer/Metrics.cjs');
@@ -51,8 +51,19 @@ process.on('unhandledRejection', (reason) => {
   console.error('[webrtc-peer unhandledRejection]', reason);
 });
 
-// Create video encoder
+// Create video encoder with capability detection
 const videoEncoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
+detectH264Encoder().then((detected) => {
+  if (detected && detected.isHardware) {
+    console.log(`[webrtc-peer] hardware acceleration enabled: ${detected.name}`);
+    videoEncoder.encoderName = detected.name;
+    videoEncoder.isHardware = true;
+  } else if (detected) {
+    console.log(`[webrtc-peer] using encoder: ${detected.name}`);
+  }
+}).catch((err) => {
+  console.warn('[webrtc-peer] encoder capability detection warning:', err.message);
+});
 const serverMetrics = new ServerMetrics();
 
 const streamWsClients = new Set();

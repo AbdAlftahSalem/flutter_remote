@@ -1,42 +1,28 @@
-// flutter-remote-template-version: 5
 /**
- * Flutter Remote WebRTC V3 Real Video Encoder (CommonJS)
+ * Flutter Remote Base Video Encoder
  *
- * For standalone remote runner execution.
+ * Abstract base class providing common H.264 stream pipeline:
+ *   - Annex-B NAL parsing (3-byte & 4-byte start codes across chunk boundaries)
+ *   - Access Unit (frame) demarcation & grouping
+ *   - Zero-copy buffer management & bounded queue backpressure
+ *   - RFC 6184 RTP packetization delegation
+ *   - Keyframe recovery controller delegation
+ *   - Runtime metric tracking (encode latency, queue depth, frame drop rate)
  */
 
-const { EventEmitter } = require('node:events');
-const { spawn } = require('node:child_process');
-const { RtpPacketizer, NAL_TYPES } = require('./RtpPacketizer.cjs');
-const { KeyframeController, RECOVERY_STATES } = require('./KeyframeController.cjs');
-const { BaseVideoEncoder } = require('./BaseVideoEncoder.cjs');
-const { HardwareH264Encoder } = require('./HardwareH264Encoder.cjs');
-const { SoftwareH264Encoder } = require('./SoftwareH264Encoder.cjs');
-const { detectH264Encoder } = require('./EncoderDetector.cjs');
+import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
+import { RtpPacketizer, NAL_TYPES } from './RtpPacketizer.js';
+import { KeyframeController, RECOVERY_STATES } from './KeyframeController.js';
 
-let ffmpegPath = 'ffmpeg';
-try {
-  ffmpegPath = require('ffmpeg-static') || 'ffmpeg';
-} catch {}
+export { NAL_TYPES, RECOVERY_STATES };
 
-async function createVideoEncoder(options = {}) {
-  let encoderName = options.encoderName || options.encoder;
-  if (!encoderName || encoderName === 'auto') {
-    const detected = await detectH264Encoder(options.ffmpegPath || ffmpegPath);
-    encoderName = detected.name;
-  }
-  if (encoderName === 'h264_videotoolbox') {
-    return new HardwareH264Encoder(Object.assign({}, options, { ffmpegPath: options.ffmpegPath || ffmpegPath }));
-  }
-  return new SoftwareH264Encoder(Object.assign({}, options, { ffmpegPath: options.ffmpegPath || ffmpegPath }));
-}
-
-class VideoEncoder extends EventEmitter {
+export class BaseVideoEncoder extends EventEmitter {
   constructor(options = {}) {
     super();
     this.codec = options.codec || 'H264';
-    this.encoderName = options.encoderName || (options.isHardware ? 'h264_videotoolbox' : 'libx264');
-    this.isHardware = this.encoderName === 'h264_videotoolbox';
+    this.encoderName = options.encoderName || 'base';
+    this.isHardware = Boolean(options.isHardware);
     this.payloadType = options.payloadType || 98;
     this.ssrc = options.ssrc || 12345;
     this.mtu = options.mtu || 1200;
@@ -44,7 +30,7 @@ class VideoEncoder extends EventEmitter {
     this.bitrateKbps = options.bitrateKbps || 2500;
     this.width = options.width || 720;
     this.height = options.height || 1280;
-    this.ffmpegPath = options.ffmpegPath || ffmpegPath;
+    this.ffmpegPath = options.ffmpegPath || 'ffmpeg';
 
     this.rtpPacketizer = new RtpPacketizer({
       payloadType: this.payloadType,
@@ -57,8 +43,8 @@ class VideoEncoder extends EventEmitter {
       spawnEncoderFn: () => this._spawnEncoderProcess(),
     });
 
-    this.keyframeController.on('keyframe_requested', (d) => this.emit('keyframe_requested', d));
-    this.keyframeController.on('fresh_keyframe_encoded', (d) => this.emit('fresh_keyframe_encoded', d));
+    this.keyframeController.on('keyframe_requested', (data) => this.emit('keyframe_requested', data));
+    this.keyframeController.on('fresh_keyframe_encoded', (data) => this.emit('fresh_keyframe_encoded', data));
 
     this.maxPendingFrames = options.maxPendingFrames || 1;
     this._pendingQueue = [];
@@ -74,14 +60,17 @@ class VideoEncoder extends EventEmitter {
     this._latestFrameId = 0;
     this._latestFrame = null;
 
-    // Diagnostics & Metrics (shared directly with keyframeController)
+    // Metrics & diagnostics
     this.metrics = this.keyframeController.metrics;
+    this.metrics.encoderName = this.encoderName;
+    this.metrics.isHardware = this.isHardware;
     this.metrics.inputReceived = 0;
     this.metrics.inputDropped = 0;
     this.metrics.inputPending = 0;
     this.metrics.encodedFrames = 0;
     this.metrics.totalEncodeLatencyMs = 0;
     this.metrics.maxEncodeLatencyMs = 0;
+    this.metrics.lastEncodeLatencyMs = 0;
     this._diagInterval = null;
 
     this.ffmpegProc = null;
@@ -114,6 +103,20 @@ class VideoEncoder extends EventEmitter {
 
   get _clockRate() { return this.rtpPacketizer._clockRate; }
   set _clockRate(v) { this.rtpPacketizer._clockRate = v; }
+
+  get resolution() {
+    return { width: this.width, height: this.height };
+  }
+
+  get health() {
+    return {
+      running: this._isEncoding && Boolean(this.ffmpegProc),
+      pid: this.ffmpegProc?.pid || null,
+      waitingForDrain: this._waitingForDrain,
+      queueDepth: this._pendingQueue.length,
+      recoveryState: this.keyframeController.state,
+    };
+  }
 
   _nextRtpTimestamp(fps = this.fps) {
     return this.rtpPacketizer.nextRtpTimestamp(fps);
@@ -152,17 +155,37 @@ class VideoEncoder extends EventEmitter {
     return this.packetizeAccessUnit(units, fps);
   }
 
-  requestKeyframe() {
-    // 1. Immediately emit cached keyframe packets if available for instant unfreeze (< 10ms)
+  setBitrate(bitrateKbps) {
+    const num = Number(bitrateKbps);
+    if (num > 0 && num !== this.bitrateKbps) {
+      this.bitrateKbps = num;
+      this.emit('quality_changed', { bitrateKbps: this.bitrateKbps, fps: this.fps });
+    }
+  }
+
+  setFramerate(fps) {
+    const num = Number(fps);
+    if (num > 0 && num !== this.fps) {
+      this.fps = num;
+      this.emit('quality_changed', { bitrateKbps: this.bitrateKbps, fps: this.fps });
+    }
+  }
+
+  setResolution(width, height) {
+    if (width > 0 && height > 0) {
+      this.width = width;
+      this.height = height;
+    }
+  }
+
+  requestKeyframe(reason = 'manual') {
     if (this.hasKeyframe()) {
       const cachedPackets = this.getKeyframePackets(this.fps);
       if (cachedPackets && cachedPackets.length > 0) {
-        console.log('[video] instantly dispatched cached keyframe packets for quick unfreeze');
         this.emit('packets', cachedPackets);
       }
     }
 
-    // 2. Request fresh IDR from KeyframeController and emit fresh packets upon resolution
     const p = this.keyframeController.requestKeyframe(
       this._latestFrame,
       (nextProc) => this._promoteReplacementEncoder(nextProc),
@@ -174,9 +197,7 @@ class VideoEncoder extends EventEmitter {
       if (packets && packets.length > 0) {
         this.emit('packets', packets);
       }
-    }).catch((err) => {
-      console.warn('[video] fresh keyframe recovery failed:', err.message);
-    });
+    }).catch(() => {});
 
     this._syncMetrics();
     return p;
@@ -203,15 +224,11 @@ class VideoEncoder extends EventEmitter {
       this._handleEncodedData(chunk);
     });
 
-    nextProc.on('close', (code, signal) => {
-      if (this.ffmpegProc !== nextProc) {
-        console.log(`[ffmpeg] retired encoder closed pid=${nextProc.pid}`);
-        return;
-      }
+    nextProc.on('close', () => {
+      if (this.ffmpegProc !== nextProc) return;
       this._isEncoding = false;
       this.ffmpegProc = null;
       this._flushPending();
-      console.log(`[ffmpeg] active encoder closed pid=${nextProc.pid} code=${code} signal=${signal}`);
     });
 
     this._flushNextPendingInput();
@@ -221,91 +238,11 @@ class VideoEncoder extends EventEmitter {
     Object.assign(this.metrics, this.keyframeController.metrics);
   }
 
-  get resolution() {
-    return { width: this.width, height: this.height };
-  }
-
-  get health() {
-    return {
-      running: this._isEncoding && Boolean(this.ffmpegProc),
-      pid: this.ffmpegProc?.pid || null,
-      waitingForDrain: this._waitingForDrain,
-      queueDepth: this._pendingQueue.length,
-      recoveryState: this.keyframeController.state,
-      encoderName: this.encoderName,
-      isHardware: this.isHardware,
-    };
-  }
-
-  setBitrate(bitrateKbps) {
-    const num = Number(bitrateKbps);
-    if (num > 0 && num !== this.bitrateKbps) {
-      this.bitrateKbps = num;
-      this.emit('quality_changed', { bitrateKbps: this.bitrateKbps, fps: this.fps });
-    }
-  }
-
-  setFramerate(fps) {
-    const num = Number(fps);
-    if (num > 0 && num !== this.fps) {
-      this.fps = num;
-      this.emit('quality_changed', { bitrateKbps: this.bitrateKbps, fps: this.fps });
-    }
-  }
-
-  setResolution(width, height) {
-    if (width > 0 && height > 0) {
-      this.width = width;
-      this.height = height;
-    }
-  }
-
-  encode(frame) {
-    return this.encodeFrame(frame);
-  }
-
+  /**
+   * Must be implemented by subclasses to build FFmpeg arguments.
+   */
   buildFfmpegArgs() {
-    if (this.encoderName === 'h264_videotoolbox') {
-      return [
-        '-loglevel', 'error',
-        '-f', 'image2pipe',
-        '-vcodec', 'mjpeg',
-        '-i', 'pipe:0',
-        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-        '-c:v', 'h264_videotoolbox',
-        '-realtime', '1',
-        '-pix_fmt', 'yuv420p',
-        '-g', String(this.fps),
-        '-forced-idr', '1',
-        '-aud', '1',
-        '-b:v', `${this.bitrateKbps}k`,
-        '-maxrate', `${this.bitrateKbps}k`,
-        '-bufsize', `${this.bitrateKbps * 2}k`,
-        '-f', 'h264',
-        'pipe:1',
-      ];
-    }
-
-    return [
-      '-loglevel', 'error',
-      '-f', 'image2pipe',
-      '-vcodec', 'mjpeg',
-      '-i', 'pipe:0',
-      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-tune', 'zerolatency',
-      '-pix_fmt', 'yuv420p',
-      '-g', String(this.fps),
-      '-keyint_min', '1',
-      '-forced-idr', '1',
-      '-aud', '1',
-      '-b:v', `${this.bitrateKbps}k`,
-      '-maxrate', `${this.bitrateKbps}k`,
-      '-bufsize', `${this.bitrateKbps * 2}k`,
-      '-f', 'h264',
-      'pipe:1',
-    ];
+    throw new Error('buildFfmpegArgs must be implemented by subclass');
   }
 
   _spawnEncoderProcess() {
@@ -321,8 +258,6 @@ class VideoEncoder extends EventEmitter {
       this.ffmpegProc = proc;
       this._isEncoding = true;
       this._waitingForDrain = false;
-
-      console.log(`[ffmpeg] encoder started pid=${proc.pid}`);
 
       proc.stdout.on('data', (chunk) => {
         if (this.ffmpegProc !== proc) return;
@@ -351,26 +286,20 @@ class VideoEncoder extends EventEmitter {
       });
 
       proc.on('error', (err) => {
-        console.error(`[ffmpeg] encoder error pid=${proc.pid}: ${err.message}`);
         this.emit('encoder_error', err);
         this.close();
       });
 
-      proc.on('close', (code, signal) => {
-        if (this.ffmpegProc !== proc) {
-          console.log(`[ffmpeg] retired encoder closed pid=${proc.pid}`);
-          return;
-        }
+      proc.on('close', (code) => {
+        if (this.ffmpegProc !== proc) return;
         this._isEncoding = false;
         this.ffmpegProc = null;
         this._flushPending();
-        console.log(`[ffmpeg] active encoder closed pid=${proc.pid} code=${code} signal=${signal}`);
         this.emit('encoder_closed', code);
       });
 
       this._startDiagnostics();
     } catch (err) {
-      console.error('[ffmpeg] encoder spawn error:', err.message);
       this.emit('encoder_error', err);
       this._isEncoding = false;
     }
@@ -385,21 +314,20 @@ class VideoEncoder extends EventEmitter {
     });
   }
 
+  encode(frame) {
+    return this.encodeFrame(frame);
+  }
+
   encodeFrame(jpegBuffer) {
     if (!Buffer.isBuffer(jpegBuffer) || jpegBuffer.length === 0) return false;
 
     this._frameId++;
     this._latestFrameId = this._frameId;
+
+    // Buffer optimization: attach id to buffer directly, avoiding redundant Buffer.from copy
     jpegBuffer.id = this._frameId;
     this._latestFrame = jpegBuffer;
     this.metrics.inputReceived++;
-
-    if (this.metrics.inputReceived <= 3 || this.metrics.inputReceived % 60 === 0) {
-      console.log(
-        `[video] received=${this.metrics.inputReceived} encoded=${this.metrics.encodedFrames} ` +
-        `keyframes=${this.metrics.keyframes} dropped=${this.metrics.inputDropped}`
-      );
-    }
 
     if (this.keyframeController.state === RECOVERY_STATES.WAITING_FOR_IDR) {
       while (this._pendingQueue.length >= this.maxPendingFrames) {
@@ -465,11 +393,13 @@ class VideoEncoder extends EventEmitter {
       this._flushTimer = null;
     }
 
+    // Buffer optimization: avoid allocation when stream buffer was empty
     if (this._streamBuffer.length === 0) {
       this._streamBuffer = chunk;
     } else {
       this._streamBuffer = Buffer.concat([this._streamBuffer, chunk]);
     }
+
     const { completeNals, lastStartCode } = this._extractCompleteNalsWithLast();
 
     for (const nal of completeNals) {
@@ -493,6 +423,7 @@ class VideoEncoder extends EventEmitter {
     } else {
       this._streamBuffer = Buffer.concat([this._streamBuffer, chunk]);
     }
+
     const { completeNals, lastStartCode } = this._extractCompleteNalsWithLast();
     const emittedAUs = [];
 
@@ -693,10 +624,7 @@ class VideoEncoder extends EventEmitter {
     if (this._diagInterval) return;
     this._diagInterval = setInterval(() => {
       if (this.metrics.inputReceived > 0 || this.metrics.encodedFrames > 0) {
-        console.log(
-          `[video] received=${this.metrics.inputReceived} encoded=${this.metrics.encodedFrames} ` +
-          `keyframes=${this.metrics.keyframes} dropped=${this.metrics.inputDropped}`
-        );
+        // debug logging can be wired here
       }
     }, 3000);
     this._diagInterval.unref?.();
@@ -728,14 +656,3 @@ class VideoEncoder extends EventEmitter {
     this.keyframeController.reset();
   }
 }
-
-module.exports = {
-  NAL_TYPES,
-  RECOVERY_STATES,
-  VideoEncoder,
-  BaseVideoEncoder,
-  HardwareH264Encoder,
-  SoftwareH264Encoder,
-  detectH264Encoder,
-  createVideoEncoder,
-};

@@ -1,0 +1,40 @@
+/**
+ * Flutter Remote Hardware H.264 Encoder (Apple VideoToolbox)
+ *
+ * Utilizes macOS VideoToolbox hardware encoder (h264_videotoolbox) for ultra-low latency,
+ * minimal CPU utilization on Apple Silicon (M1/M2/M3/M4) and Intel macOS runners.
+ */
+
+import { BaseVideoEncoder } from './BaseVideoEncoder.js';
+
+export class HardwareH264Encoder extends BaseVideoEncoder {
+  constructor(options = {}) {
+    super({
+      ...options,
+      codec: 'H264',
+      encoderName: 'h264_videotoolbox',
+      isHardware: true,
+    });
+  }
+
+  buildFfmpegArgs() {
+    return [
+      '-loglevel', 'error',
+      '-f', 'image2pipe',
+      '-vcodec', 'mjpeg',
+      '-i', 'pipe:0',
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+      '-c:v', 'h264_videotoolbox',
+      '-realtime', '1',
+      '-pix_fmt', 'yuv420p',
+      '-g', String(this.fps),
+      '-forced-idr', '1',
+      '-aud', '1',
+      '-b:v', `${this.bitrateKbps}k`,
+      '-maxrate', `${this.bitrateKbps}k`,
+      '-bufsize', `${this.bitrateKbps * 2}k`,
+      '-f', 'h264',
+      'pipe:1',
+    ];
+  }
+}

@@ -49,6 +49,20 @@ describe('Workflow & Gate Templates', () => {
     assert.equal(res.ok, true, `Syntax error in PeerSession.cjs: ${res.err}`);
   });
 
+  test('templates/peer encoder files are valid JavaScript syntax', () => {
+    const files = [
+      'templates/peer/BaseVideoEncoder.cjs',
+      'templates/peer/HardwareH264Encoder.cjs',
+      'templates/peer/SoftwareH264Encoder.cjs',
+      'templates/peer/EncoderDetector.cjs',
+      'templates/peer/VideoEncoder.cjs',
+    ];
+    for (const file of files) {
+      const res = sh('node', ['--check', file]);
+      assert.equal(res.ok, true, `Syntax error in ${file}: ${res.err}`);
+    }
+  });
+
   test('scaffold writes templates into destination directory', () => {
     const projDir = join(tempDir, 'sample-proj');
     mkdirSync(projDir, { recursive: true });
@@ -65,6 +79,18 @@ describe('Workflow & Gate Templates', () => {
     assert.ok(existsSync(gateFile), 'gate.cjs should exist');
     assert.ok(existsSync(webrtcPeerFile), 'webrtc-peer.cjs should exist');
     assert.ok(existsSync(gitignoreFile), '.gitignore should exist');
+
+    const encoderFiles = [
+      'BaseVideoEncoder.cjs',
+      'HardwareH264Encoder.cjs',
+      'SoftwareH264Encoder.cjs',
+      'EncoderDetector.cjs',
+      'VideoEncoder.cjs',
+    ];
+    for (const name of encoderFiles) {
+      const filePath = join(projDir, '.github', 'flutter-remote', 'peer', name);
+      assert.ok(existsSync(filePath), `${name} should exist in .github/flutter-remote/peer/`);
+    }
 
     const content = readFileSync(workflowFile, 'utf8');
     assert.ok(content.includes('flutter-remote'));
