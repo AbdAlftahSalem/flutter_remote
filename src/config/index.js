@@ -5,6 +5,9 @@
  */
 
 import { DEFAULT_CONFIG } from './defaultConfig.js';
+import { PortManager } from './PortManager.js';
+
+export { PortManager };
 
 export function resolveConfig(flags = {}, env = process.env) {
   const envConfig = {
@@ -58,14 +61,20 @@ export function resolveConfig(flags = {}, env = process.env) {
   const cleanEnv = clean(envConfig);
   const cleanCli = clean(cliConfig);
 
+  const mergedPorts = {
+    ...DEFAULT_CONFIG.ports,
+    ...(cleanEnv.ports || {}),
+    ...(cleanCli.ports || {}),
+  };
+
+  // Validate no collisions among configured ports
+  const pm = new PortManager(mergedPorts);
+
   return {
     ...DEFAULT_CONFIG,
     ...cleanEnv,
     ...cleanCli,
-    ports: {
-      ...DEFAULT_CONFIG.ports,
-      ...(cleanEnv.ports || {}),
-      ...(cleanCli.ports || {}),
-    },
+    ports: pm.getAllPorts(),
+    portManager: pm,
   };
 }

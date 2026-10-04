@@ -3,14 +3,21 @@
  */
 
 import { logger } from '../shared/logger.js';
+import { ProcessSupervisor } from './ProcessSupervisor.js';
+import { SessionError } from '../shared/errors.js';
 
 export class SessionLifecycle {
   constructor(sessionId) {
     this.sessionId = sessionId;
     this._cleanupHooks = [];
-    this._trackedProcesses = new Map();
     this._cleanedUp = false;
     this._cleanupPromise = null;
+    this.supervisor = new ProcessSupervisor(this.sessionId);
+    this.abortController = new AbortController();
+  }
+
+  get signal() {
+    return this.abortController.signal;
   }
 
   addCleanupHook(name, fn) {
@@ -18,17 +25,34 @@ export class SessionLifecycle {
     this._cleanupHooks.push({ name, fn });
   }
 
-  trackProcess(pid, name, port = null) {
-    if (!pid) return;
-    this._trackedProcesses.set(pid, { pid, name, port, startedAt: Date.now() });
+  trackProcess(pid, name, port = null, childProc = null) {
+    return this.supervisor.trackProcess(pid, name, port, childProc);
   }
 
   untrackProcess(pid) {
-    this._trackedProcesses.delete(pid);
+    this.supervisor.untrackProcess(pid);
   }
 
   get trackedProcesses() {
-    return Array.from(this._trackedProcesses.values());
+    return this.supervisor.trackedProcesses;
+  }
+
+  /**
+   * Runs an async operation with an enforceable timeout and abort check.
+   */
+  async withTimeout(promise, timeoutMs, opName = 'operation') {
+    let timer;
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new SessionError(`Operation '${opName}' timed out after ${timeoutMs}ms`, { code: 'OPERATION_TIMEOUT' }));
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async cleanup(reason = 'shutdown') {
@@ -37,6 +61,11 @@ export class SessionLifecycle {
     }
 
     this._cleanedUp = true;
+
+    // Trigger AbortController signal
+    try {
+      this.abortController.abort(reason);
+    } catch {}
 
     this._cleanupPromise = (async () => {
       logger.info('session.cleanup_started', { sessionId: this.sessionId, reason });
@@ -55,13 +84,8 @@ export class SessionLifecycle {
         }
       }
 
-      // Terminate tracked processes
-      for (const [pid, proc] of this._trackedProcesses.entries()) {
-        try {
-          process.kill(pid, 'SIGTERM');
-        } catch {}
-      }
-      this._trackedProcesses.clear();
+      // Terminate tracked processes with SIGTERM -> SIGKILL escalation
+      await this.supervisor.terminateAll({ timeoutMs: 2000 });
 
       logger.info('session.cleanup_completed', { sessionId: this.sessionId });
     })();
