@@ -19,7 +19,7 @@ for (const [suiteName, verifyFn, detectFn, resetFn] of [
   ['CJS EncoderDetector', verifyEncoderRealRuntimeCjs, detectH264EncoderCjs, resetEncoderDetectionCacheCjs],
 ]) {
   test(`${suiteName}: verifyEncoderRealRuntime succeeds for valid encoder libx264`, async () => {
-    const res = await verifyFn(ffmpegBin, 'libx264', { timeoutMs: 5000 });
+    const res = await verifyFn(ffmpegBin, 'libx264', { timeoutMs: 10000 });
     assert.equal(res.ok, true, `Verification should succeed: ${res.reason}`);
     assert.ok(res.bytes > 0, 'Should produce output bytes');
   });

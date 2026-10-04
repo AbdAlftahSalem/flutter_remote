@@ -18,7 +18,7 @@ const { execFile, spawn } = require('node:child_process');
 let cachedEncoder = null;
 let probePromise = null;
 
-function verifyEncoderRealRuntime(ffmpegPath = 'ffmpeg', encoderName = 'h264_videotoolbox', { timeoutMs = 3000 } = {}) {
+function verifyEncoderRealRuntime(ffmpegPath = 'ffmpeg', encoderName = 'h264_videotoolbox', { timeoutMs = 10000 } = {}) {
   return new Promise((resolve) => {
     let timer = null;
     let proc = null;
@@ -92,7 +92,7 @@ function verifyEncoderRealRuntime(ffmpegPath = 'ffmpeg', encoderName = 'h264_vid
   });
 }
 
-function detectH264Encoder(ffmpegPath = 'ffmpeg', { timeoutMs = 3000, verifyHardware = true } = {}) {
+function detectH264Encoder(ffmpegPath = 'ffmpeg', { timeoutMs = 10000, verifyHardware = true } = {}) {
   if (cachedEncoder) {
     return Promise.resolve(cachedEncoder);
   }

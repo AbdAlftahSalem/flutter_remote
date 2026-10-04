@@ -27,7 +27,7 @@ let probePromise = null;
  * @param {object} options
  * @returns {Promise<{ ok: boolean, reason?: string, bytes?: number }>}
  */
-export async function verifyEncoderRealRuntime(ffmpegPath = 'ffmpeg', encoderName = 'h264_videotoolbox', { timeoutMs = 3000 } = {}) {
+export async function verifyEncoderRealRuntime(ffmpegPath = 'ffmpeg', encoderName = 'h264_videotoolbox', { timeoutMs = 10000 } = {}) {
   return new Promise((resolve) => {
     let timer = null;
     let proc = null;
@@ -101,7 +101,7 @@ export async function verifyEncoderRealRuntime(ffmpegPath = 'ffmpeg', encoderNam
   });
 }
 
-export async function detectH264Encoder(ffmpegPath = 'ffmpeg', { timeoutMs = 3000, verifyHardware = true } = {}) {
+export async function detectH264Encoder(ffmpegPath = 'ffmpeg', { timeoutMs = 10000, verifyHardware = true } = {}) {
   if (cachedEncoder) {
     return cachedEncoder;
   }
