@@ -65,7 +65,7 @@ const NEEDS_VALUE = new Set([
   'minutes', 'device', 'runner', 'flutter-version', 'build-mode', 'flavor', 'target',
   'dart-define', 'codec', 'fps', 'quality', 'max-dimension', 'app-file', 'app',
   'app-release', 'mode', 'repo', 'message', 'account-id', 'access-key-id', 'secret-access-key',
-  'bucket', 'key-id', 'key-token', 'tunnel-protocol',
+  'bucket', 'key-id', 'key-token', 'tunnel-protocol', 'frames',
 ]);
 
 export function parseArgs(argv) {
