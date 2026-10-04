@@ -76,12 +76,14 @@ class PeerSession {
       }
     }
 
+    this.generation = msg.generation || 1;
+
     this.peer.onLocalDescription((sdp, type) => {
       if (this.ws.readyState === 1 /* OPEN */) {
         this.ws.send(JSON.stringify({
           v: 2,
           type,
-          generation: msg.generation || 1,
+          generation: this.generation,
           payload: { sdp },
         }));
       }
@@ -92,7 +94,7 @@ class PeerSession {
         this.ws.send(JSON.stringify({
           v: 2,
           type: 'ice-candidate',
-          generation: msg.generation || 1,
+          generation: this.generation,
           payload: { candidate, sdpMid: mid },
         }));
       }
@@ -113,8 +115,26 @@ class PeerSession {
         if (label === 'control') {
           try {
             const cmd = JSON.parse(rawMsg.toString());
+            if (cmd.generation && cmd.generation < this.generation) {
+              return; // drop stale generation control event
+            }
             if (cmd.type === 'request_keyframe') {
               this.videoEncoder.requestKeyframe(cmd.reason || 'client_request');
+              return;
+            }
+            if (cmd.type === 'quality' || cmd.type === 'bitrate') {
+              if (cmd.bitrateKbps && typeof this.videoEncoder.setBitrate === 'function') {
+                this.videoEncoder.setBitrate(cmd.bitrateKbps);
+              }
+              if (cmd.fps && typeof this.videoEncoder.setFramerate === 'function') {
+                this.videoEncoder.setFramerate(cmd.fps);
+              }
+              return;
+            }
+            if (cmd.type === 'resize') {
+              if (cmd.width && cmd.height && typeof this.videoEncoder.setResolution === 'function') {
+                this.videoEncoder.setResolution(cmd.width, cmd.height);
+              }
               return;
             }
           } catch {}
@@ -129,6 +149,9 @@ class PeerSession {
 
   handleCandidate(msg) {
     if (!this.peer) return;
+    if (msg.generation && msg.generation < this.generation) {
+      return; // Ignore stale ICE candidate from previous generation
+    }
     const candidateData = msg.payload || msg.candidate;
     if (candidateData && candidateData.candidate) {
       const mid = candidateData.sdpMid || '0';

@@ -466,13 +466,15 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
     updateDebug(m) {
       if (!this.debugPanel) return;
       this.debugPanel.innerHTML =
-        '<div><strong>Flutter Remote V2 Diagnostics</strong></div>' +
-        '<div>Connection: ' + m.connectionState + '</div>' +
-        '<div>ICE: ' + m.iceState + '</div>' +
-        '<div>RTT: ' + m.rtt + ' ms</div>' +
-        '<div>FPS: ' + m.fps + '</div>' +
-        '<div>Reconnects: ' + m.reconnects + '</div>' +
-        '<div>Generation: ' + m.generation + '</div>';
+        '<div><strong>Flutter Remote Diagnostics</strong></div>' +
+        '<div>State: ' + m.connectionState + '</div>' +
+        '<div>ICE State: ' + m.iceState + ' (' + (m.candidateType || 'direct') + ')</div>' +
+        '<div>Codec: ' + (m.codec || 'H.264') + ' (' + (m.resolution || '720x1280') + ')</div>' +
+        '<div>FPS: ' + m.fps + ' | Bitrate: ' + (m.bitrate || 0) + ' kbps</div>' +
+        '<div>RTT: ' + m.rtt + ' ms | Jitter: ' + (m.jitter || 0) + ' ms</div>' +
+        '<div>Packet Loss: ' + (m.lossPercentage || '0.00%') + '</div>' +
+        '<div>Dropped Frames: ' + (m.framesDropped || 0) + '</div>' +
+        '<div>Reconnects: ' + m.reconnects + ' | Gen: ' + m.generation + '</div>';
     }
   }
 
@@ -509,9 +511,14 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       this.connectionState.onChange((s, gen) => {
         this.metrics.connectionState = s;
         this.metrics.generation = gen;
-        if (s === 'CONNECTING') this.ui.setStatus('Connecting to remote simulator...');
+        if (s === 'LOADING') this.ui.setStatus('Loading session...');
+        else if (s === 'CONNECTING') this.ui.setStatus('Connecting to remote simulator...');
         else if (s === 'CONNECTED') this.ui.setStatus('Connected', true);
+        else if (s === 'DEGRADED') this.ui.setStatus('Network Degraded (Adapting Video)');
         else if (s === 'RECONNECTING') this.ui.setStatus('Reconnecting (Gen ' + gen + ')...');
+        else if (s === 'DISCONNECTED') this.ui.setStatus('Disconnected from remote runner');
+        else if (s === 'EXPIRED') this.ui.setStatus('Session Expired');
+        else if (s === 'ERROR') this.ui.setStatus('Connection Error');
       });
 
       window.addEventListener('resize', () => this._handleResize());
@@ -709,18 +716,72 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
     }
 
     _startDebugLoop() {
+      let prevPacketsLost = 0;
+      let prevPacketsReceived = 0;
+      let prevBytesReceived = 0;
+      let prevTimestamp = Date.now();
+
       setInterval(async () => {
         if (this.peer && typeof this.peer.getStats === 'function') {
           try {
             const stats = await this.peer.getStats();
+            const now = Date.now();
+            const durationSec = Math.max(0.1, (now - prevTimestamp) / 1000);
+            prevTimestamp = now;
+
             stats.forEach((r) => {
-              if (r.type === 'candidate-pair' && r.state === 'succeeded') {
+              if (r.type === 'candidate-pair' && (r.state === 'succeeded' || r.nominated || r.selected)) {
                 this.metrics.rtt = Math.round((r.currentRoundTripTime || 0) * 1000);
+              }
+              if (r.type === 'remote-candidate') {
+                this.metrics.candidateType = r.candidateType || this.metrics.candidateType;
               }
               if (r.type === 'inbound-rtp' && r.kind === 'video') {
                 this.metrics.fps = Math.round(r.framesPerSecond || 0);
+                this.metrics.framesDropped = r.framesDropped || 0;
+                this.metrics.jitter = Math.round((r.jitter || 0) * 1000);
+                this.metrics.codec = (r.codecId || 'H264').includes('VP8') ? 'VP8' : 'H264';
+
+                // Bitrate delta
+                const bytesDelta = Math.max(0, (r.bytesReceived || 0) - prevBytesReceived);
+                prevBytesReceived = r.bytesReceived || 0;
+                this.metrics.bitrate = Math.round((bytesDelta * 8) / (durationSec * 1000));
+
+                // Loss rate delta
+                const lostDelta = Math.max(0, (r.packetsLost || 0) - prevPacketsLost);
+                const recDelta = Math.max(0, (r.packetsReceived || 0) - prevPacketsReceived);
+                prevPacketsLost = r.packetsLost || 0;
+                prevPacketsReceived = r.packetsReceived || 0;
+                const totalDelta = recDelta + lostDelta;
+                const rate = totalDelta > 0 ? (lostDelta / totalDelta) : 0;
+                this.metrics.lossRate = rate;
+                this.metrics.lossPercentage = (rate * 100).toFixed(2) + '%';
               }
             });
+
+            if (this.videoRenderer) {
+              const res = this.videoRenderer.getVideoResolution();
+              this.metrics.resolution = res.width + 'x' + res.height;
+            }
+
+            // Adaptive quality & degradation check
+            const isDegraded = this.metrics.rtt > 200 || this.metrics.lossRate > 0.03 || this.metrics.framesDropped > 5;
+            if (isDegraded && this.connectionState.state === 'CONNECTED') {
+              this.connectionState.set('DEGRADED');
+              const dc = this.dataChannels.control;
+              if (dc && dc.readyState === 'open') {
+                dc.send(JSON.stringify({
+                  v: PROTOCOL_VERSION,
+                  type: 'adaptation',
+                  rtt: this.metrics.rtt,
+                  packetLoss: this.metrics.lossRate,
+                  jitter: this.metrics.jitter,
+                  fps: this.metrics.fps,
+                }));
+              }
+            } else if (!isDegraded && this.connectionState.state === 'DEGRADED') {
+              this.connectionState.set('CONNECTED');
+            }
           } catch {}
         }
         this.ui.updateDebug(this.metrics);
