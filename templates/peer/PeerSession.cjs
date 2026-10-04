@@ -19,6 +19,7 @@ class PeerSession {
     this.serveSimConsumer = options.serveSimConsumer;
     this.activeVideoTracks = options.activeVideoTracks;
     this.transportMode = options.transportMode || 'webrtc';
+    this.qualityController = options.qualityController || null;
 
     this.peer = null;
     this.videoTrack = null;
@@ -128,6 +129,12 @@ class PeerSession {
               }
               if (cmd.fps && typeof this.videoEncoder.setFramerate === 'function') {
                 this.videoEncoder.setFramerate(cmd.fps);
+              }
+              return;
+            }
+            if (cmd.type === 'adaptation') {
+              if (this.qualityController && typeof this.qualityController.evaluateTelemetry === 'function') {
+                this.qualityController.evaluateTelemetry(cmd);
               }
               return;
             }

@@ -11,6 +11,7 @@
 
 const http = require('node:http');
 const { VideoEncoder, detectH264Encoder } = require('./peer/VideoEncoder.cjs');
+const { AdaptiveQualityController } = require('./peer/AdaptiveQualityController.cjs');
 const { ServeSimConsumer } = require('./peer/ServeSimConsumer.cjs');
 const { PeerSession } = require('./peer/PeerSession.cjs');
 const { ServerMetrics } = require('./peer/Metrics.cjs');
@@ -64,6 +65,7 @@ detectH264Encoder().then((detected) => {
 }).catch((err) => {
   console.warn('[webrtc-peer] encoder capability detection warning:', err.message);
 });
+const qualityController = new AdaptiveQualityController({ videoEncoder });
 const serverMetrics = new ServerMetrics();
 
 const streamWsClients = new Set();
@@ -156,6 +158,7 @@ if (WebSocketServer) {
       ws,
       ndc: { PeerConnection, Video },
       videoEncoder,
+      qualityController,
       serveSimConsumer,
       activeVideoTracks,
       transportMode: TRANSPORT_MODE,

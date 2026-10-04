@@ -56,6 +56,7 @@ describe('Workflow & Gate Templates', () => {
       'templates/peer/SoftwareH264Encoder.cjs',
       'templates/peer/EncoderDetector.cjs',
       'templates/peer/VideoEncoder.cjs',
+      'templates/peer/AdaptiveQualityController.cjs',
     ];
     for (const file of files) {
       const res = sh('node', ['--check', file]);
@@ -86,6 +87,7 @@ describe('Workflow & Gate Templates', () => {
       'SoftwareH264Encoder.cjs',
       'EncoderDetector.cjs',
       'VideoEncoder.cjs',
+      'AdaptiveQualityController.cjs',
     ];
     for (const name of encoderFiles) {
       const filePath = join(projDir, '.github', 'flutter-remote', 'peer', name);
