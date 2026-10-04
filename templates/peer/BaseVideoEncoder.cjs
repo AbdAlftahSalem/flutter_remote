@@ -302,6 +302,12 @@ class BaseVideoEncoder extends EventEmitter {
       return;
     }
 
+    if (this.isHardware) {
+      console.warn(`[encoder] hardware encoder ${this.encoderName} crashed; switching to software fallback (libx264)`);
+      this.isHardware = false;
+      this.encoderName = 'libx264';
+    }
+
     const backoffDelay = Math.min(8000, 1000 * Math.pow(2, this._crashRecoveryAttempts - 1));
     this.emit('encoder_crashed', { code, signal, attempt: this._crashRecoveryAttempts, delayMs: backoffDelay });
 

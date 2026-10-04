@@ -106,8 +106,12 @@ export async function doctor(cwd) {
 
   try {
     const enc = await detectH264Encoder(ffmpegBin);
-    if (enc.isHardware) {
+    if (enc.isHardware && enc.verified) {
+      add(PASS, 'H.264 Encoder', `${enc.name} (Apple VideoToolbox Hardware Accelerated — Runtime Verified)`);
+    } else if (enc.isHardware) {
       add(PASS, 'H.264 Encoder', `${enc.name} (Apple VideoToolbox Hardware Accelerated)`);
+    } else if (enc.hardwareUnavailableReason) {
+      add(WARN, 'H.264 Encoder', `libx264 software fallback (VideoToolbox unverified: ${enc.hardwareUnavailableReason})`);
     } else {
       add(PASS, 'H.264 Encoder', `${enc.name} (software libx264 zerolatency)`);
     }

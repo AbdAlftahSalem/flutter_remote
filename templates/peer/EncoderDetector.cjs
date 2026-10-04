@@ -1,21 +1,98 @@
-// flutter-remote-template-version: 1
+// flutter-remote-template-version: 2
 /**
  * Flutter Remote H.264 Encoder Capability Detector (CommonJS)
  *
  * Probes runtime environment (macOS ARM64 vs Linux vs Windows) using FFmpeg CLI
  * to discover whether Apple VideoToolbox hardware acceleration is available.
  *
+ * CRITICAL RULE: VideoToolbox is not marked AVAILABLE merely because it is listed
+ * in `ffmpeg -encoders`. A real test frame encode probe is executed and verified.
+ *
  * Selection order:
- *   1. Preferred: h264_videotoolbox (hardware Apple Silicon / Intel macOS)
+ *   1. Preferred: h264_videotoolbox (hardware Apple Silicon / Intel macOS, verified at runtime)
  *   2. Fallback:  libx264 (software ultrafast zerolatency)
  */
 
-const { execFile } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
 
 let cachedEncoder = null;
 let probePromise = null;
 
-function detectH264Encoder(ffmpegPath = 'ffmpeg', { timeoutMs = 3000 } = {}) {
+function verifyEncoderRealRuntime(ffmpegPath = 'ffmpeg', encoderName = 'h264_videotoolbox', { timeoutMs = 3000 } = {}) {
+  return new Promise((resolve) => {
+    let timer = null;
+    let proc = null;
+    let resolved = false;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      if (proc && !proc.killed) {
+        try { proc.kill('SIGKILL'); } catch {}
+      }
+    };
+
+    const done = (result) => {
+      if (resolved) return;
+      resolved = true;
+      cleanup();
+      resolve(result);
+    };
+
+    timer = setTimeout(() => {
+      done({ ok: false, reason: `Verification probe timed out after ${timeoutMs}ms` });
+    }, timeoutMs);
+
+    try {
+      const args = [
+        '-y',
+        '-f', 'lavfi',
+        '-i', 'testsrc=size=64x64:rate=30',
+        '-frames:v', '1',
+        '-pix_fmt', 'yuv420p',
+        '-c:v', encoderName,
+        '-f', 'h264',
+        'pipe:1',
+      ];
+      proc = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdoutChunks = [];
+      let stderr = '';
+
+      proc.stdout.on('data', (d) => stdoutChunks.push(d));
+      proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+      proc.on('error', (err) => {
+        done({ ok: false, reason: err.message });
+      });
+
+      proc.on('close', (code) => {
+        if (code !== 0) {
+          const lines = stderr.trim().split('\n').filter(Boolean);
+          const reason = lines[lines.length - 1] || `Exit code ${code}`;
+          done({ ok: false, reason });
+          return;
+        }
+
+        const out = Buffer.concat(stdoutChunks);
+        if (out.length === 0) {
+          done({ ok: false, reason: 'Encoder exited 0 but produced 0 output bytes' });
+          return;
+        }
+
+        const hasStartCode = out.includes(Buffer.from([0, 0, 0, 1])) || out.includes(Buffer.from([0, 0, 1]));
+        if (!hasStartCode) {
+          done({ ok: false, reason: 'Output missing valid H.264 Annex-B start codes' });
+          return;
+        }
+
+        done({ ok: true, bytes: out.length });
+      });
+    } catch (err) {
+      done({ ok: false, reason: err.message });
+    }
+  });
+}
+
+function detectH264Encoder(ffmpegPath = 'ffmpeg', { timeoutMs = 3000, verifyHardware = true } = {}) {
   if (cachedEncoder) {
     return Promise.resolve(cachedEncoder);
   }
@@ -24,58 +101,91 @@ function detectH264Encoder(ffmpegPath = 'ffmpeg', { timeoutMs = 3000 } = {}) {
     return probePromise;
   }
 
-  probePromise = new Promise((resolve) => {
+  probePromise = (async () => {
     try {
-      execFile(ffmpegPath, ['-encoders'], { timeout: timeoutMs }, (err, stdout) => {
-        probePromise = null;
-        if (err || !stdout) {
-          console.warn('[encoder] probe failed, falling back to libx264:', err ? err.message : 'no stdout');
-          cachedEncoder = {
-            name: 'libx264',
-            isHardware: false,
-            codec: 'H264',
-            description: 'Software libx264 fallback',
-          };
-          resolve(cachedEncoder);
-          return;
-        }
+      const stdout = await new Promise((resolve) => {
+        execFile(ffmpegPath, ['-encoders'], { timeout: timeoutMs }, (err, out) => {
+          if (err || !out) resolve(null);
+          else resolve(out);
+        });
+      });
 
-        const lines = stdout.split('\n');
-        const hasVideoToolbox = lines.some(
-          (line) => line.includes('h264_videotoolbox') && /^\s*V/i.test(line)
-        );
+      if (!stdout) {
+        console.warn('[encoder] probe failed, falling back to libx264');
+        cachedEncoder = {
+          name: 'libx264',
+          isHardware: false,
+          codec: 'H264',
+          verified: false,
+          description: 'Software libx264 fallback',
+        };
+        return cachedEncoder;
+      }
 
-        if (hasVideoToolbox && process.platform === 'darwin') {
-          console.log('[encoder] detected hardware acceleration: h264_videotoolbox');
+      const lines = stdout.split('\n');
+      const hasVideoToolbox = lines.some(
+        (line) => line.includes('h264_videotoolbox') && /^\s*V/i.test(line)
+      );
+
+      if (hasVideoToolbox && process.platform === 'darwin') {
+        if (verifyHardware) {
+          const check = await verifyEncoderRealRuntime(ffmpegPath, 'h264_videotoolbox', { timeoutMs });
+          if (check.ok) {
+            console.log('[encoder] detected and verified hardware acceleration: h264_videotoolbox');
+            cachedEncoder = {
+              name: 'h264_videotoolbox',
+              isHardware: true,
+              codec: 'H264',
+              verified: true,
+              description: 'Apple VideoToolbox Hardware H.264 Encoder (Runtime Verified)',
+            };
+            return cachedEncoder;
+          } else {
+            console.warn(`[encoder] VideoToolbox hardware verification failed: ${check.reason}; falling back to libx264`);
+            cachedEncoder = {
+              name: 'libx264',
+              isHardware: false,
+              codec: 'H264',
+              verified: false,
+              hardwareUnavailableReason: check.reason,
+              description: `Software libx264 fallback (VideoToolbox unverified: ${check.reason})`,
+            };
+            return cachedEncoder;
+          }
+        } else {
           cachedEncoder = {
             name: 'h264_videotoolbox',
             isHardware: true,
             codec: 'H264',
-            description: 'Apple VideoToolbox Hardware H.264 Encoder',
+            verified: false,
+            description: 'Apple VideoToolbox Hardware H.264 Encoder (Unverified)',
           };
-        } else {
-          console.log('[encoder] using software encoder: libx264');
-          cachedEncoder = {
-            name: 'libx264',
-            isHardware: false,
-            codec: 'H264',
-            description: 'Software libx264 ultrafast/zerolatency',
-          };
+          return cachedEncoder;
         }
+      }
 
-        resolve(cachedEncoder);
-      });
-    } catch (err) {
-      probePromise = null;
+      console.log('[encoder] using software encoder: libx264');
       cachedEncoder = {
         name: 'libx264',
         isHardware: false,
         codec: 'H264',
+        verified: true,
+        description: 'Software libx264 ultrafast/zerolatency',
+      };
+      return cachedEncoder;
+    } catch (err) {
+      cachedEncoder = {
+        name: 'libx264',
+        isHardware: false,
+        codec: 'H264',
+        verified: false,
         description: 'Software libx264 fallback',
       };
-      resolve(cachedEncoder);
+      return cachedEncoder;
+    } finally {
+      probePromise = null;
     }
-  });
+  })();
 
   return probePromise;
 }
@@ -87,5 +197,6 @@ function resetEncoderDetectionCache() {
 
 module.exports = {
   detectH264Encoder,
+  verifyEncoderRealRuntime,
   resetEncoderDetectionCache,
 };
