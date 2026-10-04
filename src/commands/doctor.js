@@ -1,8 +1,22 @@
+/**
+ * Flutter Remote Doctor Command
+ *
+ * Verifies system prerequisites:
+ *   - Node, Git, GitHub CLI & Auth
+ *   - Flutter & iOS project integrity
+ *   - Xcode & iOS Simulator environment
+ *   - serve-sim availability
+ *   - FFmpeg & H.264 Encoder (VideoToolbox / libx264 detection)
+ *   - WebRTC (node-datachannel) & TURN configuration
+ *   - Cloudflare tunnel
+ */
+
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { sh, has } from '../lib/proc.js';
 import { assertFlutterProject, getFlutterAppName, getFlutterBundleId } from '../lib/flutter-project.js';
 import { WORKFLOW_PATH, GATE_PATH } from './init.js';
+import { detectH264Encoder } from '../media/EncoderDetector.js';
 import { green, red, yellow, dim, bold } from '../lib/ui.js';
 
 const PASS = green('✓');
@@ -33,10 +47,10 @@ export async function doctor(cwd) {
   // 3. GitHub CLI check
   if (!has('gh')) {
     add(FAIL, 'GitHub CLI installed', 'Install: https://cli.github.com or winget install GitHub.cli');
-  } else if (!sh('gh', ['auth', 'status']).ok) {
+  } else if (!sh('gh', ['auth', 'status'], { timeout: 4000 }).ok) {
     add(FAIL, 'GitHub authenticated', 'Run: gh auth login');
   } else {
-    const user = sh('gh', ['api', 'user', '-q', '.login']);
+    const user = sh('gh', ['api', 'user', '-q', '.login'], { timeout: 4000 });
     add(PASS, 'GitHub authenticated', user.out ? `@${user.out}` : 'logged in');
   }
 
@@ -52,7 +66,7 @@ export async function doctor(cwd) {
 
   // 6. GitHub remote
   const repo = sh('gh', ['repo', 'view', '--json', 'nameWithOwner,visibility', '-q',
-    '.nameWithOwner + " (" + .visibility + ")"'], { cwd });
+    '.nameWithOwner + " (" + .visibility + ")"'], { cwd, timeout: 4000 });
   if (repo.ok && repo.out) {
     const isPublic = /PUBLIC/i.test(repo.out);
     add(isPublic ? PASS : WARN, 'GitHub remote', isPublic ? repo.out : `${repo.out} — private repos bill macOS minutes at 10×`);
@@ -60,12 +74,53 @@ export async function doctor(cwd) {
     add(WARN, 'GitHub remote', 'none yet — flutter-remote up will create one');
   }
 
-  // 7. WebRTC & TURN checks
+  // 7. Xcode & Simulator environment
+  if (process.platform === 'darwin') {
+    if (has('xcodebuild')) {
+      const xcVer = sh('xcodebuild', ['-version']);
+      add(PASS, 'Xcode', xcVer.out ? xcVer.out.split('\n')[0] : 'installed');
+    } else {
+      add(FAIL, 'Xcode', 'not installed (required on local macOS)');
+    }
+    if (has('xcrun')) {
+      const simCheck = sh('xcrun', ['simctl', 'help']);
+      add(simCheck.ok ? PASS : FAIL, 'iOS Simulator (simctl)', simCheck.ok ? 'available' : 'not found');
+    }
+  } else {
+    add(PASS, 'Xcode & iOS Simulator', 'managed by remote macOS GitHub Actions runner');
+  }
+
+  // 8. serve-sim
+  if (has('serve-sim')) {
+    add(PASS, 'serve-sim', 'installed globally');
+  } else {
+    add(PASS, 'serve-sim', 'cached & executed via npx on macOS runner');
+  }
+
+  // 9. FFmpeg & H.264 Encoder capability detection
+  let ffmpegBin = 'ffmpeg';
   try {
-    const ndc = await import('node-datachannel');
+    const ffmpegStatic = await import('ffmpeg-static');
+    ffmpegBin = ffmpegStatic.default || ffmpegStatic || 'ffmpeg';
+  } catch {}
+
+  try {
+    const enc = await detectH264Encoder(ffmpegBin);
+    if (enc.isHardware) {
+      add(PASS, 'H.264 Encoder', `${enc.name} (Apple VideoToolbox Hardware Accelerated)`);
+    } else {
+      add(PASS, 'H.264 Encoder', `${enc.name} (software libx264 zerolatency)`);
+    }
+  } catch (err) {
+    add(WARN, 'H.264 Encoder', 'libx264 fallback');
+  }
+
+  // 10. WebRTC & TURN checks
+  try {
+    await import('node-datachannel');
     add(PASS, 'WebRTC (node-datachannel)', 'available');
   } catch (err) {
-    add(WARN, 'WebRTC (node-datachannel)', 'will be installed automatically on macOS runner');
+    add(WARN, 'WebRTC (node-datachannel)', 'installed automatically on macOS runner');
   }
 
   const turnConfigured = Boolean(process.env.FLUTTER_REMOTE_TURN_KEY_ID && process.env.FLUTTER_REMOTE_TURN_KEY_TOKEN);
@@ -75,7 +130,14 @@ export async function doctor(cwd) {
     add(WARN, 'TURN relay credentials', 'unconfigured (using free Cloudflare STUN fallback, run: flutter-remote turn)');
   }
 
-  // 8. Optional local Flutter info
+  // 11. Cloudflare tunnel check
+  if (has('cloudflared') || existsSync(join(cwd, 'cloudflared'))) {
+    add(PASS, 'Cloudflare tunnel (cloudflared)', 'available');
+  } else {
+    add(PASS, 'Cloudflare tunnel (cloudflared)', 'cached & downloaded on macOS runner');
+  }
+
+  // 12. Local Flutter info (optional)
   if (has('flutter')) {
     const flVer = sh('flutter', ['--version']);
     const firstLine = flVer.out.split('\n')[0].replace('•', '-');
@@ -87,4 +149,3 @@ export async function doctor(cwd) {
   console.log(checks.join('\n'));
   console.log('');
 }
-
