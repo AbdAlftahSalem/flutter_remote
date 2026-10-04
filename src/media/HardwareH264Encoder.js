@@ -18,12 +18,15 @@ export class HardwareH264Encoder extends BaseVideoEncoder {
   }
 
   buildFfmpegArgs() {
+    const scaleFilter = (this.width && this.height && (this.width !== 720 || this.height !== 1280))
+      ? `scale=${this.width}:${this.height}`
+      : 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
     return [
       '-loglevel', 'error',
       '-f', 'image2pipe',
       '-vcodec', 'mjpeg',
       '-i', 'pipe:0',
-      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+      '-vf', scaleFilter,
       '-c:v', 'h264_videotoolbox',
       '-realtime', '1',
       '-pix_fmt', 'yuv420p',

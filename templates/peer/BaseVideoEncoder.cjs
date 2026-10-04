@@ -22,6 +22,11 @@ class BaseVideoEncoder extends EventEmitter {
     this.width = options.width || 720;
     this.height = options.height || 1280;
     this.ffmpegPath = options.ffmpegPath || 'ffmpeg';
+    this.supervisor = options.supervisor || null;
+
+    this._crashRecoveryAttempts = 0;
+    this._isClosing = false;
+    this._autoRecoverCrashes = options.autoRecoverCrashes !== false;
 
     this.rtpPacketizer = new RtpPacketizer({
       payloadType: this.payloadType,
@@ -147,27 +152,74 @@ class BaseVideoEncoder extends EventEmitter {
     return this.packetizeAccessUnit(units, fps);
   }
 
-  setBitrate(bitrateKbps) {
-    const num = Number(bitrateKbps);
-    if (num > 0 && num !== this.bitrateKbps) {
-      this.bitrateKbps = num;
-      this.emit('quality_changed', { bitrateKbps: this.bitrateKbps, fps: this.fps });
+  reconfigure(options = {}) {
+    let changed = false;
+    const oldConfig = {
+      width: this.width,
+      height: this.height,
+      fps: this.fps,
+      bitrateKbps: this.bitrateKbps,
+    };
+
+    if (options.bitrateKbps && Number(options.bitrateKbps) > 0 && options.bitrateKbps !== this.bitrateKbps) {
+      this.bitrateKbps = Number(options.bitrateKbps);
+      changed = true;
     }
+    if (options.fps && Number(options.fps) > 0 && options.fps !== this.fps) {
+      this.fps = Number(options.fps);
+      changed = true;
+    }
+    if (options.width && options.height && Number(options.width) > 0 && Number(options.height) > 0) {
+      if (options.width !== this.width || options.height !== this.height) {
+        this.width = Number(options.width);
+        this.height = Number(options.height);
+        changed = true;
+      }
+    }
+
+    if (!changed) return false;
+
+    this.emit('quality_changed', {
+      bitrateKbps: this.bitrateKbps,
+      fps: this.fps,
+      width: this.width,
+      height: this.height,
+      previous: oldConfig,
+    });
+
+    // If active process is running, execute controlled restart with fresh parameters
+    if (this._isEncoding && this.ffmpegProc) {
+      try {
+        const nextProc = this._spawnEncoderProcess();
+        // Invalidate SPS/PPS cache on reconfigure because stream parameters changed
+        this.keyframeController.cachedSps = null;
+        this.keyframeController.cachedPps = null;
+        this.keyframeController.cachedKeyframe = null;
+
+        this._promoteReplacementEncoder(nextProc);
+
+        // Request fresh keyframe on the new encoder
+        this.requestKeyframe('reconfigure');
+        return true;
+      } catch (err) {
+        this.emit('encoder_error', err);
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  setBitrate(bitrateKbps) {
+    return this.reconfigure({ bitrateKbps });
   }
 
   setFramerate(fps) {
-    const num = Number(fps);
-    if (num > 0 && num !== this.fps) {
-      this.fps = num;
-      this.emit('quality_changed', { bitrateKbps: this.bitrateKbps, fps: this.fps });
-    }
+    return this.reconfigure({ fps });
   }
 
   setResolution(width, height) {
-    if (width > 0 && height > 0) {
-      this.width = width;
-      this.height = height;
-    }
+    return this.reconfigure({ width, height });
   }
 
   requestKeyframe(reason = 'manual') {
@@ -196,7 +248,7 @@ class BaseVideoEncoder extends EventEmitter {
   }
 
   _performMainEncoderIdrRecovery() {
-    return this.requestKeyframe();
+    return this.requestKeyframe('recovery');
   }
 
   _promoteReplacementEncoder(nextProc) {
@@ -204,11 +256,19 @@ class BaseVideoEncoder extends EventEmitter {
     this.ffmpegProc = nextProc;
     this._setupStdin(nextProc.stdin);
 
+    if (this.supervisor && nextProc.pid) {
+      this.supervisor.trackProcess(nextProc.pid, 'ffmpeg-' + this.encoderName, null, nextProc);
+    }
+
     if (oldProc) {
-      try {
-        if (oldProc.stdin) oldProc.stdin.end();
-        oldProc.kill('SIGTERM');
-      } catch {}
+      if (this.supervisor && oldProc.pid) {
+        this.supervisor.terminateProcess(oldProc.pid, { timeoutMs: 1500 }).catch(() => {});
+      } else {
+        try {
+          if (oldProc.stdin) oldProc.stdin.end();
+          oldProc.kill('SIGTERM');
+        } catch {}
+      }
     }
 
     nextProc.stdout.on('data', (chunk) => {
@@ -216,14 +276,48 @@ class BaseVideoEncoder extends EventEmitter {
       this._handleEncodedData(chunk);
     });
 
-    nextProc.on('close', () => {
+    nextProc.on('close', (code, signal) => {
       if (this.ffmpegProc !== nextProc) return;
       this._isEncoding = false;
       this.ffmpegProc = null;
       this._flushPending();
+
+      const wasUnexpected = code !== 0 && code !== null && !this._isClosing;
+      if (wasUnexpected && this._autoRecoverCrashes) {
+        this._handleEncoderCrash(code, signal);
+      } else {
+        this.emit('encoder_closed', code);
+      }
     });
 
     this._flushNextPendingInput();
+  }
+
+  _handleEncoderCrash(code, signal) {
+    this._crashRecoveryAttempts = (this._crashRecoveryAttempts || 0) + 1;
+    this.metrics.encoderCrashes = (this.metrics.encoderCrashes || 0) + 1;
+    const maxRetries = 5;
+    if (this._crashRecoveryAttempts > maxRetries) {
+      this.emit('encoder_fatal', new Error(`FFmpeg crashed repeatedly (${this._crashRecoveryAttempts} times). Max retries exceeded.`));
+      return;
+    }
+
+    const backoffDelay = Math.min(8000, 1000 * Math.pow(2, this._crashRecoveryAttempts - 1));
+    this.emit('encoder_crashed', { code, signal, attempt: this._crashRecoveryAttempts, delayMs: backoffDelay });
+
+    setTimeout(() => {
+      if (this._isClosing) return;
+      try {
+        this.start();
+        this.keyframeController.cachedSps = null;
+        this.keyframeController.cachedPps = null;
+        this.keyframeController.cachedKeyframe = null;
+        this.requestKeyframe('crash_recovery');
+        this.emit('encoder_recovered', { attempt: this._crashRecoveryAttempts });
+      } catch (err) {
+        this.emit('encoder_error', err);
+      }
+    }, backoffDelay);
   }
 
   _syncMetrics() {
@@ -241,12 +335,17 @@ class BaseVideoEncoder extends EventEmitter {
 
   start() {
     if (this.ffmpegProc) return;
+    this._isClosing = false;
 
     try {
       const proc = this._spawnEncoderProcess();
       this.ffmpegProc = proc;
       this._isEncoding = true;
       this._waitingForDrain = false;
+
+      if (this.supervisor && proc.pid) {
+        this.supervisor.trackProcess(proc.pid, 'ffmpeg-' + this.encoderName, null, proc);
+      }
 
       proc.stdout.on('data', (chunk) => {
         if (this.ffmpegProc !== proc) return;
@@ -279,12 +378,18 @@ class BaseVideoEncoder extends EventEmitter {
         this.close();
       });
 
-      proc.on('close', (code) => {
+      proc.on('close', (code, signal) => {
         if (this.ffmpegProc !== proc) return;
         this._isEncoding = false;
         this.ffmpegProc = null;
         this._flushPending();
-        this.emit('encoder_closed', code);
+
+        const wasUnexpected = code !== 0 && code !== null && !this._isClosing;
+        if (wasUnexpected && this._autoRecoverCrashes) {
+          this._handleEncoderCrash(code, signal);
+        } else {
+          this.emit('encoder_closed', code);
+        }
       });
 
       this._startDiagnostics();
@@ -617,6 +722,7 @@ class BaseVideoEncoder extends EventEmitter {
   }
 
   close() {
+    this._isClosing = true;
     this._isEncoding = false;
     if (this._flushTimer) {
       clearTimeout(this._flushTimer);
@@ -627,11 +733,16 @@ class BaseVideoEncoder extends EventEmitter {
       this._diagInterval = null;
     }
     if (this.ffmpegProc) {
-      try {
-        if (this.ffmpegProc.stdin) this.ffmpegProc.stdin.end();
-        this.ffmpegProc.kill('SIGTERM');
-      } catch {}
+      const proc = this.ffmpegProc;
       this.ffmpegProc = null;
+      if (this.supervisor && proc.pid) {
+        this.supervisor.terminateProcess(proc.pid, { timeoutMs: 1500 }).catch(() => {});
+      } else {
+        try {
+          if (proc.stdin) proc.stdin.end();
+          proc.kill('SIGTERM');
+        } catch {}
+      }
     }
     this._streamBuffer = Buffer.alloc(0);
     this._pendingAU = [];

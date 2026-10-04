@@ -17,12 +17,15 @@ export class SoftwareH264Encoder extends BaseVideoEncoder {
   }
 
   buildFfmpegArgs() {
+    const scaleFilter = (this.width && this.height && (this.width !== 720 || this.height !== 1280))
+      ? `scale=${this.width}:${this.height}`
+      : 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
     return [
       '-loglevel', 'error',
       '-f', 'image2pipe',
       '-vcodec', 'mjpeg',
       '-i', 'pipe:0',
-      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+      '-vf', scaleFilter,
       '-c:v', 'libx264',
       '-preset', 'ultrafast',
       '-tune', 'zerolatency',
