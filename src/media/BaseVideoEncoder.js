@@ -523,9 +523,11 @@ export class BaseVideoEncoder extends EventEmitter {
 
     if (lastStartCode) this._checkTrailingStartCode(lastStartCode);
 
-    if ((this._auHasVcl || this._streamBuffer.length > 0) && this._isEncoding) {
-      this._flushTimer = setTimeout(() => this._flushPending(), 10);
-    }
+    // Do not time-flush the trailing NAL. FFmpeg may split a single H.264 NAL
+    // across stdout chunks; treating it as complete after an arbitrary 10 ms
+    // delay sends malformed RTP to the browser, which appears as recurring
+    // black video. AUD/SPS/PPS and the next VCL NAL delimit access units
+    // without adding more than one frame of latency.
   }
 
   feedStream(chunk) {
