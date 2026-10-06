@@ -208,7 +208,7 @@ test('Phase 21: InputController tracks lastInteractionTime', () => {
   assert.ok(controller.getLastInteractionTime() > 0, 'Interaction time must be recorded on pointer event');
 });
 
-test('Phase 21: FlutterRemoteClient coalesces keyframe requests within 1000ms', () => {
+test('Phase 21: FlutterRemoteClient coalesces keyframe requests within the stability cooldown', () => {
   const client = new FlutterRemoteClient({ autoConnect: false });
   const requests = [];
 
@@ -224,13 +224,14 @@ test('Phase 21: FlutterRemoteClient coalesces keyframe requests within 1000ms', 
   assert.equal(r1, true);
   assert.equal(requests.length, 1);
 
-  // Immediate subsequent request within 1000ms is coalesced/ignored
+  // Immediate subsequent request is coalesced/ignored. A long cooldown keeps
+  // a browser-side false stall signal from repeatedly disturbing playback.
   const r2 = client.requestKeyframe('swipe_stall_2');
   assert.equal(r2, false);
   assert.equal(requests.length, 1);
 
   // Fast-forward lastKeyframeRequestTime
-  client._lastKeyframeRequestTime = Date.now() - 1100;
+  client._lastKeyframeRequestTime = Date.now() - 10100;
   const r3 = client.requestKeyframe('swipe_stall_3');
   assert.equal(r3, true);
   assert.equal(requests.length, 2);

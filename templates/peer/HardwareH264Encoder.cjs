@@ -33,6 +33,7 @@ class HardwareH264Encoder extends BaseVideoEncoder {
         '-g', String(this.fps),
         '-keyint_min', '1',
         '-forced-idr', '1',
+        '-x264-params', 'repeat-headers=1:scenecut=0',
         '-aud', '1',
         '-b:v', `${this.bitrateKbps}k`,
         '-maxrate', `${this.bitrateKbps}k`,

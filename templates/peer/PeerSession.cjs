@@ -20,6 +20,10 @@ class PeerSession {
     this.activeVideoTracks = options.activeVideoTracks;
     this.transportMode = options.transportMode || 'webrtc';
     this.qualityController = options.qualityController || null;
+    // Reconfiguring FFmpeg changes the H.264 parameter sets and causes a
+    // visible decode interruption. Keep it opt-in until it is driven by
+    // measured, end-to-end media health rather than a browser debug sample.
+    this.adaptiveQualityEnabled = options.adaptiveQualityEnabled === true;
 
     this.peer = null;
     this.videoTrack = null;
@@ -133,15 +137,14 @@ class PeerSession {
               return;
             }
             if (cmd.type === 'adaptation') {
-              if (this.qualityController && typeof this.qualityController.evaluateTelemetry === 'function') {
+              if (this.adaptiveQualityEnabled && this.qualityController && typeof this.qualityController.evaluateTelemetry === 'function') {
                 this.qualityController.evaluateTelemetry(cmd);
               }
               return;
             }
             if (cmd.type === 'resize') {
-              if (cmd.width && cmd.height && typeof this.videoEncoder.setResolution === 'function') {
-                this.videoEncoder.setResolution(cmd.width, cmd.height);
-              }
+              // Browser layout is not the simulator's capture resolution.
+              // Resizing the browser must not restart the encoder.
               return;
             }
           } catch {}

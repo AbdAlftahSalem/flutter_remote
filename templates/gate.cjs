@@ -241,6 +241,7 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       });
     }
     attachStream(s) {
+      if (this.video.srcObject === s) return;
       this.connectTime = Date.now();
       this.firstFrameTime = 0;
       this.lastFramePresentedTime = 0;
@@ -644,7 +645,10 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
 
     requestKeyframe(reason = 'manual') {
       const now = Date.now();
-      if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 1000) return false;
+      // A recovery request only re-sends a cached IDR. Keep the cooldown long
+      // enough that an intermittent frame callback cannot create a recovery
+      // storm over an otherwise playable stream.
+      if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 10000) return false;
       this._lastKeyframeRequestTime = now;
       console.log('[flutter-remote] Requesting keyframe recovery (reason: ' + reason + ')');
       const dc = this.dataChannels.control;
@@ -681,7 +685,7 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       const firstFrameTime = this.videoRenderer.firstFrameTime;
 
       if (!firstFrameTime) {
-        if (now - this.videoRenderer.connectTime > 1500) {
+        if (now - this.videoRenderer.connectTime > 8000) {
           this.requestKeyframe('initial_track_timeout');
         }
         return;
@@ -690,14 +694,14 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       if (this.inputController) {
         const lastInteraction = this.inputController.getLastInteractionTime();
         if (lastInteraction > 0 && (now - lastInteraction < 2000)) {
-          if (now - lastFrameTime > 1000) {
+          if (now - lastFrameTime > 3000) {
             this.requestKeyframe('interaction_stall');
             return;
           }
         }
       }
 
-      if (lastFrameTime > 0 && (now - lastFrameTime > 2000)) {
+      if (lastFrameTime > 0 && (now - lastFrameTime > 6000)) {
         this.requestKeyframe('video_freeze');
       }
     }

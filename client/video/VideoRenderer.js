@@ -56,6 +56,9 @@ export class VideoRenderer {
   }
 
   attachStream(stream) {
+    if (this.video.srcObject === stream) {
+      return;
+    }
     this.connectTime = Date.now();
     this.firstFrameTime = 0;
     this.lastFramePresentedTime = 0;

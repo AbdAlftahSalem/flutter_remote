@@ -43,6 +43,7 @@ const PREVIEW_PORT = Number(process.env.FLUTTER_REMOTE_TARGET_PORT || process.en
 const STREAM_PATH = process.env.FLUTTER_REMOTE_STREAM_PATH || '/stream.mjpeg?raw=1';
 const SIGNAL_PORT = Number(process.env.FLUTTER_REMOTE_WEBRTC_SIGNAL_PORT || 3201);
 const TRANSPORT_MODE = process.env.FLUTTER_REMOTE_TRANSPORT || 'webrtc';
+const ADAPTIVE_QUALITY_ENABLED = process.env.FLUTTER_REMOTE_ADAPTIVE_QUALITY === 'true';
 const TARGET_HOST = '127.0.0.1';
 
 process.on('uncaughtException', (err) => {
@@ -159,6 +160,7 @@ if (WebSocketServer) {
       ndc: { PeerConnection, Video },
       videoEncoder,
       qualityController,
+      adaptiveQualityEnabled: ADAPTIVE_QUALITY_ENABLED,
       serveSimConsumer,
       activeVideoTracks,
       transportMode: TRANSPORT_MODE,

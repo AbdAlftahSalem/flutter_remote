@@ -341,7 +341,7 @@ export class FlutterRemoteClient {
 
   requestKeyframe(reason = 'manual') {
     const now = Date.now();
-    if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 1000) {
+    if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 10000) {
       return false;
     }
     this._lastKeyframeRequestTime = now;
@@ -377,7 +377,7 @@ export class FlutterRemoteClient {
 
     // 1. Initial track timeout: track attached but first frame never presented after 1.5s
     if (!firstFrameTime) {
-      if (now - this.videoRenderer.connectTime > 1500) {
+      if (now - this.videoRenderer.connectTime > 8000) {
         this.requestKeyframe('initial_track_timeout');
       }
       return;
@@ -387,7 +387,7 @@ export class FlutterRemoteClient {
     if (this.inputController) {
       const lastInteraction = this.inputController.getLastInteractionTime();
       if (lastInteraction > 0 && (now - lastInteraction < 2000)) {
-        if (now - lastFrameTime > 1000) {
+        if (now - lastFrameTime > 3000) {
           this.requestKeyframe('interaction_stall');
           return;
         }
@@ -395,7 +395,7 @@ export class FlutterRemoteClient {
     }
 
     // 3. Playback freeze: stream was active but presentation stopped > 2000ms
-    if (lastFrameTime > 0 && (now - lastFrameTime > 2000)) {
+    if (lastFrameTime > 0 && (now - lastFrameTime > 6000)) {
       this.requestKeyframe('video_freeze');
     }
   }

@@ -31,6 +31,10 @@ class SoftwareH264Encoder extends BaseVideoEncoder {
       '-g', String(this.fps),
       '-keyint_min', '1',
       '-forced-idr', '1',
+      // Every IDR must be independently decodable after loss or a late join.
+      // Without repeated parameter sets, a browser can remain black until an
+      // encoder restart happens to emit a new SPS/PPS pair.
+      '-x264-params', 'repeat-headers=1:scenecut=0',
       '-aud', '1',
       '-b:v', `${this.bitrateKbps}k`,
       '-maxrate', `${this.bitrateKbps}k`,
