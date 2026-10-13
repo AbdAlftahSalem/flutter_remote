@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 6
+﻿// flutter-remote-template-version: 6
 /**
  * Flutter Remote WebRTC V3 ServeSimConsumer (CommonJS)
  *
@@ -24,6 +24,7 @@ class ServeSimConsumer {
     this.jpegFrameCount = 0;
     this.frameWarningTimer = null;
     this.reconnectTimer = null;
+    this._streamStuckTimer = null;
     this._closed = false;
 
     // WebSocket bridge state
@@ -33,7 +34,23 @@ class ServeSimConsumer {
   }
 
   ensureLocalStream() {
-    if (this.localStreamReq || (this.streamWsClients.size === 0 && this.activeVideoTracks.size === 0)) {
+    if (this.streamWsClients.size === 0 && this.activeVideoTracks.size === 0) {
+      return;
+    }
+    if (this.localStreamReq) {
+      // Guard against stuck requests: if connected but 0 frames after 4s, destroy and restart.
+      if (!this._streamStuckTimer && this.jpegFrameCount === 0) {
+        this._streamStuckTimer = setTimeout(() => {
+          this._streamStuckTimer = null;
+          if (this.jpegFrameCount === 0 && this.localStreamReq) {
+            console.warn('[webrtc-peer] serve-sim stream stuck — 0 frames in 4s, restarting connection');
+            const req = this.localStreamReq;
+            this.localStreamReq = null;
+            try { req.destroy(); } catch {}
+            this.ensureLocalStream();
+          }
+        }, 4000);
+      }
       return;
     }
     this._closed = false;
@@ -96,6 +113,11 @@ class ServeSimConsumer {
 
             const jpeg = buffer.subarray(soi, eoi + 2);
             this.jpegFrameCount++;
+
+            if (this._streamStuckTimer) {
+              clearTimeout(this._streamStuckTimer);
+              this._streamStuckTimer = null;
+            }
 
             if (this.jpegFrameCount <= 3 || this.jpegFrameCount % 60 === 0) {
               console.log(`[video] JPEG frames=${this.jpegFrameCount} size=${jpeg.length}`);
@@ -226,6 +248,10 @@ class ServeSimConsumer {
 
   close() {
     this._closed = true;
+    if (this._streamStuckTimer) {
+      clearTimeout(this._streamStuckTimer);
+      this._streamStuckTimer = null;
+    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

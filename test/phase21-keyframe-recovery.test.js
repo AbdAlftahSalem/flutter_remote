@@ -85,6 +85,8 @@ test('Phase 21: MediaVideoEncoder (src/media) also emits cached and fresh keyfra
 test('Phase 21: PeerSession forwards request_keyframe control message to videoEncoder with reason', () => {
   let requestedReason = null;
   const mockEncoder = {
+    hasKeyframe: () => false,
+    getKeyframePackets: () => [],
     requestKeyframe: (reason) => {
       requestedReason = reason;
     },
@@ -96,10 +98,12 @@ test('Phase 21: PeerSession forwards request_keyframe control message to videoEn
   };
 
   let registeredChannelHandler = null;
+  let connectionStateHandler = null;
   const mockPeer = {
     addTrack: () => {},
     onLocalDescription: () => {},
     onLocalCandidate: () => {},
+    onConnectionStateChange: (cb) => { connectionStateHandler = cb; },
     onDataChannel: (cb) => {
       registeredChannelHandler = cb;
     },
@@ -147,6 +151,12 @@ test('Phase 21: PeerSession forwards request_keyframe control message to videoEn
   })));
 
   assert.equal(requestedReason, 'client_freeze_watchdog', 'PeerSession must pass reason to videoEncoder.requestKeyframe');
+
+  // Verify Fix B1: ICE-gated keyframe fires when peer reaches 'connected'
+  assert.ok(typeof connectionStateHandler === 'function', 'PeerSession must register onConnectionStateChange handler');
+  requestedReason = null;
+  connectionStateHandler('connected');
+  assert.equal(requestedReason, 'peer_connected', 'PeerSession must request keyframe when ICE state reaches connected');
 });
 
 test('Phase 21: DataChannelManager formats and sends request_keyframe over control channel', () => {

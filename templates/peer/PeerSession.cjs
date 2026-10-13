@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 5
+﻿// flutter-remote-template-version: 5
 /**
  * Flutter Remote WebRTC V3 PeerSession (CommonJS)
  *
@@ -67,13 +67,25 @@ class PeerSession {
         this.activeVideoTracks.add(this.videoTrack);
         console.log('[webrtc-peer] video track ready');
 
-        // Send cached keyframe immediately to new subscriber
-        if (this.videoEncoder.hasKeyframe()) {
-          const keyPackets = this.videoEncoder.getKeyframePackets();
-          for (const kp of keyPackets) {
-            try { this.videoTrack.sendMessageBinary(kp); } catch {}
+        // Delay keyframe send until ICE+DTLS are fully established.
+        // Sending RTP before 'connected' causes silent drops and black screen.
+        this._keyframeSentOnConnect = false;
+        if (typeof this.peer.onConnectionStateChange === 'function') {
+        this.peer.onConnectionStateChange((state) => {
+          if ((state === 'connected' || state === 'completed') && !this._keyframeSentOnConnect) {
+            this._keyframeSentOnConnect = true;
+            console.log('[webrtc-peer] ICE connected — sending cached keyframe to new peer');
+            if (this.videoEncoder.hasKeyframe()) {
+              const keyPackets = this.videoEncoder.getKeyframePackets();
+              for (const kp of keyPackets) {
+                try { this.videoTrack.sendMessageBinary(kp); } catch {}
+              }
+            }
+            // Also trigger a fresh IDR so any missed frames are recovered immediately
+            this.videoEncoder.requestKeyframe('peer_connected');
           }
-        }
+        });
+        } // end onConnectionStateChange guard
 
         this.serveSimConsumer.ensureLocalStream();
       } catch (err) {

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Flutter Remote WebRTC V3 Browser Client & Modular Direct Engine
  *
  * ZERO MONKEY-PATCHING: Communicates directly over WebRTC Media and DataChannels.
@@ -77,6 +77,7 @@ export class FlutterRemoteClient {
     this._videoFrameCheckTimer = null;
     this._lastKeyframeRequestTime = 0;
     this._stallWatchdogTimer = null;
+    this._heartbeatTimer = null;
 
     // Video Module
     this.videoRenderer = container
@@ -224,6 +225,7 @@ export class FlutterRemoteClient {
     this.connectionState.set('CONNECTED');
     this.reconnectController.reset();
     this._startWatchdog();
+    this._startHeartbeat();
 
     if (this._videoFrameCheckTimer) {
       clearTimeout(this._videoFrameCheckTimer);
@@ -246,6 +248,14 @@ export class FlutterRemoteClient {
       this._attemptIceRestart();
     } else if (iceState === 'failed') {
       this._scheduleReconnect();
+    } else if (iceState === 'connected' || iceState === 'completed') {
+      // ICE path confirmed; wait 500ms for DTLS to settle then request a keyframe
+      // so the browser gets its first video frame without waiting for the watchdog.
+      setTimeout(() => {
+        if (this.connectionState.state === 'CONNECTED') {
+          this.requestKeyframe('ice_connected');
+        }
+      }, 500);
     }
     this._updateDebug();
   }
@@ -341,7 +351,7 @@ export class FlutterRemoteClient {
 
   requestKeyframe(reason = 'manual') {
     const now = Date.now();
-    if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 10000) {
+    if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 3000) {
       return false;
     }
     this._lastKeyframeRequestTime = now;
@@ -366,6 +376,22 @@ export class FlutterRemoteClient {
     }
   }
 
+  _startHeartbeat() {
+    if (this._heartbeatTimer) return;
+    this._heartbeatTimer = setInterval(() => {
+      if (this.connectionState.state === 'CONNECTED') {
+        this.requestKeyframe('heartbeat');
+      }
+    }, 30_000);
+  }
+
+  _stopHeartbeat() {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+  }
+
   _checkVideoHealth() {
     if (this.connectionState.state !== 'CONNECTED' || !this.videoRenderer) {
       return;
@@ -377,7 +403,7 @@ export class FlutterRemoteClient {
 
     // 1. Initial track timeout: track attached but first frame never presented after 1.5s
     if (!firstFrameTime) {
-      if (now - this.videoRenderer.connectTime > 8000) {
+      if (now - this.videoRenderer.connectTime > 3000) {
         this.requestKeyframe('initial_track_timeout');
       }
       return;
@@ -387,7 +413,7 @@ export class FlutterRemoteClient {
     if (this.inputController) {
       const lastInteraction = this.inputController.getLastInteractionTime();
       if (lastInteraction > 0 && (now - lastInteraction < 2000)) {
-        if (now - lastFrameTime > 3000) {
+        if (now - lastFrameTime > 1500) {
           this.requestKeyframe('interaction_stall');
           return;
         }
@@ -395,7 +421,7 @@ export class FlutterRemoteClient {
     }
 
     // 3. Playback freeze: stream was active but presentation stopped > 2000ms
-    if (lastFrameTime > 0 && (now - lastFrameTime > 6000)) {
+    if (lastFrameTime > 0 && (now - lastFrameTime > 3000)) {
       this.requestKeyframe('video_freeze');
     }
   }
@@ -414,6 +440,7 @@ export class FlutterRemoteClient {
       this._videoFrameCheckTimer = null;
     }
     this._stopWatchdog();
+    this._stopHeartbeat();
     if (this.statsCollector) {
       this.statsCollector.stop();
     }
