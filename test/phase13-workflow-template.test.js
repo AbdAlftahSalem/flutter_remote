@@ -13,20 +13,20 @@ test('Phase 13: templates/flutter-remote.yml pinned dependencies and version 15'
   assert.ok(ymlContent.includes('FLUTTER_REMOTE_TRANSPORT'), 'Must pass FLUTTER_REMOTE_TRANSPORT env');
 });
 
-test('Phase 13: templates/gate.cjs version 11 and V2 client serving', () => {
+test('Phase 13: templates/gate.cjs version 12 and V2 client serving', () => {
   const gatePath = join(process.cwd(), 'templates', 'gate.cjs');
   const gateContent = readFileSync(gatePath, 'utf8');
 
-  assert.ok(gateContent.includes('flutter-remote-template-version: 11'), 'Gate template version must be 11');
+  assert.ok(gateContent.includes('flutter-remote-template-version: 12'), 'Gate template version must be 12');
   assert.ok(gateContent.includes('/__flutter-remote/client.js'), 'Must serve V2 client at /__flutter-remote/client.js');
   assert.ok(gateContent.includes('/readyz'), 'Must implement /readyz health check');
 });
 
-test('Phase 13: templates/webrtc-peer.cjs version 5 and Video track streaming', () => {
+test('Phase 13: templates/webrtc-peer.cjs version 6 and Video track streaming', () => {
   const peerPath = join(process.cwd(), 'templates', 'webrtc-peer.cjs');
   const peerContent = readFileSync(peerPath, 'utf8');
 
-  assert.ok(peerContent.includes('flutter-remote-template-version: 5'), 'Peer template version must be 5');
+  assert.ok(peerContent.includes('flutter-remote-template-version: 6'), 'Peer template version must be 6');
   assert.ok(peerContent.includes("new Video('video', 'SendOnly')"), 'Must configure Video SendOnly track');
   assert.ok(peerContent.includes('addH264Codec(98)'), 'Must configure H.264 codec');
   assert.ok(peerContent.includes('addVP8Codec(97)'), 'Must configure VP8 codec');

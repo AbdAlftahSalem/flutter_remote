@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 5
+// flutter-remote-template-version: 6
 /**
  * flutter-remote WebRTC V3 Thin Peer Bridge Bootstrap.
  *

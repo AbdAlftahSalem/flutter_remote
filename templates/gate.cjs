@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 11
+// flutter-remote-template-version: 12
 /**
  * flutter-remote auth gate.
  *
@@ -229,6 +229,15 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
         this.container.appendChild(v);
       }
       this.video = v;
+
+      const resumeVideo = () => {
+        if (this.video && this.video.paused && this.video.srcObject) {
+          this.video.play().catch(() => {});
+        }
+      };
+      window.addEventListener('pointerdown', resumeVideo, { passive: true });
+      window.addEventListener('keydown', resumeVideo, { passive: true });
+
       this.video.addEventListener('loadeddata', () => {
         this.lastFramePresentedTime = Date.now();
         if (!this.firstFrameTime) {
@@ -246,7 +255,9 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       this.firstFrameTime = 0;
       this.lastFramePresentedTime = 0;
       this.video.srcObject = s;
-      this.video.play().catch(() => {});
+      this.video.play().catch((err) => {
+        console.warn('[flutter-remote] autoplay blocked or error, awaiting interaction', err);
+      });
 
       const onFrame = () => {
         if (!this.video) return;
@@ -597,6 +608,10 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
           this.connectionState.resetBackoff();
         };
 
+        this.dataChannels.control.onopen = () => {
+          this.requestKeyframe('control_channel_open');
+        };
+
         this.peer.onicecandidate = (e) => {
           if (e.candidate && this.signalingWs && this.signalingWs.readyState === WebSocket.OPEN) {
             this.signalingWs.send(JSON.stringify({
@@ -610,9 +625,19 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
         };
 
         this.peer.oniceconnectionstatechange = () => {
-          this.metrics.iceState = this.peer.iceConnectionState;
-          if (this.peer.iceConnectionState === 'disconnected') this._attemptIceRestart();
-          else if (this.peer.iceConnectionState === 'failed') this._scheduleReconnect();
+          const iceState = this.peer.iceConnectionState;
+          this.metrics.iceState = iceState;
+          if (iceState === 'connected' || iceState === 'completed') {
+            setTimeout(() => {
+              if (this.connectionState.state === 'CONNECTED') {
+                this.requestKeyframe('ice_connected');
+              }
+            }, 500);
+          } else if (iceState === 'disconnected') {
+            this._attemptIceRestart();
+          } else if (iceState === 'failed') {
+            this._scheduleReconnect();
+          }
         };
       }
 
@@ -645,10 +670,7 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
 
     requestKeyframe(reason = 'manual') {
       const now = Date.now();
-      // A recovery request only re-sends a cached IDR. Keep the cooldown long
-      // enough that an intermittent frame callback cannot create a recovery
-      // storm over an otherwise playable stream.
-      if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 10000) return false;
+      if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 3000) return false;
       this._lastKeyframeRequestTime = now;
       console.log('[flutter-remote] Requesting keyframe recovery (reason: ' + reason + ')');
       const dc = this.dataChannels.control;
@@ -669,12 +691,30 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       this._stallWatchdogTimer = setInterval(() => {
         this._checkVideoHealth();
       }, 500);
+      this._startHeartbeat();
     }
 
     _stopWatchdog() {
       if (this._stallWatchdogTimer) {
         clearInterval(this._stallWatchdogTimer);
         this._stallWatchdogTimer = null;
+      }
+      this._stopHeartbeat();
+    }
+
+    _startHeartbeat() {
+      if (this._heartbeatTimer) return;
+      this._heartbeatTimer = setInterval(() => {
+        if (this.connectionState.state === 'CONNECTED') {
+          this.requestKeyframe('heartbeat');
+        }
+      }, 30000);
+    }
+
+    _stopHeartbeat() {
+      if (this._heartbeatTimer) {
+        clearInterval(this._heartbeatTimer);
+        this._heartbeatTimer = null;
       }
     }
 
@@ -685,7 +725,7 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       const firstFrameTime = this.videoRenderer.firstFrameTime;
 
       if (!firstFrameTime) {
-        if (now - this.videoRenderer.connectTime > 8000) {
+        if (now - this.videoRenderer.connectTime > 3000) {
           this.requestKeyframe('initial_track_timeout');
         }
         return;
@@ -694,14 +734,14 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       if (this.inputController) {
         const lastInteraction = this.inputController.getLastInteractionTime();
         if (lastInteraction > 0 && (now - lastInteraction < 2000)) {
-          if (now - lastFrameTime > 3000) {
+          if (now - lastFrameTime > 1500) {
             this.requestKeyframe('interaction_stall');
             return;
           }
         }
       }
 
-      if (lastFrameTime > 0 && (now - lastFrameTime > 6000)) {
+      if (lastFrameTime > 0 && (now - lastFrameTime > 3000)) {
         this.requestKeyframe('video_freeze');
       }
     }
@@ -938,7 +978,7 @@ const server = http.createServer((req, res) => {
   if (pathnameOf(req) === '/__flutter-remote/client.js') {
     res.writeHead(200, {
       'Content-Type': 'application/javascript; charset=utf-8',
-      'Cache-Control': 'public, max-age=3600'
+      'Cache-Control': 'no-cache, no-store, must-revalidate'
     });
     res.end(WEBRTC_CLIENT_SCRIPT_V2);
     return;

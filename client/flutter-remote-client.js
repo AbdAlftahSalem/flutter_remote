@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Flutter Remote WebRTC V3 Browser Client & Modular Direct Engine
  *
  * ZERO MONKEY-PATCHING: Communicates directly over WebRTC Media and DataChannels.
@@ -264,6 +264,9 @@ export class FlutterRemoteClient {
     if (name === 'input') {
       this.connectionState.set('CONNECTED');
       this.reconnectController.reset();
+    }
+    if (name === 'control') {
+      this.requestKeyframe('control_channel_open');
     }
   }
 

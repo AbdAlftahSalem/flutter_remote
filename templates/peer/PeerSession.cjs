@@ -1,4 +1,4 @@
-﻿// flutter-remote-template-version: 5
+// flutter-remote-template-version: 6
 /**
  * Flutter Remote WebRTC V3 PeerSession (CommonJS)
  *
@@ -70,8 +70,7 @@ class PeerSession {
         // Delay keyframe send until ICE+DTLS are fully established.
         // Sending RTP before 'connected' causes silent drops and black screen.
         this._keyframeSentOnConnect = false;
-        if (typeof this.peer.onConnectionStateChange === 'function') {
-        this.peer.onConnectionStateChange((state) => {
+        const triggerKeyframeOnConnect = (state) => {
           if ((state === 'connected' || state === 'completed') && !this._keyframeSentOnConnect) {
             this._keyframeSentOnConnect = true;
             console.log('[webrtc-peer] ICE connected — sending cached keyframe to new peer');
@@ -84,8 +83,14 @@ class PeerSession {
             // Also trigger a fresh IDR so any missed frames are recovered immediately
             this.videoEncoder.requestKeyframe('peer_connected');
           }
-        });
-        } // end onConnectionStateChange guard
+        };
+
+        if (typeof this.peer.onStateChange === 'function') {
+          this.peer.onStateChange(triggerKeyframeOnConnect);
+        }
+        if (typeof this.peer.onConnectionStateChange === 'function') {
+          this.peer.onConnectionStateChange(triggerKeyframeOnConnect);
+        }
 
         this.serveSimConsumer.ensureLocalStream();
       } catch (err) {
@@ -120,6 +125,10 @@ class PeerSession {
     this.peer.onDataChannel((dc) => {
       const label = dc.getLabel ? dc.getLabel() : 'input';
       console.log('[webrtc-peer] DataChannel opened:', label);
+      // If data channels open, ICE/DTLS are definitively established
+      if (typeof triggerKeyframeOnConnect === 'function') {
+        triggerKeyframeOnConnect('connected');
+      }
       this.router.registerChannel(label, dc);
       this.serveSimConsumer.initServeSimWs();
 

@@ -1,4 +1,4 @@
-﻿// flutter-remote-template-version: 6
+// flutter-remote-template-version: 7
 /**
  * Flutter Remote WebRTC V3 ServeSimConsumer (CommonJS)
  *

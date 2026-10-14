@@ -39,6 +39,16 @@ export class VideoRenderer {
     }
     this.video = video;
 
+    const resumeVideo = () => {
+      if (this.video && this.video.paused && this.video.srcObject) {
+        this.video.play().catch(() => {});
+      }
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('pointerdown', resumeVideo, { passive: true });
+      window.addEventListener('keydown', resumeVideo, { passive: true });
+    }
+
     this.video.addEventListener('loadeddata', () => {
       this.lastFramePresentedTime = Date.now();
       if (!this.firstFrameTime) {
@@ -63,7 +73,9 @@ export class VideoRenderer {
     this.firstFrameTime = 0;
     this.lastFramePresentedTime = 0;
     this.video.srcObject = stream;
-    this.video.play().catch(() => {});
+    this.video.play().catch((err) => {
+      console.warn('[flutter-remote] autoplay blocked or error, awaiting interaction', err);
+    });
 
     const onFrame = () => {
       if (!this.video) return;
