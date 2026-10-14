@@ -26,7 +26,7 @@ test('Phase 15: End-to-End full session lifecycle, signaling, media & input rout
   session.state.transition(SESSION_STATES.ACTIVE);
 
   // 2. Start Signaling Server
-  const signalPort = 39874;
+  const signalPort = 39878;
   const signalingServer = new SignalingServer({ port: signalPort, store });
   signalingServer.start();
 

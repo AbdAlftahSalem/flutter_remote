@@ -6,7 +6,7 @@ import { PORTS, CODECS } from '../shared/constants.js';
 
 export const DEFAULT_CONFIG = {
   transport: 'webrtc',
-  codec: CODECS.AUTO,
+  codec: CODECS.MJPEG,
   fps: 30,
   maxDimension: 720,
   adaptiveQuality: true,

@@ -1,6 +1,6 @@
 {
   "name": "flutter-remote",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Run Flutter iOS applications on a real iOS Simulator on GitHub macOS runners and stream interactively to your browser.",
   "type": "module",
   "bin": {

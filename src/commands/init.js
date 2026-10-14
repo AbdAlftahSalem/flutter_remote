@@ -24,6 +24,18 @@ export function scaffold(cwd, { force = false } = {}) {
     [WORKFLOW_PATH, 'flutter-remote.yml'],
     [GATE_PATH, 'gate.cjs'],
     [WEBRTC_PEER_PATH, 'webrtc-peer.cjs'],
+    ['.github/flutter-remote/peer/RtpPacketizer.cjs', 'peer/RtpPacketizer.cjs'],
+    ['.github/flutter-remote/peer/KeyframeController.cjs', 'peer/KeyframeController.cjs'],
+    ['.github/flutter-remote/peer/VideoEncoder.cjs', 'peer/VideoEncoder.cjs'],
+    ['.github/flutter-remote/peer/BaseVideoEncoder.cjs', 'peer/BaseVideoEncoder.cjs'],
+    ['.github/flutter-remote/peer/HardwareH264Encoder.cjs', 'peer/HardwareH264Encoder.cjs'],
+    ['.github/flutter-remote/peer/SoftwareH264Encoder.cjs', 'peer/SoftwareH264Encoder.cjs'],
+    ['.github/flutter-remote/peer/EncoderDetector.cjs', 'peer/EncoderDetector.cjs'],
+    ['.github/flutter-remote/peer/ServeSimConsumer.cjs', 'peer/ServeSimConsumer.cjs'],
+    ['.github/flutter-remote/peer/AdaptiveQualityController.cjs', 'peer/AdaptiveQualityController.cjs'],
+    ['.github/flutter-remote/peer/PeerSession.cjs', 'peer/PeerSession.cjs'],
+    ['.github/flutter-remote/peer/DataChannelRouter.cjs', 'peer/DataChannelRouter.cjs'],
+    ['.github/flutter-remote/peer/Metrics.cjs', 'peer/Metrics.cjs'],
   ]) {
     const dest = join(cwd, rel);
     const templatePath = join(TEMPLATES, src);

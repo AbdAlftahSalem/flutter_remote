@@ -74,5 +74,37 @@ export function validateInputEvent(event) {
     }
   }
 
+  // Size limit validation for input messages
+  validatePayloadSize(JSON.stringify(event), LIMITS.MAX_INPUT_MESSAGE_SIZE);
+
   return true;
 }
+
+export function validateGeneration(incomingGeneration, currentGeneration) {
+  if (incomingGeneration !== undefined && typeof incomingGeneration === 'number') {
+    if (incomingGeneration < currentGeneration) {
+      return false; // Stale generation
+    }
+  }
+  return true;
+}
+
+export function validateClipboardMessage(text) {
+  if (typeof text !== 'string') {
+    throw new SessionError('Clipboard content must be a string');
+  }
+  validatePayloadSize(text, LIMITS.MAX_CLIPBOARD_MESSAGE_SIZE);
+  return true;
+}
+
+export function validateControlMessage(msg) {
+  if (!msg || typeof msg !== 'object') {
+    throw new SessionError('Control message must be an object');
+  }
+  if (!msg.type || typeof msg.type !== 'string') {
+    throw new SessionError('Control message requires a valid type string');
+  }
+  validatePayloadSize(JSON.stringify(msg), LIMITS.MAX_INPUT_MESSAGE_SIZE);
+  return true;
+}
+

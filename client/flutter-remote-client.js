@@ -1,591 +1,502 @@
 /**
- * Flutter Remote WebRTC V2 Browser Client & Modular Direct Engine
+ * Flutter Remote WebRTC V3 Browser Client & Modular Direct Engine
  *
  * ZERO MONKEY-PATCHING: Communicates directly over WebRTC Media and DataChannels.
  * Architecture:
- *   - ConnectionState: State machine, generation IDs, backoff retry
- *   - WebRTCClient: RTCPeerConnection, ICE restart, signaling, discrete DataChannels
+ *   - ConnectionState: State machine & generation tracking
+ *   - ReconnectController: Exponential backoff & retry scheduling
+ *   - SignalingClient: WebSocket signaling for offer/answer & ICE trickle
+ *   - PeerConnectionManager: RTCPeerConnection, ICE restart, ontrack
+ *   - DataChannelManager: Discrete channels (input, keyboard, control, telemetry)
+ *   - WebRTCStatsCollector: Normalized stats & delta-based packet loss rate
  *   - VideoRenderer: <video> element, aspect-ratio letterboxing, first-frame detection
- *   - InputController: Pointer capture, normalized coordinates, RAF coalescing, backpressure
+ *   - InputController: Pointer capture, RAF move coalescing, RAF wheel delta accumulation
  *   - KeyboardController: Keydown/keyup, IME composition
  *   - ClipboardController: User-gesture copy/paste
- *   - SessionUI: Status banner and diagnostics overlay
+ *   - SessionUI: Status banner
+ *   - DebugOverlay: Diagnostics display
  */
-(function() {
-  'use strict';
 
-  if (window.__flutterRemoteV2Initialized) return;
-  window.__flutterRemoteV2Initialized = true;
+import { ConnectionState } from './connection/ConnectionState.js';
+import { ReconnectController } from './connection/ReconnectController.js';
+import { SignalingClient } from './connection/SignalingClient.js';
 
-  const PROTOCOL_VERSION = 2;
-  const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
+import { PeerConnectionManager } from './webrtc/PeerConnectionManager.js';
+import { DataChannelManager } from './webrtc/DataChannelManager.js';
+import { WebRTCStatsCollector } from './webrtc/WebRTCStatsCollector.js';
 
-  // 1. ConnectionState Machine
-  class ConnectionState {
-    constructor() {
-      this.state = 'IDLE'; // IDLE, CONNECTING, CONNECTED, DISCONNECTED, RECONNECTING, FAILED
-      this.generation = 1;
-      this.reconnectAttempt = 0;
-      this.reconnectTimer = null;
-      this.listeners = new Set();
-    }
+import { InputController } from './input/InputController.js';
+import { KeyboardController } from './input/KeyboardController.js';
+import { ClipboardController } from './input/ClipboardController.js';
 
-    set(newState) {
-      if (this.state === newState) return;
-      this.state = newState;
-      for (const fn of this.listeners) {
-        try { fn(this.state, this.generation); } catch {}
-      }
-    }
+import { VideoRenderer } from './video/VideoRenderer.js';
 
-    onChange(fn) {
-      this.listeners.add(fn);
-    }
+import { SessionUI } from './ui/SessionUI.js';
+import { DebugOverlay } from './ui/DebugOverlay.js';
 
-    advanceGeneration() {
-      this.generation++;
-      return this.generation;
-    }
+export class FlutterRemoteClient {
+  constructor(options = {}) {
+    const urlParams = typeof window !== 'undefined' && window.location
+      ? new URLSearchParams(window.location.search)
+      : new URLSearchParams();
 
-    resetBackoff() {
-      this.reconnectAttempt = 0;
-      if (this.reconnectTimer) {
-        clearTimeout(this.reconnectTimer);
-        this.reconnectTimer = null;
-      }
-    }
+    this.sessionId = options.sessionId || urlParams.get('session') || 'active';
+    this.token = options.token || urlParams.get('k') || '';
+    this.debugMode = options.debugMode !== undefined
+      ? options.debugMode
+      : (urlParams.get('debug') === '1');
+    this.protocolVersion = options.protocolVersion || 2;
 
-    scheduleReconnect(callback) {
-      if (this.reconnectTimer) return;
-      this.set('RECONNECTING');
-      const delay = BACKOFF_MS[Math.min(this.reconnectAttempt, BACKOFF_MS.length - 1)];
-      this.reconnectAttempt++;
+    const container = options.container || (typeof document !== 'undefined'
+      ? (document.getElementById('flutter-remote-container') || document.body)
+      : null);
 
-      this.reconnectTimer = setTimeout(() => {
-        this.reconnectTimer = null;
-        this.advanceGeneration();
-        callback();
-      }, delay);
-    }
-  }
+    this.connectionState = new ConnectionState();
+    this.reconnectController = new ReconnectController(this.connectionState);
 
-  // 2. VideoRenderer
-  class VideoRenderer {
-    constructor(container) {
-      this.container = container;
-      this.video = null;
-      this.firstFrameTime = 0;
-      this.connectTime = Date.now();
-      this._initElement();
-    }
+    this.metrics = {
+      rtt: 0,
+      fps: 0,
+      bitrate: 0,
+      jitter: 0,
+      packetsLostTotal: 0,
+      packetLossRate: 0,
+      packetLossDisplay: '0.00%',
+      firstFrameTime: 0,
+      reconnects: 0,
+      connectionState: 'IDLE',
+      iceState: 'new',
+      candidateType: 'unknown',
+      generation: 1,
+    };
 
-    _initElement() {
-      let video = document.getElementById('flutter-remote-video');
-      if (!video) {
-        video = document.createElement('video');
-        video.id = 'flutter-remote-video';
-        video.autoplay = true;
-        video.playsInline = true;
-        video.muted = true;
-        video.style.cssText = 'width:100%;height:100%;object-fit:contain;background:#000;display:block;';
-        this.container.appendChild(video);
-      }
-      this.video = video;
+    // UI Modules
+    this.ui = container ? new SessionUI(container) : null;
+    this.debugOverlay = (container && this.debugMode) ? new DebugOverlay(container) : null;
 
-      this.video.addEventListener('loadeddata', () => {
-        if (!this.firstFrameTime) {
-          this.firstFrameTime = Date.now() - this.connectTime;
-          console.log(`[flutter-remote] First video frame rendered in ${this.firstFrameTime}ms`);
-        }
-      });
-    }
+    this._videoFrameCheckTimer = null;
+    this._lastKeyframeRequestTime = 0;
+    this._stallWatchdogTimer = null;
+    this._heartbeatTimer = null;
 
-    attachStream(stream) {
-      this.connectTime = Date.now();
-      this.firstFrameTime = 0;
-      this.video.srcObject = stream;
-      this.video.play().catch(() => {});
-    }
-
-    getBounds() {
-      return this.video.getBoundingClientRect();
-    }
-
-    getVideoResolution() {
-      return {
-        width: this.video.videoWidth || 720,
-        height: this.video.videoHeight || 1280,
-      };
-    }
-  }
-
-  // 3. InputController
-  class InputController {
-    constructor(container, videoRenderer, dataChannels) {
-      this.container = container;
-      this.videoRenderer = videoRenderer;
-      this.dataChannels = dataChannels;
-      this.overlay = null;
-      this.nextSeq = 1;
-      this.pendingMove = null;
-      this.rafId = null;
-      this._initOverlay();
-    }
-
-    _initOverlay() {
-      let overlay = document.getElementById('flutter-remote-input-overlay');
-      if (!overlay) {
-        overlay = document.createElement('div');
-        overlay.id = 'flutter-remote-input-overlay';
-        overlay.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;touch-action:none;cursor:pointer;z-index:10;';
-        this.container.style.position = 'relative';
-        this.container.appendChild(overlay);
-      }
-      this.overlay = overlay;
-
-      const sendPointer = (evt) => {
-        const dc = this.dataChannels.input;
-        if (dc && dc.readyState === 'open') {
-          // Drop pointer moves if backpressure is high (> 64KB)
-          if (dc.bufferedAmount > 65536 && evt.event === 'move') return;
-          dc.send(JSON.stringify(evt));
-        }
-      };
-
-      const flush = () => {
-        if (this.pendingMove) {
-          sendPointer(this.pendingMove);
-          this.pendingMove = null;
-        }
-        this.rafId = null;
-      };
-
-      const handlePointer = (e, type) => {
-        const rect = this.videoRenderer.getBounds();
-        const { width: vW, height: vH } = this.videoRenderer.getVideoResolution();
-        const containerAspect = rect.width / rect.height;
-        const videoAspect = vW / vH;
-
-        let dispW = rect.width;
-        let dispH = rect.height;
-        let offX = 0;
-        let offY = 0;
-
-        if (containerAspect > videoAspect) {
-          dispW = rect.height * videoAspect;
-          offX = (rect.width - dispW) / 2;
-        } else {
-          dispH = rect.width / videoAspect;
-          offY = (rect.height - dispH) / 2;
-        }
-
-        const rawX = e.clientX - rect.left - offX;
-        const rawY = e.clientY - rect.top - offY;
-        const normX = Math.max(0, Math.min(1, rawX / dispW));
-        const normY = Math.max(0, Math.min(1, rawY / dispH));
-
-        const evt = {
-          v: PROTOCOL_VERSION,
-          type: 'pointer',
-          seq: this.nextSeq++,
-          ts: Date.now(),
-          event: type,
-          pointerId: e.pointerId || 1,
-          x: Number(normX.toFixed(5)),
-          y: Number(normY.toFixed(5)),
-          button: e.button || 0,
-          buttons: e.buttons !== undefined ? e.buttons : 1,
-        };
-
-        if (type === 'down') {
-          try { this.overlay.setPointerCapture(e.pointerId); } catch {}
-          if (this.rafId) { cancelAnimationFrame(this.rafId); flush(); }
-          sendPointer(evt);
-        } else if (type === 'up' || type === 'cancel') {
-          try { this.overlay.releasePointerCapture(e.pointerId); } catch {}
-          if (this.rafId) { cancelAnimationFrame(this.rafId); flush(); }
-          sendPointer(evt);
-        } else if (type === 'move') {
-          this.pendingMove = evt;
-          if (!this.rafId) {
-            this.rafId = requestAnimationFrame(flush);
-          }
-        }
-      };
-
-      this.overlay.addEventListener('pointerdown', (e) => handlePointer(e, 'down'));
-      this.overlay.addEventListener('pointermove', (e) => handlePointer(e, 'move'));
-      this.overlay.addEventListener('pointerup', (e) => handlePointer(e, 'up'));
-      this.overlay.addEventListener('pointercancel', (e) => handlePointer(e, 'cancel'));
-
-      // Wheel / Scroll
-      this.overlay.addEventListener('wheel', (e) => {
-        e.preventDefault();
-        const dc = this.dataChannels.input;
-        if (dc && dc.readyState === 'open') {
-          dc.send(JSON.stringify({
-            v: PROTOCOL_VERSION,
-            type: 'scroll',
-            seq: this.nextSeq++,
-            ts: Date.now(),
-            deltaX: e.deltaX,
-            deltaY: e.deltaY,
-          }));
-        }
-      }, { passive: false });
-    }
-  }
-
-  // 4. KeyboardController
-  class KeyboardController {
-    constructor(dataChannels) {
-      this.dataChannels = dataChannels;
-      this.nextSeq = 1;
-      this._init();
-    }
-
-    _init() {
-      const sendKey = (e, eventType) => {
-        const dc = this.dataChannels.keyboard;
-        if (dc && dc.readyState === 'open') {
-          dc.send(JSON.stringify({
-            v: PROTOCOL_VERSION,
-            type: 'keyboard',
-            seq: this.nextSeq++,
-            ts: Date.now(),
-            event: eventType,
-            key: e.key,
-            code: e.code,
-            isComposing: Boolean(e.isComposing),
-          }));
-        }
-      };
-
-      window.addEventListener('keydown', (e) => sendKey(e, 'keydown'));
-      window.addEventListener('keyup', (e) => sendKey(e, 'keyup'));
-    }
-  }
-
-  // 5. ClipboardController
-  class ClipboardController {
-    constructor(dataChannels) {
-      this.dataChannels = dataChannels;
-      this.nextSeq = 1;
-      this._init();
-    }
-
-    _init() {
-      // User-gesture paste
-      window.addEventListener('paste', async (e) => {
-        let text = '';
-        if (e.clipboardData) {
-          text = e.clipboardData.getData('text/plain');
-        } else if (navigator.clipboard && navigator.clipboard.readText) {
-          try { text = await navigator.clipboard.readText(); } catch {}
-        }
-
-        if (text) {
-          this.sendClipboard(text);
-        }
-      });
-    }
-
-    sendClipboard(text) {
-      const dc = this.dataChannels.control;
-      if (dc && dc.readyState === 'open') {
-        dc.send(JSON.stringify({
-          v: PROTOCOL_VERSION,
-          type: 'clipboard',
-          seq: this.nextSeq++,
-          ts: Date.now(),
-          text: String(text),
-        }));
-      }
-    }
-  }
-
-  // 6. SessionUI
-  class SessionUI {
-    constructor(container, debugMode = false) {
-      this.container = container;
-      this.debugMode = debugMode;
-      this.statusEl = null;
-      this.debugPanel = null;
-      this._init();
-    }
-
-    _init() {
-      let status = document.getElementById('flutter-remote-status');
-      if (!status) {
-        status = document.createElement('div');
-        status.id = 'flutter-remote-status';
-        status.style.cssText = 'position:absolute;top:10px;left:50%;transform:translateX(-50%);padding:6px 14px;background:rgba(0,0,0,0.75);color:#fff;border-radius:20px;font:12px sans-serif;z-index:20;transition:opacity 0.3s;pointer-events:none;';
-        this.container.appendChild(status);
-      }
-      this.statusEl = status;
-
-      if (this.debugMode) {
-        let debugPanel = document.getElementById('flutter-remote-debug-panel');
-        if (!debugPanel) {
-          debugPanel = document.createElement('div');
-          debugPanel.id = 'flutter-remote-debug-panel';
-          debugPanel.style.cssText = 'position:absolute;bottom:10px;left:10px;padding:10px;background:rgba(0,0,0,0.85);color:#0f0;font:11px monospace;border-radius:6px;z-index:30;pointer-events:none;line-height:1.4;';
-          this.container.appendChild(debugPanel);
-        }
-        this.debugPanel = debugPanel;
-      }
-    }
-
-    setStatus(text, autoHide = false) {
-      if (this.statusEl) {
-        this.statusEl.textContent = text;
-        this.statusEl.style.opacity = '1';
-        if (autoHide) {
-          setTimeout(() => {
-            if (this.statusEl.textContent === text) {
-              this.statusEl.style.opacity = '0';
+    // Video Module
+    this.videoRenderer = container
+      ? new VideoRenderer(container, {
+          onFirstFrame: (firstFrameTime) => {
+            if (this._videoFrameCheckTimer) {
+              clearTimeout(this._videoFrameCheckTimer);
+              this._videoFrameCheckTimer = null;
             }
-          }, 2000);
-        }
-      }
-    }
+            if (this.ui) this.ui.setStatus('Connected', true);
+            this.metrics.firstFrameTime = firstFrameTime;
+            this._updateDebug();
+          },
+        })
+      : null;
 
-    updateDebug(metrics) {
-      if (!this.debugPanel) return;
-      this.debugPanel.innerHTML = `
-        <div><strong>Flutter Remote V2 Diagnostics</strong></div>
-        <div>Connection: ${metrics.connectionState}</div>
-        <div>ICE State: ${metrics.iceState}</div>
-        <div>RTT: ${metrics.rtt} ms</div>
-        <div>Video FPS: ${metrics.fps}</div>
-        <div>Packet Loss: ${metrics.packetLoss}</div>
-        <div>First Frame: ${metrics.firstFrameTime ? metrics.firstFrameTime + 'ms' : 'pending'}</div>
-        <div>Reconnects: ${metrics.reconnects}</div>
-        <div>Generation: ${metrics.generation}</div>
-      `;
-    }
-  }
-
-  // 7. WebRTCClient & Coordinator
-  class FlutterRemoteClient {
-    constructor() {
-      const urlParams = new URLSearchParams(window.location.search);
-      this.sessionId = urlParams.get('session') || 'active';
-      this.token = urlParams.get('k') || '';
-      this.debugMode = urlParams.get('debug') === '1';
-
-      this.connectionState = new ConnectionState();
-      this.peer = null;
-      this.signalingWs = null;
-      this.dataChannels = {};
-
-      this.metrics = {
-        rtt: 0,
-        fps: 0,
-        packetLoss: 0,
-        firstFrameTime: 0,
-        reconnects: 0,
-        connectionState: 'IDLE',
-        iceState: 'new',
-        generation: 1,
-      };
-
-      const container = document.getElementById('flutter-remote-container') || document.body;
-      this.ui = new SessionUI(container, this.debugMode);
-      this.videoRenderer = new VideoRenderer(container);
-      this.inputController = new InputController(container, this.videoRenderer, this.dataChannels);
-      this.keyboardController = new KeyboardController(this.dataChannels);
-      this.clipboardController = new ClipboardController(this.dataChannels);
-
-      this.connectionState.onChange((state, gen) => {
+    // WebRTC Modules
+    this.peerConnectionManager = new PeerConnectionManager({
+      iceConfigUrl: options.iceConfigUrl || '/ice-config',
+      onTrack: (event) => this._handleTrack(event),
+      onIceCandidate: (candidate) => this._handleIceCandidate(candidate),
+      onIceConnectionStateChange: (state) => this._handleIceConnectionState(state),
+      onConnectionStateChange: (state) => {
         this.metrics.connectionState = state;
-        this.metrics.generation = gen;
+        this._updateDebug();
+      },
+    });
+
+    this.dataChannelManager = new DataChannelManager(this.peerConnectionManager, {
+      onOpen: (name) => this._handleDataChannelOpen(name),
+    });
+
+    // Input Modules
+    this.inputController = container && this.videoRenderer
+      ? new InputController(container, this.videoRenderer, this.dataChannelManager, {
+          protocolVersion: this.protocolVersion,
+        })
+      : null;
+
+    this.keyboardController = new KeyboardController(this.dataChannelManager, {
+      protocolVersion: this.protocolVersion,
+    });
+
+    this.clipboardController = new ClipboardController(this.dataChannelManager, {
+      protocolVersion: this.protocolVersion,
+    });
+
+    // Stats Module
+    this.statsCollector = new WebRTCStatsCollector(this.peerConnectionManager, {
+      intervalMs: 1000,
+      onMetrics: (sample) => this._handleMetrics(sample),
+    });
+
+    // Connection / Signaling Module
+    this.signaling = new SignalingClient({
+      url: options.signalingUrl,
+      sessionId: this.sessionId,
+      token: this.token,
+      connectionState: this.connectionState,
+      onMessage: (msg) => this._handleSignalingMessage(msg),
+      onOpen: async () => {
+        if (this.ui) this.ui.setStatus('Negotiating WebRTC...');
+        await this._initPeerConnection();
+      },
+      onClose: () => this._scheduleReconnect(),
+      onError: () => this._scheduleReconnect(),
+    });
+
+    // Event Wire-up
+    this.connectionState.onChange((state, gen) => {
+      this.metrics.connectionState = state;
+      this.metrics.generation = gen;
+      if (this.ui) {
         if (state === 'CONNECTING') this.ui.setStatus('Connecting to remote simulator...');
         else if (state === 'CONNECTED') this.ui.setStatus('Connected', true);
         else if (state === 'RECONNECTING') this.ui.setStatus(`Reconnecting (Gen ${gen})...`);
-      });
+      }
+      this._updateDebug();
+    });
 
-      window.addEventListener('resize', () => this._handleResize());
-      if (this.debugMode) this._startDebugLoop();
-
-      this._connectSignaling();
+    this._boundResize = () => this._handleResize();
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', this._boundResize);
     }
 
-    async _connectSignaling() {
-      this.connectionState.set('CONNECTING');
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${proto}//${location.host}/signal?session=${encodeURIComponent(this.sessionId)}&k=${encodeURIComponent(this.token)}`;
+    if (this.debugMode) {
+      this.statsCollector.start();
+    }
 
-      this.signalingWs = new WebSocket(url);
+    this._destroyed = false;
 
-      this.signalingWs.onopen = async () => {
-        this.ui.setStatus('Negotiating WebRTC...');
-        await this._initPeerConnection();
-      };
+    if (options.autoConnect !== false) {
+      this.start();
+    }
+  }
 
-      this.signalingWs.onmessage = async (e) => {
-        try {
-          const msg = JSON.parse(e.data);
-          if (msg.generation && msg.generation < this.connectionState.generation) {
-            return; // Stale generation
-          }
+  start() {
+    this.connectionState.set('CONNECTING');
+    this.signaling.connect();
+  }
 
-          if (msg.type === 'answer' && this.peer) {
-            const sdp = (msg.payload && msg.payload.sdp) || msg.sdp;
-            await this.peer.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
-          } else if ((msg.type === 'ice-candidate' || msg.type === 'candidate') && this.peer) {
-            const cand = msg.payload || msg.candidate;
-            if (cand && cand.candidate) {
-              await this.peer.addIceCandidate(new RTCIceCandidate(cand));
-            }
-          }
-        } catch (err) {
-          console.warn('[flutter-remote signaling message error]', err);
+  connect() {
+    this.start();
+  }
+
+  async _initPeerConnection(isRestart = false) {
+    try {
+      if (!isRestart) {
+        await this.peerConnectionManager.createPeer();
+        this.dataChannelManager.setupChannels();
+      }
+
+      const offer = await this.peerConnectionManager.createOffer({ iceRestart: isRestart });
+      this.signaling.sendOffer(offer.sdp, offer.iceServers);
+    } catch (err) {
+      console.warn('[flutter-remote] PeerConnection init error:', err.message);
+      this._scheduleReconnect();
+    }
+  }
+
+  async _handleSignalingMessage(msg) {
+    try {
+      if (msg.type === 'answer') {
+        const sdp = (msg.payload && msg.payload.sdp) || msg.sdp;
+        await this.peerConnectionManager.handleAnswer(sdp);
+      } else if (msg.type === 'ice-candidate' || msg.type === 'candidate') {
+        const cand = msg.payload || msg.candidate;
+        if (cand && cand.candidate) {
+          await this.peerConnectionManager.addIceCandidate(cand);
         }
-      };
-
-      this.signalingWs.onclose = () => {
-        this._scheduleReconnect();
-      };
-    }
-
-    async _initPeerConnection(isRestart = false) {
-      if (!isRestart && this.peer) {
-        try { this.peer.close(); } catch {}
-        this.peer = null;
       }
-
-      let iceServers = [{ urls: 'stun:stun.cloudflare.com:3478' }];
-      try {
-        const res = await fetch('/ice-config');
-        const data = await res.json();
-        if (data && data.iceServers) iceServers = data.iceServers;
-      } catch {}
-
-      if (!this.peer) {
-        this.peer = new RTCPeerConnection({ iceServers });
-
-        this.peer.ontrack = (event) => {
-          if (event.streams && event.streams[0]) {
-            this.videoRenderer.attachStream(event.streams[0]);
-          } else {
-            this.videoRenderer.attachStream(new MediaStream([event.track]));
-          }
-          this.connectionState.set('CONNECTED');
-          this.connectionState.resetBackoff();
-        };
-
-        // Discrete DataChannels
-        this.dataChannels.input = this.peer.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
-        this.dataChannels.keyboard = this.peer.createDataChannel('keyboard', { ordered: true });
-        this.dataChannels.control = this.peer.createDataChannel('control', { ordered: true });
-        this.dataChannels.telemetry = this.peer.createDataChannel('telemetry', { ordered: false, maxRetransmits: 0 });
-
-        this.dataChannels.input.onopen = () => {
-          this.connectionState.set('CONNECTED');
-          this.connectionState.resetBackoff();
-        };
-
-        this.peer.onicecandidate = (e) => {
-          if (e.candidate && this.signalingWs && this.signalingWs.readyState === WebSocket.OPEN) {
-            this.signalingWs.send(JSON.stringify({
-              v: PROTOCOL_VERSION,
-              type: 'ice-candidate',
-              sessionId: this.sessionId,
-              generation: this.connectionState.generation,
-              payload: e.candidate,
-            }));
-          }
-        };
-
-        this.peer.oniceconnectionstatechange = () => {
-          this.metrics.iceState = this.peer.iceConnectionState;
-          if (this.peer.iceConnectionState === 'disconnected') {
-            // Attempt ICE restart before full tear down
-            this._attemptIceRestart();
-          } else if (this.peer.iceConnectionState === 'failed') {
-            this._scheduleReconnect();
-          }
-        };
-      }
-
-      const offer = await this.peer.createOffer({ offerToReceiveVideo: true, iceRestart: isRestart });
-      await this.peer.setLocalDescription(offer);
-
-      this.signalingWs.send(JSON.stringify({
-        v: PROTOCOL_VERSION,
-        type: 'offer',
-        sessionId: this.sessionId,
-        generation: this.connectionState.generation,
-        payload: { sdp: offer.sdp, iceServers },
-      }));
+    } catch (err) {
+      console.warn('[flutter-remote] Signaling message handling error:', err.message);
     }
+  }
 
-    async _attemptIceRestart() {
-      console.log('[flutter-remote] ICE disconnected, attempting ICE restart...');
+  _handleTrack(event) {
+    if (this.videoRenderer) {
+      if (event.streams && event.streams[0]) {
+        this.videoRenderer.attachStream(event.streams[0]);
+      } else if (event.track) {
+        this.videoRenderer.attachStream(new MediaStream([event.track]));
+      }
+    }
+    this.connectionState.set('CONNECTED');
+    this.reconnectController.reset();
+    this._startWatchdog();
+    this._startHeartbeat();
+
+    if (this._videoFrameCheckTimer) {
+      clearTimeout(this._videoFrameCheckTimer);
+    }
+    this._videoFrameCheckTimer = setTimeout(() => {
+      if (this.videoRenderer && !this.videoRenderer.firstFrameTime && this.connectionState.state === 'CONNECTED') {
+        if (this.ui) this.ui.setStatus('Connected, waiting for video feed...');
+        console.warn('[flutter-remote] WebRTC connected, but 0 video frames decoded after 5s');
+      }
+    }, 5000);
+  }
+
+  _handleIceCandidate(candidate) {
+    this.signaling.sendCandidate(candidate);
+  }
+
+  _handleIceConnectionState(iceState) {
+    this.metrics.iceState = iceState;
+    if (iceState === 'disconnected') {
+      this._attemptIceRestart();
+    } else if (iceState === 'failed') {
+      this._scheduleReconnect();
+    } else if (iceState === 'connected' || iceState === 'completed') {
+      // ICE path confirmed; wait 500ms for DTLS to settle then request a keyframe
+      // so the browser gets its first video frame without waiting for the watchdog.
+      setTimeout(() => {
+        if (this.connectionState.state === 'CONNECTED') {
+          this.requestKeyframe('ice_connected');
+        }
+      }, 500);
+    }
+    this._updateDebug();
+  }
+
+  _handleDataChannelOpen(name) {
+    if (name === 'input') {
+      this.connectionState.set('CONNECTED');
+      this.reconnectController.reset();
+    }
+    if (name === 'control') {
+      this.requestKeyframe('control_channel_open');
+    }
+  }
+
+  async _attemptIceRestart() {
+    console.log('[flutter-remote] ICE disconnected, attempting ICE restart...');
+    try {
+      await this._initPeerConnection(true);
+    } catch {
+      this._scheduleReconnect();
+    }
+  }
+
+  _scheduleReconnect() {
+    if (this._destroyed) return;
+    this.metrics.reconnects++;
+    this.reconnectController.scheduleReconnect(async () => {
       try {
-        await this._initPeerConnection(true);
+        if (this.signaling && this.signaling.isOpen) {
+          await this._initPeerConnection(false);
+        } else {
+          this.start();
+        }
       } catch {
         this._scheduleReconnect();
       }
-    }
+    });
+  }
 
-    _scheduleReconnect() {
-      this.metrics.reconnects++;
-      this.connectionState.scheduleReconnect(async () => {
-        try {
-          if (this.signalingWs && this.signalingWs.readyState === WebSocket.OPEN) {
-            await this._initPeerConnection(false);
-          } else {
-            await this._connectSignaling();
-          }
-        } catch {
-          this._scheduleReconnect();
+  _handleResize() {
+    if (!this.videoRenderer) return;
+    const bounds = this.videoRenderer.getBounds();
+    this.dataChannelManager.sendControl({
+      v: this.protocolVersion,
+      type: 'resize',
+      width: Math.round(bounds.width),
+      height: Math.round(bounds.height),
+    });
+  }
+
+  _handleMetrics(sample) {
+    const conn = sample.connection || {};
+    const vid = sample.video || {};
+    const pkt = sample.packets || {};
+
+    this.metrics.rtt = conn.rtt || 0;
+    this.metrics.candidateType = conn.candidateType || 'unknown';
+    this.metrics.fps = vid.fps || 0;
+    this.metrics.bitrate = vid.bitrate || 0;
+    this.metrics.jitter = vid.jitter || 0;
+    this.metrics.packetsLostTotal = pkt.lost || 0;
+    this.metrics.packetLossRate = pkt.lossRate || 0;
+    this.metrics.packetLossDisplay = pkt.lossPercentage || '0.00%';
+
+    this._updateDebug();
+  }
+
+  _updateDebug() {
+    if (this.debugOverlay) {
+      this.debugOverlay.update(
+        {
+          connection: {
+            connectionState: this.metrics.connectionState,
+            iceState: this.metrics.iceState,
+            candidateType: this.metrics.candidateType,
+            rtt: this.metrics.rtt,
+          },
+          video: {
+            fps: this.metrics.fps,
+            bitrate: this.metrics.bitrate,
+            jitter: this.metrics.jitter,
+          },
+          packets: {
+            lossPercentage: this.metrics.packetLossDisplay,
+            lost: this.metrics.packetsLostTotal,
+          },
+        },
+        {
+          firstFrameTime: this.metrics.firstFrameTime,
+          reconnects: this.metrics.reconnects,
+          generation: this.metrics.generation,
         }
-      });
+      );
+    }
+  }
+
+  requestKeyframe(reason = 'manual') {
+    const now = Date.now();
+    if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 3000) {
+      return false;
+    }
+    this._lastKeyframeRequestTime = now;
+    console.log(`[flutter-remote] Requesting keyframe recovery (reason: ${reason})`);
+    if (this.dataChannelManager) {
+      return this.dataChannelManager.requestKeyframe(reason);
+    }
+    return false;
+  }
+
+  _startWatchdog() {
+    if (this._stallWatchdogTimer) return;
+    this._stallWatchdogTimer = setInterval(() => {
+      this._checkVideoHealth();
+    }, 500);
+  }
+
+  _stopWatchdog() {
+    if (this._stallWatchdogTimer) {
+      clearInterval(this._stallWatchdogTimer);
+      this._stallWatchdogTimer = null;
+    }
+  }
+
+  _startHeartbeat() {
+    if (this._heartbeatTimer) return;
+    this._heartbeatTimer = setInterval(() => {
+      if (this.connectionState.state === 'CONNECTED') {
+        this.requestKeyframe('heartbeat');
+      }
+    }, 30_000);
+  }
+
+  _stopHeartbeat() {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+  }
+
+  _checkVideoHealth() {
+    if (this.connectionState.state !== 'CONNECTED' || !this.videoRenderer) {
+      return;
     }
 
-    _handleResize() {
-      const dc = this.dataChannels.control;
-      if (dc && dc.readyState === 'open') {
-        const bounds = this.videoRenderer.getBounds();
-        dc.send(JSON.stringify({
-          v: PROTOCOL_VERSION,
-          type: 'resize',
-          width: Math.round(bounds.width),
-          height: Math.round(bounds.height),
-        }));
+    const now = Date.now();
+    const lastFrameTime = this.videoRenderer.getLastFramePresentedTime();
+    const firstFrameTime = this.videoRenderer.firstFrameTime;
+
+    // 1. Initial track timeout: track attached but first frame never presented after 1.5s
+    if (!firstFrameTime) {
+      if (now - this.videoRenderer.connectTime > 3000) {
+        this.requestKeyframe('initial_track_timeout');
+      }
+      return;
+    }
+
+    // 2. Active interaction stall: user swiping/interacting but video frozen > 1000ms
+    if (this.inputController) {
+      const lastInteraction = this.inputController.getLastInteractionTime();
+      if (lastInteraction > 0 && (now - lastInteraction < 2000)) {
+        if (now - lastFrameTime > 1500) {
+          this.requestKeyframe('interaction_stall');
+          return;
+        }
       }
     }
 
-    _startDebugLoop() {
-      setInterval(async () => {
-        if (this.peer && typeof this.peer.getStats === 'function') {
-          try {
-            const stats = await this.peer.getStats();
-            stats.forEach((report) => {
-              if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-                this.metrics.rtt = Math.round((report.currentRoundTripTime || 0) * 1000);
-              }
-              if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                this.metrics.fps = Math.round(report.framesPerSecond || 0);
-                this.metrics.packetLoss = report.packetsLost || 0;
-              }
-            });
-          } catch {}
-        }
-        this.metrics.firstFrameTime = this.videoRenderer.firstFrameTime;
-        this.ui.updateDebug(this.metrics);
-      }, 1000);
+    // 3. Playback freeze: stream was active but presentation stopped > 2000ms
+    if (lastFrameTime > 0 && (now - lastFrameTime > 3000)) {
+      this.requestKeyframe('video_freeze');
     }
   }
 
-  // Bootstrap client on DOM load
-  if (document.readyState === 'complete' || document.readyState === 'interactive') {
-    window.__flutterRemoteClient = new FlutterRemoteClient();
-  } else {
-    window.addEventListener('DOMContentLoaded', () => {
-      window.__flutterRemoteClient = new FlutterRemoteClient();
-    });
+  destroy() {
+    if (this._destroyed) return;
+    this._destroyed = true;
+
+    if (typeof window !== 'undefined' && this._boundResize) {
+      window.removeEventListener('resize', this._boundResize);
+      this._boundResize = null;
+    }
+
+    if (this._videoFrameCheckTimer) {
+      clearTimeout(this._videoFrameCheckTimer);
+      this._videoFrameCheckTimer = null;
+    }
+    this._stopWatchdog();
+    this._stopHeartbeat();
+    if (this.statsCollector) {
+      this.statsCollector.stop();
+    }
+    if (this.reconnectController) {
+      this.reconnectController.cancel();
+    }
+    if (this.inputController) {
+      this.inputController.destroy();
+    }
+    if (this.keyboardController) {
+      this.keyboardController.destroy();
+    }
+    if (this.clipboardController) {
+      this.clipboardController.destroy();
+    }
+    if (this.dataChannelManager) {
+      this.dataChannelManager.close();
+    }
+    if (this.peerConnectionManager) {
+      this.peerConnectionManager.close();
+    }
+    if (this.signaling) {
+      this.signaling.close();
+    }
+    if (this.videoRenderer) {
+      this.videoRenderer.destroy();
+    }
+    if (this.ui) {
+      this.ui.destroy();
+    }
+    if (this.debugOverlay) {
+      this.debugOverlay.destroy();
+    }
+    if (this.connectionState) {
+      this.connectionState.set('CLOSED');
+    }
   }
-})();
+
+  close() {
+    this.destroy();
+  }
+}
+
+// Browser bootstrap
+if (typeof window !== 'undefined') {
+  if (!window.__flutterRemoteV3Initialized) {
+    window.__flutterRemoteV3Initialized = true;
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+      window.__flutterRemoteClient = new FlutterRemoteClient();
+    } else {
+      window.addEventListener('DOMContentLoaded', () => {
+        window.__flutterRemoteClient = new FlutterRemoteClient();
+      });
+    }
+  }
+}

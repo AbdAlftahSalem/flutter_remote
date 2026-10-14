@@ -6,6 +6,7 @@ import { doctor } from './commands/doctor.js';
 import { upload } from './commands/upload.js';
 import { r2Setup } from './commands/r2.js';
 import { turn } from './commands/turn.js';
+import { benchmark } from './commands/benchmark.js';
 import { bold, dim, cyan, green } from './lib/ui.js';
 
 const HELP = `
@@ -20,6 +21,7 @@ ${bold('COMMANDS')}
   status    Show active session details, runner state, and simulator stream URL
   down      Cancel the runner job and shut down the remote simulator ${dim('(--all for every session)')}
   doctor    Check prerequisites (Flutter project, pubspec, git, GitHub auth)
+  benchmark Measure video streaming, encoding latency, and interaction metrics
   upload    Upload a prebuilt simulator .app to this repository's release ${dim('(--r2 for R2)')}
   r2        Configure Cloudflare R2 credentials ${dim('(--status to inspect)')}
   turn      Configure WebRTC TURN credentials in repository secrets
@@ -63,7 +65,7 @@ const NEEDS_VALUE = new Set([
   'minutes', 'device', 'runner', 'flutter-version', 'build-mode', 'flavor', 'target',
   'dart-define', 'codec', 'fps', 'quality', 'max-dimension', 'app-file', 'app',
   'app-release', 'mode', 'repo', 'message', 'account-id', 'access-key-id', 'secret-access-key',
-  'bucket', 'key-id', 'key-token', 'tunnel-protocol',
+  'bucket', 'key-id', 'key-token', 'tunnel-protocol', 'frames',
 ]);
 
 export function parseArgs(argv) {
@@ -147,7 +149,7 @@ export async function main(argv) {
   }
 
   const cwd = process.cwd();
-  const commands = { up, init, status, down, doctor, upload, r2: r2Setup, turn };
+  const commands = { up, init, status, down, doctor, upload, r2: r2Setup, turn, benchmark };
   const handler = commands[command];
   if (!handler) {
     throw new Error(`Unknown command "${command}". Run: flutter-remote --help`);

@@ -119,3 +119,15 @@ export class TransportManager extends EventEmitter {
     this.removeAllListeners();
   }
 }
+
+export const WebRTCTransport = WebRTCInputTransport;
+export const LegacyTransport = WebSocketInputTransport;
+
+export function resolveTransportMode(mode, fallback = 'webrtc') {
+  const m = String(mode || '').toLowerCase();
+  if (m === 'legacy' || m === 'v1' || m === 'websocket' || m === 'http') return 'legacy';
+  if (m === 'webrtc' || m === 'v2' || m === 'v3') return 'webrtc';
+  if (m === 'auto') return 'auto';
+  return fallback;
+}
+

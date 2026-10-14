@@ -20,6 +20,25 @@ export class Session {
     this.generation = 1;
     this.metadata = options.metadata || {};
     this.store = options.store || sessionStore;
+
+    // Subsystem ownership (Section 32, 33)
+    this.simulator = options.simulator || null;
+    this.capture = options.capture || null;
+    this.media = options.media || null;
+    this.peer = options.peer || null;
+    this.input = options.input || null;
+    this.signaling = options.signaling || null;
+    this.metrics = options.metrics || null;
+  }
+
+  attachSubsystems(subsystems = {}) {
+    if (subsystems.simulator) this.simulator = subsystems.simulator;
+    if (subsystems.capture) this.capture = subsystems.capture;
+    if (subsystems.media) this.media = subsystems.media;
+    if (subsystems.peer) this.peer = subsystems.peer;
+    if (subsystems.input) this.input = subsystems.input;
+    if (subsystems.signaling) this.signaling = subsystems.signaling;
+    if (subsystems.metrics) this.metrics = subsystems.metrics;
   }
 
   nextGeneration() {
@@ -31,6 +50,15 @@ export class Session {
     if (this.state.canTransition(SESSION_STATES.STOPPING)) {
       this.state.transition(SESSION_STATES.STOPPING, reason);
     }
+
+    // Clean up owned subsystems safely
+    try { if (this.media && typeof this.media.close === 'function') this.media.close(); } catch {}
+    try { if (this.capture && typeof this.capture.close === 'function') this.capture.close(); } catch {}
+    try { if (this.peer && typeof this.peer.close === 'function') this.peer.close(); } catch {}
+    try { if (this.signaling && typeof this.signaling.close === 'function') this.signaling.close(); } catch {}
+    try { if (this.simulator && typeof this.simulator.close === 'function') this.simulator.close(); } catch {}
+    try { if (this.metrics && typeof this.metrics.close === 'function') this.metrics.close(); } catch {}
+
     await this.lifecycle.cleanup(reason);
     if (this.state.canTransition(SESSION_STATES.STOPPED)) {
       this.state.transition(SESSION_STATES.STOPPED, reason);

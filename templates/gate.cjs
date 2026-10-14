@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 9
+// flutter-remote-template-version: 12
 /**
  * flutter-remote auth gate.
  *
@@ -207,11 +207,14 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
   }
 
   class VideoRenderer {
-    constructor(container) {
+    constructor(container, onFirstFrame) {
       this.container = container;
+      this.onFirstFrame = onFirstFrame || (() => {});
       this.video = null;
       this.firstFrameTime = 0;
+      this.lastFramePresentedTime = 0;
       this.connectTime = Date.now();
+      this._rvfcId = null;
       this._init();
     }
     _init() {
@@ -226,16 +229,52 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
         this.container.appendChild(v);
       }
       this.video = v;
+
+      const resumeVideo = () => {
+        if (this.video && this.video.paused && this.video.srcObject) {
+          this.video.play().catch(() => {});
+        }
+      };
+      window.addEventListener('pointerdown', resumeVideo, { passive: true });
+      window.addEventListener('keydown', resumeVideo, { passive: true });
+
       this.video.addEventListener('loadeddata', () => {
-        if (!this.firstFrameTime) this.firstFrameTime = Date.now() - this.connectTime;
+        this.lastFramePresentedTime = Date.now();
+        if (!this.firstFrameTime) {
+          this.firstFrameTime = Date.now() - this.connectTime;
+          this.onFirstFrame(this.firstFrameTime);
+        }
+      });
+      this.video.addEventListener('timeupdate', () => {
+        this.lastFramePresentedTime = Date.now();
       });
     }
     attachStream(s) {
+      if (this.video.srcObject === s) return;
       this.connectTime = Date.now();
       this.firstFrameTime = 0;
+      this.lastFramePresentedTime = 0;
       this.video.srcObject = s;
-      this.video.play().catch(() => {});
+      this.video.play().catch((err) => {
+        console.warn('[flutter-remote] autoplay blocked or error, awaiting interaction', err);
+      });
+
+      const onFrame = () => {
+        if (!this.video) return;
+        this.lastFramePresentedTime = Date.now();
+        if (!this.firstFrameTime) {
+          this.firstFrameTime = Date.now() - this.connectTime;
+          this.onFirstFrame(this.firstFrameTime);
+        }
+        if (typeof this.video.requestVideoFrameCallback === 'function') {
+          this._rvfcId = this.video.requestVideoFrameCallback(onFrame);
+        }
+      };
+      if (typeof this.video.requestVideoFrameCallback === 'function') {
+        this._rvfcId = this.video.requestVideoFrameCallback(onFrame);
+      }
     }
+    getLastFramePresentedTime() { return this.lastFramePresentedTime; }
     getBounds() { return this.video.getBoundingClientRect(); }
     getVideoResolution() {
       return { width: this.video.videoWidth || 720, height: this.video.videoHeight || 1280 };
@@ -251,8 +290,10 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       this.nextSeq = 1;
       this.pendingMove = null;
       this.rafId = null;
+      this.lastInteractionTime = 0;
       this._init();
     }
+    getLastInteractionTime() { return this.lastInteractionTime; }
     _init() {
       let o = document.getElementById('flutter-remote-input-overlay');
       if (!o) {
@@ -278,6 +319,7 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       };
 
       const handlePointer = (e, type) => {
+        this.lastInteractionTime = Date.now();
         const rect = this.videoRenderer.getBounds();
         const { width: vW, height: vH } = this.videoRenderer.getVideoResolution();
         const containerAspect = rect.width / rect.height;
@@ -436,13 +478,15 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
     updateDebug(m) {
       if (!this.debugPanel) return;
       this.debugPanel.innerHTML =
-        '<div><strong>Flutter Remote V2 Diagnostics</strong></div>' +
-        '<div>Connection: ' + m.connectionState + '</div>' +
-        '<div>ICE: ' + m.iceState + '</div>' +
-        '<div>RTT: ' + m.rtt + ' ms</div>' +
-        '<div>FPS: ' + m.fps + '</div>' +
-        '<div>Reconnects: ' + m.reconnects + '</div>' +
-        '<div>Generation: ' + m.generation + '</div>';
+        '<div><strong>Flutter Remote Diagnostics</strong></div>' +
+        '<div>State: ' + m.connectionState + '</div>' +
+        '<div>ICE State: ' + m.iceState + ' (' + (m.candidateType || 'direct') + ')</div>' +
+        '<div>Codec: ' + (m.codec || 'H.264') + ' (' + (m.resolution || '720x1280') + ')</div>' +
+        '<div>FPS: ' + m.fps + ' | Bitrate: ' + (m.bitrate || 0) + ' kbps</div>' +
+        '<div>RTT: ' + m.rtt + ' ms | Jitter: ' + (m.jitter || 0) + ' ms</div>' +
+        '<div>Packet Loss: ' + (m.lossPercentage || '0.00%') + '</div>' +
+        '<div>Dropped Frames: ' + (m.framesDropped || 0) + '</div>' +
+        '<div>Reconnects: ' + m.reconnects + ' | Gen: ' + m.generation + '</div>';
     }
   }
 
@@ -461,8 +505,17 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       this.metrics = { rtt: 0, fps: 0, reconnects: 0, connectionState: 'IDLE', iceState: 'new', generation: 1 };
 
       const c = document.getElementById('flutter-remote-container') || document.body;
+      this._videoFrameCheckTimer = null;
+      this._lastKeyframeRequestTime = 0;
+      this._stallWatchdogTimer = null;
       this.ui = new SessionUI(c, this.debugMode);
-      this.videoRenderer = new VideoRenderer(c);
+      this.videoRenderer = new VideoRenderer(c, () => {
+        if (this._videoFrameCheckTimer) {
+          clearTimeout(this._videoFrameCheckTimer);
+          this._videoFrameCheckTimer = null;
+        }
+        if (this.ui) this.ui.setStatus('Connected', true);
+      });
       this.inputController = new InputController(c, this.videoRenderer, this.dataChannels);
       this.keyboardController = new KeyboardController(this.dataChannels);
       this.clipboardController = new ClipboardController(this.dataChannels);
@@ -470,9 +523,14 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       this.connectionState.onChange((s, gen) => {
         this.metrics.connectionState = s;
         this.metrics.generation = gen;
-        if (s === 'CONNECTING') this.ui.setStatus('Connecting to remote simulator...');
+        if (s === 'LOADING') this.ui.setStatus('Loading session...');
+        else if (s === 'CONNECTING') this.ui.setStatus('Connecting to remote simulator...');
         else if (s === 'CONNECTED') this.ui.setStatus('Connected', true);
+        else if (s === 'DEGRADED') this.ui.setStatus('Network Degraded (Adapting Video)');
         else if (s === 'RECONNECTING') this.ui.setStatus('Reconnecting (Gen ' + gen + ')...');
+        else if (s === 'DISCONNECTED') this.ui.setStatus('Disconnected from remote runner');
+        else if (s === 'EXPIRED') this.ui.setStatus('Session Expired');
+        else if (s === 'ERROR') this.ui.setStatus('Connection Error');
       });
 
       window.addEventListener('resize', () => this._handleResize());
@@ -530,6 +588,14 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
           else this.videoRenderer.attachStream(new MediaStream([e.track]));
           this.connectionState.set('CONNECTED');
           this.connectionState.resetBackoff();
+          this._startWatchdog();
+
+          if (this._videoFrameCheckTimer) clearTimeout(this._videoFrameCheckTimer);
+          this._videoFrameCheckTimer = setTimeout(() => {
+            if (this.videoRenderer && !this.videoRenderer.firstFrameTime && this.connectionState.state === 'CONNECTED') {
+              if (this.ui) this.ui.setStatus('Connected, waiting for video feed...');
+            }
+          }, 5000);
         };
 
         this.dataChannels.input = this.peer.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
@@ -540,6 +606,10 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
         this.dataChannels.input.onopen = () => {
           this.connectionState.set('CONNECTED');
           this.connectionState.resetBackoff();
+        };
+
+        this.dataChannels.control.onopen = () => {
+          this.requestKeyframe('control_channel_open');
         };
 
         this.peer.onicecandidate = (e) => {
@@ -555,9 +625,19 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
         };
 
         this.peer.oniceconnectionstatechange = () => {
-          this.metrics.iceState = this.peer.iceConnectionState;
-          if (this.peer.iceConnectionState === 'disconnected') this._attemptIceRestart();
-          else if (this.peer.iceConnectionState === 'failed') this._scheduleReconnect();
+          const iceState = this.peer.iceConnectionState;
+          this.metrics.iceState = iceState;
+          if (iceState === 'connected' || iceState === 'completed') {
+            setTimeout(() => {
+              if (this.connectionState.state === 'CONNECTED') {
+                this.requestKeyframe('ice_connected');
+              }
+            }, 500);
+          } else if (iceState === 'disconnected') {
+            this._attemptIceRestart();
+          } else if (iceState === 'failed') {
+            this._scheduleReconnect();
+          }
         };
       }
 
@@ -588,6 +668,84 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
       });
     }
 
+    requestKeyframe(reason = 'manual') {
+      const now = Date.now();
+      if (this._lastKeyframeRequestTime && now - this._lastKeyframeRequestTime < 3000) return false;
+      this._lastKeyframeRequestTime = now;
+      console.log('[flutter-remote] Requesting keyframe recovery (reason: ' + reason + ')');
+      const dc = this.dataChannels.control;
+      if (dc && dc.readyState === 'open') {
+        dc.send(JSON.stringify({
+          v: PROTOCOL_VERSION,
+          type: 'request_keyframe',
+          reason: reason,
+          ts: now,
+        }));
+        return true;
+      }
+      return false;
+    }
+
+    _startWatchdog() {
+      if (this._stallWatchdogTimer) return;
+      this._stallWatchdogTimer = setInterval(() => {
+        this._checkVideoHealth();
+      }, 500);
+      this._startHeartbeat();
+    }
+
+    _stopWatchdog() {
+      if (this._stallWatchdogTimer) {
+        clearInterval(this._stallWatchdogTimer);
+        this._stallWatchdogTimer = null;
+      }
+      this._stopHeartbeat();
+    }
+
+    _startHeartbeat() {
+      if (this._heartbeatTimer) return;
+      this._heartbeatTimer = setInterval(() => {
+        if (this.connectionState.state === 'CONNECTED') {
+          this.requestKeyframe('heartbeat');
+        }
+      }, 30000);
+    }
+
+    _stopHeartbeat() {
+      if (this._heartbeatTimer) {
+        clearInterval(this._heartbeatTimer);
+        this._heartbeatTimer = null;
+      }
+    }
+
+    _checkVideoHealth() {
+      if (this.connectionState.state !== 'CONNECTED' || !this.videoRenderer) return;
+      const now = Date.now();
+      const lastFrameTime = this.videoRenderer.getLastFramePresentedTime();
+      const firstFrameTime = this.videoRenderer.firstFrameTime;
+
+      if (!firstFrameTime) {
+        if (now - this.videoRenderer.connectTime > 3000) {
+          this.requestKeyframe('initial_track_timeout');
+        }
+        return;
+      }
+
+      if (this.inputController) {
+        const lastInteraction = this.inputController.getLastInteractionTime();
+        if (lastInteraction > 0 && (now - lastInteraction < 2000)) {
+          if (now - lastFrameTime > 1500) {
+            this.requestKeyframe('interaction_stall');
+            return;
+          }
+        }
+      }
+
+      if (lastFrameTime > 0 && (now - lastFrameTime > 3000)) {
+        this.requestKeyframe('video_freeze');
+      }
+    }
+
     _handleResize() {
       const dc = this.dataChannels.control;
       if (dc && dc.readyState === 'open') {
@@ -602,18 +760,72 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
     }
 
     _startDebugLoop() {
+      let prevPacketsLost = 0;
+      let prevPacketsReceived = 0;
+      let prevBytesReceived = 0;
+      let prevTimestamp = Date.now();
+
       setInterval(async () => {
         if (this.peer && typeof this.peer.getStats === 'function') {
           try {
             const stats = await this.peer.getStats();
+            const now = Date.now();
+            const durationSec = Math.max(0.1, (now - prevTimestamp) / 1000);
+            prevTimestamp = now;
+
             stats.forEach((r) => {
-              if (r.type === 'candidate-pair' && r.state === 'succeeded') {
+              if (r.type === 'candidate-pair' && (r.state === 'succeeded' || r.nominated || r.selected)) {
                 this.metrics.rtt = Math.round((r.currentRoundTripTime || 0) * 1000);
+              }
+              if (r.type === 'remote-candidate') {
+                this.metrics.candidateType = r.candidateType || this.metrics.candidateType;
               }
               if (r.type === 'inbound-rtp' && r.kind === 'video') {
                 this.metrics.fps = Math.round(r.framesPerSecond || 0);
+                this.metrics.framesDropped = r.framesDropped || 0;
+                this.metrics.jitter = Math.round((r.jitter || 0) * 1000);
+                this.metrics.codec = (r.codecId || 'H264').includes('VP8') ? 'VP8' : 'H264';
+
+                // Bitrate delta
+                const bytesDelta = Math.max(0, (r.bytesReceived || 0) - prevBytesReceived);
+                prevBytesReceived = r.bytesReceived || 0;
+                this.metrics.bitrate = Math.round((bytesDelta * 8) / (durationSec * 1000));
+
+                // Loss rate delta
+                const lostDelta = Math.max(0, (r.packetsLost || 0) - prevPacketsLost);
+                const recDelta = Math.max(0, (r.packetsReceived || 0) - prevPacketsReceived);
+                prevPacketsLost = r.packetsLost || 0;
+                prevPacketsReceived = r.packetsReceived || 0;
+                const totalDelta = recDelta + lostDelta;
+                const rate = totalDelta > 0 ? (lostDelta / totalDelta) : 0;
+                this.metrics.lossRate = rate;
+                this.metrics.lossPercentage = (rate * 100).toFixed(2) + '%';
               }
             });
+
+            if (this.videoRenderer) {
+              const res = this.videoRenderer.getVideoResolution();
+              this.metrics.resolution = res.width + 'x' + res.height;
+            }
+
+            // Adaptive quality & degradation check
+            const isDegraded = this.metrics.rtt > 200 || this.metrics.lossRate > 0.03 || this.metrics.framesDropped > 5;
+            if (isDegraded && this.connectionState.state === 'CONNECTED') {
+              this.connectionState.set('DEGRADED');
+              const dc = this.dataChannels.control;
+              if (dc && dc.readyState === 'open') {
+                dc.send(JSON.stringify({
+                  v: PROTOCOL_VERSION,
+                  type: 'adaptation',
+                  rtt: this.metrics.rtt,
+                  packetLoss: this.metrics.lossRate,
+                  jitter: this.metrics.jitter,
+                  fps: this.metrics.fps,
+                }));
+              }
+            } else if (!isDegraded && this.connectionState.state === 'DEGRADED') {
+              this.connectionState.set('CONNECTED');
+            }
           } catch {}
         }
         this.ui.updateDebug(this.metrics);
@@ -766,7 +978,7 @@ const server = http.createServer((req, res) => {
   if (pathnameOf(req) === '/__flutter-remote/client.js') {
     res.writeHead(200, {
       'Content-Type': 'application/javascript; charset=utf-8',
-      'Cache-Control': 'public, max-age=3600'
+      'Cache-Control': 'no-cache, no-store, must-revalidate'
     });
     res.end(WEBRTC_CLIENT_SCRIPT_V2);
     return;
