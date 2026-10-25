@@ -33,7 +33,7 @@ It is not Flutter Web and not a recording: it is your real iOS build in Apple's 
    flutter-remote up --public
    ```
 
-   `--public` puts the project in a public GitHub repository, where macOS runner minutes are free. Without it, a private repository is used and every macOS minute counts **10×** against your GitHub quota.
+   `--public` creates a **new public** GitHub repository, where macOS runner minutes are free. It only applies when the project has no GitHub repository yet: an existing repository keeps its visibility. Private repositories work too, but every macOS minute counts **10×** against your GitHub quota.
 
 What you see:
 
@@ -76,7 +76,6 @@ The link opens in your browser automatically (`--no-open` to skip).
 | `flutter-remote upload <Runner.app>` | Upload a prebuilt simulator app to a GitHub release, then run it with `up --app-release` |
 | `flutter-remote benchmark` | Measure the live session, or the H.264 encoder locally with `--local` |
 | `flutter-remote turn` | Save TURN relay credentials (for strict firewalls) as repository secrets |
-| `flutter-remote r2` | Save Cloudflare R2 credentials (upload to R2 is not supported yet) |
 
 `flutter-remote --help` lists every option; `flutter-remote --version` prints the version.
 
@@ -84,7 +83,7 @@ The link opens in your browser automatically (`--no-open` to skip).
 
 | Option | Default | Description |
 |---|---|---|
-| `--public` | off | Use a public repository (free macOS minutes) |
+| `--public` | off | When creating the repository, make it public (free macOS minutes). Has no effect on an existing repository |
 | `--minutes <n>` | `10` | How long the session stays open (1–350) |
 | `--device <name>` | `iPhone 17 Pro` | Simulator device |
 | `--runner <label>` | `macos-26` | macOS runner label (must be Apple Silicon) |
@@ -116,7 +115,7 @@ Start with `flutter-remote doctor`. Common cases:
 | `On a branch: HEAD is detached` | `git switch main` |
 | Black screen in the browser | Update: `npm i -g flutter-remote@latest`, then `flutter-remote up` (files from older versions are upgraded automatically). If it persists, attach `webrtc-peer.log` from the Action log to an issue. |
 | `...edited by you, so it was kept` | You changed a generated file. `flutter-remote init --force` restores it. |
-| GitHub minutes used up | Use `--public` (free minutes on public repositories) or wait for the monthly reset |
+| GitHub minutes used up | Minutes are free on public repositories. Make the existing one public (`gh repo edit --visibility public`), or run from a copy of the project with no remote using `flutter-remote up --public`, or wait for the monthly reset. Either way the code becomes public. |
 
 Set `FLUTTER_REMOTE_DEBUG=1` to print stack traces.
 
