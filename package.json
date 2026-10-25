@@ -1,6 +1,6 @@
 {
   "name": "flutter-remote",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Run Flutter iOS applications on a real iOS Simulator on GitHub macOS runners and stream interactively to your browser.",
   "type": "module",
   "bin": {
@@ -8,14 +8,18 @@
   },
   "files": [
     "bin",
-    "src",
-    "templates"
+    "src"
   ],
   "engines": {
     "node": ">=20.0.0"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test --test-concurrency=1 test/e2e/cli.e2e.test.mjs test/e2e/scaffold.e2e.test.mjs test/e2e/gate.e2e.test.mjs test/e2e/stream.e2e.test.mjs",
+    "test:cli": "node --test test/e2e/cli.e2e.test.mjs test/e2e/scaffold.e2e.test.mjs",
+    "test:gate": "node --test test/e2e/gate.e2e.test.mjs",
+    "test:stream": "node --test test/e2e/stream.e2e.test.mjs",
+    "test:runner": "node --test test/runner/runner.e2e.test.mjs",
+    "check": "node scripts/check-syntax.mjs"
   },
   "repository": {
     "type": "git",
@@ -40,6 +44,7 @@
   "devDependencies": {
     "ffmpeg-static": "5.3.0",
     "node-datachannel": "^0.33.4",
+    "playwright-core": "^1.64.1",
     "ws": "^8.21.3"
   }
 }
