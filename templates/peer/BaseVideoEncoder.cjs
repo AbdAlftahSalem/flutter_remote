@@ -90,6 +90,12 @@ class BaseVideoEncoder extends EventEmitter {
   get _pendingKeyframePromise() { return this.keyframeController.pendingKeyframePromise; }
   set _pendingKeyframePromise(v) { this.keyframeController.pendingKeyframePromise = v; }
 
+  setPayloadType(pt) {
+    if (!Number.isInteger(pt) || pt < 0 || pt > 127) return;
+    this.payloadType = pt;
+    this.rtpPacketizer.payloadType = pt;
+  }
+
   get _sequenceNumber() { return this.rtpPacketizer._sequenceNumber; }
   set _sequenceNumber(v) { this.rtpPacketizer._sequenceNumber = v; }
 

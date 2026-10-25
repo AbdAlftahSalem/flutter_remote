@@ -22,6 +22,13 @@ class HardwareH264Encoder extends BaseVideoEncoder {
     if (!this.isHardware || this.encoderName === 'libx264') {
       return [
         '-loglevel', 'error',
+        // serve-sim only sends a JPEG when the screen changes (+1 fps keepalive).
+        // Default probing (5 MB / 5 s) swallows ~36 JPEGs before the first
+        // encoded frame => 30+ s of black on an idle app. Start immediately.
+        '-probesize', '32',
+        '-analyzeduration', '0',
+        '-fflags', 'nobuffer',
+        '-flags', 'low_delay',
         '-f', 'image2pipe',
         '-vcodec', 'mjpeg',
         '-i', 'pipe:0',
@@ -45,6 +52,13 @@ class HardwareH264Encoder extends BaseVideoEncoder {
 
     return [
       '-loglevel', 'error',
+      // serve-sim only sends a JPEG when the screen changes (+1 fps keepalive).
+      // Default probing (5 MB / 5 s) swallows ~36 JPEGs before the first
+      // encoded frame => 30+ s of black on an idle app. Start immediately.
+      '-probesize', '32',
+      '-analyzeduration', '0',
+      '-fflags', 'nobuffer',
+      '-flags', 'low_delay',
       '-f', 'image2pipe',
       '-vcodec', 'mjpeg',
       '-i', 'pipe:0',

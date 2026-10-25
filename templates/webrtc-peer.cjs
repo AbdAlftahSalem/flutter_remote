@@ -1,4 +1,4 @@
-// flutter-remote-template-version: 6
+// flutter-remote-template-version: 7
 /**
  * flutter-remote WebRTC V3 Thin Peer Bridge Bootstrap.
  *
@@ -173,6 +173,8 @@ if (WebSocketServer) {
           session.handleOffer(msg);
         } else if (msg.type === 'ice-candidate' || msg.type === 'candidate') {
           session.handleCandidate(msg);
+        } else if (msg.type === 'pointer' || msg.type === 'keyboard' || msg.type === 'scroll' || msg.type === 'clipboard' || msg.type === 'input') {
+          serveSimConsumer.sendToServeSim(data);
         }
       } catch (err) {
         console.error('[webrtc-peer signaling error]', err.message);

@@ -839,7 +839,7 @@ const WEBRTC_CLIENT_SCRIPT_V2 = `
     window.addEventListener('DOMContentLoaded', () => { window.__flutterRemoteClient = new FlutterRemoteClient(); });
   }
 })();
-\`;`;
+`;
 
 const WEBRTC_CLIENT_SCRIPT_LEGACY = `
 (function() {
@@ -1119,6 +1119,10 @@ server.on('upgrade', (req, socket, head) => {
     const { connection: _c, 'proxy-connection': _pc, te: _te, ...forwardHeaders } = req.headers;
     const headersStr = Object.entries({
       ...forwardHeaders,
+      // Hop-by-hop "Connection: Upgrade" must be re-sent upstream, otherwise
+      // Node's HTTP parser on :3201 / serve-sim never sees a WebSocket upgrade
+      // and answers 404 (no /signal, no /ws input).
+      connection: 'Upgrade',
       'x-forwarded-proto': 'https',
       'x-forwarded-host': req.headers.host,
     })

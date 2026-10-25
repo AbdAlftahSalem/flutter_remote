@@ -60,9 +60,22 @@ class PeerSession {
     // Add Video track in V2/V3 mode
     if (Video && this.transportMode !== 'v1') {
       try {
-        const video = new Video('video', 'SendOnly');
-        video.addH264Codec(98);
-        video.addVP8Codec(97);
+        // The track MUST reuse the browser's video m-line mid and H.264 payload
+        // type. With a hard-coded mid ('video') libdatachannel cannot match it to
+        // the offer's m-line (mid '0'), so the answer just mirrors the browser's
+        // section, our track is never negotiated and no RTP ever reaches Chrome
+        // (black video). PT 98 is also VP9 in Chrome's offer, not H.264.
+        const offerSdpForVideo = (msg.payload && msg.payload.sdp) || msg.sdp || '';
+        const neg = negotiateH264(offerSdpForVideo);
+        const video = new Video(neg.mid, 'SendOnly');
+        video.addH264Codec(neg.payloadType);
+        if (typeof video.addSSRC === 'function') {
+          video.addSSRC(this.videoEncoder.ssrc || 12345, 'flutter-remote', 'flutter-remote-stream', 'flutter-remote-video');
+        }
+        if (typeof this.videoEncoder.setPayloadType === 'function') {
+          this.videoEncoder.setPayloadType(neg.payloadType);
+        }
+        console.log(`[webrtc-peer] video negotiated: mid=${neg.mid} H264 pt=${neg.payloadType} (${neg.fmtp || 'no fmtp'})`);
         this.videoTrack = this.peer.addTrack(video);
         this.activeVideoTracks.add(this.videoTrack);
         console.log('[webrtc-peer] video track ready');
@@ -203,6 +216,37 @@ class PeerSession {
   }
 }
 
+
+/**
+ * Pick the browser's video mid and its H.264 packetization-mode=1 payload type
+ * from the remote offer (prefer constrained baseline 42e01f, then baseline 42001f,
+ * then any pm=1 H.264).
+ */
+function negotiateH264(sdp) {
+  const lines = String(sdp).split(/\r?\n/);
+  let inVideo = false;
+  let mid = null;
+  const h264 = [];
+  const fmtp = {};
+  for (const line of lines) {
+    if (line.startsWith('m=')) {
+      if (inVideo && mid !== null) break;
+      inVideo = line.startsWith('m=video');
+      continue;
+    }
+    if (!inVideo) continue;
+    let m;
+    if ((m = line.match(/^a=mid:(.+)$/))) mid = m[1].trim();
+    else if ((m = line.match(/^a=rtpmap:(\d+) H264\/90000/i))) h264.push(Number(m[1]));
+    else if ((m = line.match(/^a=fmtp:(\d+) (.+)$/))) fmtp[Number(m[1])] = m[2];
+  }
+  const pm1 = h264.filter((pt) => /packetization-mode=1/.test(fmtp[pt] || ''));
+  const byProfile = (p) => pm1.find((pt) => new RegExp('profile-level-id=' + p, 'i').test(fmtp[pt] || ''));
+  const payloadType = byProfile('42e0') ?? byProfile('4200') ?? pm1[0] ?? h264[0] ?? 98;
+  return { mid: mid ?? '0', payloadType, fmtp: fmtp[payloadType] };
+}
+
 module.exports = {
+  negotiateH264,
   PeerSession,
 };
