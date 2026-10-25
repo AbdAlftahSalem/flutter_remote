@@ -1,255 +1,170 @@
-# Flutter Remote (`flutter-remote`)
+# flutter-remote
 
-> Run, test, and interact with real **Flutter iOS applications** on a genuine **Apple iOS Simulator** hosted on GitHub macOS runners — directly from Chrome, Edge, or Firefox on **Windows, Linux, or macOS**.
+> Run your Flutter app in a **real iOS Simulator** from Windows, Linux or macOS, and use it in your browser. No Mac needed.
 
 [![npm version](https://img.shields.io/npm/v/flutter-remote.svg?color=cb3837)](https://www.npmjs.com/package/flutter-remote)
-[![npm downloads](https://img.shields.io/npm/dm/flutter-remote.svg)](https://www.npmjs.com/package/flutter-remote)
 [![CI](https://github.com/AbdAlftahSalem/flutter_remote/actions/workflows/ci.yml/badge.svg)](https://github.com/AbdAlftahSalem/flutter_remote/actions/workflows/ci.yml)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Platform: Cross-Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](https://github.com/AbdAlftahSalem/flutter_remote)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
----
+`flutter-remote up` pushes your project to GitHub, builds it on a GitHub-hosted macOS runner, boots the iOS Simulator, and gives you a private link. Open it in Chrome, Edge or Firefox and tap, swipe and type into your app live.
 
-## Overview
+It is not Flutter Web and not a recording: it is your real iOS build in Apple's Simulator, streamed over WebRTC.
 
-**Flutter Remote** allows any developer — especially those on Windows or Linux who do not own a Mac or physical iPhone — to:
-1. Push their Flutter project to GitHub.
-2. Automatically compile a native iOS Simulator application on GitHub's hosted macOS ARM64 runners.
-3. Boot an iOS Simulator, install the application, and launch it via `xcrun simctl`.
-4. Stream the live Simulator display and send touch/gesture events interactively in the web browser.
+## Quick start (3 steps)
 
-This is **NOT** Flutter Web, a static video, or an HTML mock. It is a **real Apple iOS Simulator** executing your compiled Flutter iOS app in real time.
+1. **Install** (Node.js 20+, Git and the GitHub CLI are the only requirements):
 
----
+   ```bash
+   npm install -g flutter-remote
+   gh auth login            # once; pick "HTTPS" and allow the "workflow" scope
+   ```
 
-## Architecture
+2. **Check** that everything is ready (each problem comes with the command that fixes it):
 
-```text
-                 Developer (Windows / Linux / macOS)
-                                 │
-                                 │ flutter-remote up
-                                 ▼
-                          Local CLI
-                                 │
-                                 │ GitHub API (gh)
-                                 ▼
-                         GitHub Repository
-                                 │
-                                 ▼
-                         GitHub Actions
-                                 │
-                                 ▼
-                        macOS ARM64 Runner
-                                 │
-                  ┌──────────────┴──────────────┐
-                  │                             │
-             Flutter SDK                      Xcode
-                  │                             │
-                  └──────────────┬──────────────┘
-                                 │ flutter build ios --simulator
-                                 ▼
-                           iOS Simulator
-                          (xcrun simctl)
-                                 │
-                                 ▼
-                             serve-sim
-                                 │
-                                 ▼
-                         Auth Gate Proxy
-                           (gate.cjs)
-                                 │
-                       ┌─────────┴─────────┐
-                       │                   │
-                 Secure Tunnel        WebRTC Peer
-                 (cloudflared)      (node-datachannel)
-                       │                   │
-                       │ HTTP/WS (V1)      │ DataChannels + Video (V2)
-                       └─────────┬─────────┘
-                                 ▼
-                         Web Browser (User)
-               (Direct Video Track + Touch/Key Channels)
-```
+   ```bash
+   cd my_flutter_app
+   flutter-remote doctor
+   ```
 
----
+3. **Run**:
 
-## Prerequisites
+   ```bash
+   flutter-remote up --public
+   ```
 
-### On Your Local Machine
-- **Node.js** >= 20.0.0
-- **Git**
-- **GitHub CLI (`gh`)** logged in (`gh auth login`)
+   `--public` puts the project in a public GitHub repository, where macOS runner minutes are free. Without it, a private repository is used and every macOS minute counts **10×** against your GitHub quota.
 
-> [!NOTE]
-> You do **NOT** need macOS, Xcode, CocoaPods, or an iPhone locally.
-> Local Flutter installation is completely optional.
-
----
-
-## Installation
-
-Install globally via npm:
-
-```bash
-npm install -g flutter-remote
-```
-
-Or run directly with npx:
-
-```bash
-npx flutter-remote up --public
-```
-
----
-
-## Quick Start
-
-Navigate to your Flutter project root and run:
-
-```bash
-cd my_flutter_app
-flutter-remote up --public
-```
-
-### Expected Output:
+What you see:
 
 ```text
-Preparing Flutter project & repository
-✓ git init (initialized git repository)
-✓ Committed changes on main
-✓ Pushed branch main to user/my_flutter_app
-✓ Pushed flutter-remote workflow & gate to GitHub
-✓ GitHub Actions workflow registered
+[1/5] Checking prerequisites
+✓ Node.js, Git, GitHub CLI and project look good
 
-Dispatching GitHub macOS runner job
-✓ Runner started: https://github.com/user/my_flutter_app/actions/runs/123456789
-✓ Simulator is live and streaming!
+[2/5] Pushing your project to GitHub
+✓ wrote .github/workflows/flutter-remote.yml
+✓ Committed 18 changed file(s) on main
+✓ Pushed main to you/my_flutter_app
 
-  ● Flutter iOS Simulator is live
+[3/5] Starting the macOS runner
+✓ Workflow registered (4s)
+✓ Runner started: https://github.com/you/my_flutter_app/actions/runs/123 (9s)
 
-  https://xxxxxx.trycloudflare.com/?k=AbCdEfGh123456789
+[4/5] Building the app and starting the simulator (first run ~8–12 min, cached runs ~3 min)
+✓ Simulator is live (6m 41s)
 
-  Anyone with this link can interact with the iOS Simulator from their browser.
-  Stop it with: flutter-remote down
+[5/5] Open the simulator
+
+  ● Your Flutter app is live in the iOS Simulator
+
+  https://xxxx.trycloudflare.com/?k=…
+
+  Anyone with this link can use the simulator. Stop it with: flutter-remote down
 ```
 
-The browser will open automatically and display the interactive iOS Simulator.
-
----
-
-## Supported Browser Interactions
-
-The browser interface streams the iOS Simulator display with full bidirectional control:
-- **Tap / Click:** Tap buttons, list items, tabs, and form controls.
-- **Drag & Swipe:** Page transitions, carousels, drawers, and modal sheets.
-- **Smooth Scrolling:** Scroll lists, grids, and Flutter CustomScrollViews.
-- **Keyboard Input:** Type text into Flutter `TextField` and `TextFormField` widgets.
-- **Navigation:** Back gestures, AppBar actions, and tab bars.
-- **Real Flutter Engine:** Native skia/impeller rendering directly from the iOS Simulator.
-
----
+The link opens in your browser automatically (`--no-open` to skip).
 
 ## Commands
 
-| Command | Description |
+| Command | What it does |
 |---|---|
-| `flutter-remote up` | Build Flutter app on macOS runner and open live browser stream |
-| `flutter-remote status` | Show current session info, runner state, and live stream URL |
-| `flutter-remote down` | Terminate the remote runner and close the simulator stream |
-| `flutter-remote doctor` | Diagnose environment, Flutter project, git, and GitHub auth |
-| `flutter-remote init` | Scaffold workflow and gate proxy files into your project |
-| `flutter-remote upload` | Upload a prebuilt `.app` bundle archive to GitHub release |
-| `flutter-remote r2` | Configure Cloudflare R2 credentials for prebuilt app hosting |
-| `flutter-remote turn` | Set WebRTC TURN relay credentials in repository secrets |
+| `flutter-remote up` | Push, build on macOS, boot the Simulator, open the live link (default command) |
+| `flutter-remote doctor` | Check Node, Git, GitHub CLI login and permissions, the project and the repo; prints a fix for every problem |
+| `flutter-remote status` | Show the current session, runner state and live link |
+| `flutter-remote down` | Stop the runner (`--all` stops every flutter-remote run) |
+| `flutter-remote init` | Add or update the workflow files in your project (`--force` overwrites your edits) |
+| `flutter-remote upload <Runner.app>` | Upload a prebuilt simulator app to a GitHub release, then run it with `up --app-release` |
+| `flutter-remote benchmark` | Measure the live session, or the H.264 encoder locally with `--local` |
+| `flutter-remote turn` | Save TURN relay credentials (for strict firewalls) as repository secrets |
+| `flutter-remote r2` | Save Cloudflare R2 credentials (upload to R2 is not supported yet) |
 
----
+`flutter-remote --help` lists every option; `flutter-remote --version` prints the version.
 
-## CLI Options Reference (`flutter-remote up`)
+### Options for `up`
 
 | Option | Default | Description |
 |---|---|---|
-| `--minutes <n>` | `10` | Duration to hold simulator session open (1 to 350 min) |
-| `--device <name>` | `iPhone 17 Pro` | Simulator device name (auto-falls back if runner differs) |
-| `--runner <label>` | `macos-26` | GitHub macOS runner label (must be ARM64 for serve-sim) |
-| `--flutter-version <v>` | `stable` | Flutter SDK version or channel (e.g. `3.29.0`) |
-| `--build-mode <mode>` | `debug` | Flutter build mode (`debug` — iOS Simulator only supports debug mode) |
-| `--flavor <name>` | _none_ | Flutter flavor (e.g. `staging`, `production`) |
-| `--target <file>` | _none_ | Target entrypoint Dart file (e.g. `lib/main_dev.dart`) |
-| `--dart-define <K=V>` | _none_ | Pass build-time environment variables (repeatable) |
-| `--transport <mode>` | `webrtc` | Transport mode: `webrtc` (ultra-low latency DataChannels + Video track) or `http` / `legacy` (V1 fallback) |
-| `--codec <codec>` | `auto` | Stream codec: `auto` (H.264/VP8 WebRTC with adaptive bitrate), `h264`, `vp8`, or `mjpeg` |
-| `--tunnel-protocol <p>` | `quic` | Cloudflare tunnel: `quic` (UDP, better on lossy networks) or `http2` (TCP) |
-| `--fps <n>` | — | _(no-op)_ serve-sim always streams at native 60 FPS |
-| `--quality <n>` | — | _(no-op)_ quality is managed internally by the H.264 hardware encoder |
-| `--max-dimension <n>` | — | _(no-op)_ serve-sim uses the simulator's native resolution |
-| `--app-file <path>` | _none_ | Run a prebuilt `.app` directory or archive directly |
-| `--app <url>` | _none_ | Download and run a prebuilt simulator `.app` from URL |
-| `--public` | `false` | Push to public GitHub repo (unlimited free macOS minutes) |
-| `--no-cache` | `false` | Bypass cache and force a complete native rebuild |
-| `--no-open` | `false` | Do not automatically open the browser window |
-| `--agent` | `false` | Enable `agent-device` proxy for AI coding agent control |
-| `--export` | `false` | Download compiled `.app` bundle as workflow artifact |
+| `--public` | off | Use a public repository (free macOS minutes) |
+| `--minutes <n>` | `10` | How long the session stays open (1–350) |
+| `--device <name>` | `iPhone 17 Pro` | Simulator device |
+| `--runner <label>` | `macos-26` | macOS runner label (must be Apple Silicon) |
+| `--flutter-version <v>` | from `pubspec.yaml`, else `stable` | Flutter SDK version or channel |
+| `--flavor <name>` / `--target <file>` | none | Flutter flavor and entry point |
+| `--dart-define <K=V>` | none | Build-time values (repeatable) |
+| `--codec <codec>` | `mjpeg` | How serve-sim captures the Simulator: `mjpeg`, `h264` or `auto` (= `mjpeg`) |
+| `--transport <mode>` | `webrtc` | `webrtc`, or `http` for the older injected client |
+| `--tunnel-protocol <p>` | `quic` | `quic` or `http2` (falls back to `http2` automatically) |
+| `--app-file <path>` | none | Run a prebuilt simulator `.app` (or `.zip`/`.tar.gz`) instead of building |
+| `--app <url>` / `--app-release <name>` | none | Run a prebuilt app from a URL or a release asset |
+| `--no-cache` | off | Force a clean native rebuild |
+| `--agent` | off | Expose the agent-device proxy for AI agents |
+| `--export` | off | Save the built `.app` as a workflow artifact |
+| `--repo <name>` / `--message <msg>` | app name / timestamp | Repository name when creating one; commit message |
 
----
+### Exit codes
 
-## Build Caching
+`0` success · `1` failure · `2` wrong usage (bad command or flag) · `3` a prerequisite is missing (`doctor` tells you which).
 
-`flutter-remote` computes a native build fingerprint:
-- Hashes `pubspec.yaml`, `pubspec.lock`
-- Hashes all source files in `lib/`, `assets/`, and `ios/`
-- Combines with runner image, Flutter version, build mode, flavor, and dart-defines
+## Troubleshooting
 
-When code and dependencies have not changed, the compiled `.app` is restored from cache, booting the simulator in seconds without rebuilding!
+Start with `flutter-remote doctor`. Common cases:
 
----
+| You see | Do this |
+|---|---|
+| `GitHub login: gh is not logged in` | `gh auth login` |
+| `Permission to push workflows` fails, or `git push` is refused for `.github/workflows` | `gh auth refresh -s workflow` |
+| `On a branch: HEAD is detached` | `git switch main` |
+| Black screen in the browser | Update: `npm i -g flutter-remote@latest`, then `flutter-remote up` (files from older versions are upgraded automatically). If it persists, attach `webrtc-peer.log` from the Action log to an issue. |
+| `...edited by you, so it was kept` | You changed a generated file. `flutter-remote init --force` restores it. |
+| GitHub minutes used up | Use `--public` (free minutes on public repositories) or wait for the monthly reset |
 
-## Security Model
+Set `FLUTTER_REMOTE_DEBUG=1` to print stack traces.
 
-1. **Gate Token Authentication**:
-   - Every session generates a cryptographically secure, high-entropy 24-byte base64url gate token.
-   - The token is passed directly into the URL (`?k=<token>`) and exchanged by `gate.cjs` for an `HttpOnly` cookie.
-   - Unauthenticated requests receive an immediate `401 Unauthorized`.
-2. **No Secret Leaks**:
-   - Tokens and credentials are never stored in git history.
-   - Tokens are never printed in GitHub Actions build logs.
-3. **Public Repository Warning**:
-   - If `--public` is used on a new repository, `flutter-remote` alerts you that project source code will be publicly visible on GitHub.
-
----
-
-## Troubleshooting & Diagnostics
-
-Run diagnostics at any time from your Flutter project directory:
-
-```bash
-flutter-remote doctor
-```
+## How it works
 
 ```text
-Flutter Remote Doctor
-
-  ✓ Flutter project (crypto)
-  ✓ pubspec.yaml (v1.0.0+1)
-  ✓ iOS project directory (bundle: com.example.crypto)
-  ✓ Git installed
-  ✓ GitHub CLI installed
-  ✓ GitHub authenticated (@myusername)
-  ✓ Node.js >= 20 (v22.18.0)
-  ✓ .github/workflows/flutter-remote.yml
-  ✓ .github/flutter-remote/gate.cjs
-  ✓ GitHub remote (myusername/crypto)
-  ✓ Local Flutter (optional)
+your computer                          GitHub macOS runner
+─────────────                          ───────────────────────────────────────────────
+flutter-remote up ──push + dispatch──▶ flutter-remote.yml
+                                         ├─ flutter build ios --simulator
+                                         ├─ iOS Simulator ──▶ serve-sim (MJPEG + input socket)
+                                         ├─ webrtc-peer.cjs  (MJPEG → H.264 → WebRTC video, input channels)
+                                         ├─ gate.cjs         (token auth, injects the browser client)
+                                         └─ cloudflared      (public https link)
+browser ◀────────────── WebRTC video + DataChannels (tap, swipe, keys) ──────────────▶
 ```
 
----
+The files that run on the runner are copied into your project under `.github/` by `init`/`up`. Each one carries a header with a content hash, so a newer flutter-remote upgrades the files it wrote, keeps the ones you edited, and is not confused by Windows line endings.
 
-## Limitations
+### Security
 
-- **Simulator Build Only**: Builds are compiled with `flutter build ios --simulator --no-codesign`. Device-only IPAs cannot be executed inside the iOS Simulator.
-- **GitHub Runner Limits**: GitHub Actions hosted runners enforce a maximum job execution time of 360 minutes (6 hours). `flutter-remote` caps sessions at 350 minutes.
-- **macOS Provisioning**: GitHub macOS runners typically take 30–60 seconds to spin up on initial dispatch.
+- Every session gets a new random 24-byte token. The link carries it once (`?k=`); the gate swaps it for an `HttpOnly` cookie and removes it from the URL.
+- Requests without the token get a `403` page; WebSocket upgrades without it are refused.
+- The token is never committed to git; TURN credentials are stored as repository secrets and sent to GitHub through stdin.
 
----
+## Development
+
+```text
+bin/flutter-remote.js        CLI entry (prints errors with a "Fix:" line)
+src/cli/                     argument parsing, help, one file per command
+src/core/                    git, gh, preflight checks, scaffold, errors, terminal UI
+src/runner/                  everything that runs on the macOS runner (copied into the app repo)
+  workflow/flutter-remote.yml   → .github/workflows/flutter-remote.yml
+  flutter-remote/**             → .github/flutter-remote/**  (gate, browser client, WebRTC peer)
+test/e2e/                    end-to-end tests (real processes, real Chrome)
+test/runner/                 full test on a real macOS runner + Simulator
+test/support/                process harness, synthetic serve-sim, browser helpers
+docs/                        architecture and history
+```
+
+```bash
+npm ci
+npm test              # all local E2E: CLI, scaffold, gate, browser streaming (needs Google Chrome)
+npm run test:cli      # CLI + scaffold only (no browser)
+npm run check         # every file parses
+```
+
+The tests are end-to-end only: they start the real CLI, the real gate and WebRTC peer, a synthetic serve-sim that streams FFmpeg test video, and a real headless Google Chrome, and they check that real video frames arrive. The iOS Simulator part runs in `.github/workflows/e2e-runner.yml` (manual; see [docs/testing.md](docs/testing.md)).
 
 ## License
 
