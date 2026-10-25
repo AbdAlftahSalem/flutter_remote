@@ -1,0 +1,56 @@
+# The full product test on a real macOS runner + real iOS Simulator.
+# Manual only (it costs runner time). Needs a repository secret
+# FLUTTER_REMOTE_E2E_TOKEN: a token with "repo" and "workflow" scopes.
+# The fixture app goes to a PUBLIC repository, so its macOS minutes are free.
+name: e2e (macOS runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fixture_repo:
+        description: Repository name for the fixture app (created if missing)
+        default: flutter-remote-e2e-fixture
+
+permissions:
+  contents: read
+
+jobs:
+  runner-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Create the fixture Flutter app
+        run: |
+          flutter create --platforms=ios --project-name fixture_app "$RUNNER_TEMP/fixture_app"
+          cp test/runner/fixture/main.dart "$RUNNER_TEMP/fixture_app/lib/main.dart"
+          rm -rf "$RUNNER_TEMP/fixture_app/test"
+          cd "$RUNNER_TEMP/fixture_app"
+          git init -q -b main
+          git config user.name "flutter-remote e2e"
+          git config user.email "e2e@users.noreply.github.com"
+      - name: Point the fixture at its GitHub repository
+        env:
+          GH_TOKEN: ${{ secrets.FLUTTER_REMOTE_E2E_TOKEN }}
+        run: |
+          gh auth setup-git
+          OWNER=$(gh api user -q .login)
+          cd "$RUNNER_TEMP/fixture_app"
+          if gh repo view "$OWNER/${{ inputs.fixture_repo }}" >/dev/null 2>&1; then
+            git remote add origin "https://github.com/$OWNER/${{ inputs.fixture_repo }}.git"
+            git fetch -q origin main && git reset -q --soft origin/main || true
+          fi
+      - name: flutter-remote up → Chrome → tap → down
+        env:
+          GH_TOKEN: ${{ secrets.FLUTTER_REMOTE_E2E_TOKEN }}
+          FR_E2E_APP_DIR: ${{ runner.temp }}/fixture_app
+          FR_E2E_REPO_NAME: ${{ inputs.fixture_repo }}
+        run: npm run test:runner
