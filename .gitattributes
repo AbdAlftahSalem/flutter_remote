@@ -1,0 +1,4 @@
+# Keep LF everywhere so patches and the scaffold hash behave the same on Windows.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
