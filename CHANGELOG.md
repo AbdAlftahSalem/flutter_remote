@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2
+
+### Fixed
+- The 0.2.1 package on npm also contained the old pre-0.2.0 modules (`src/cli.js`, `src/commands`, `src/lib`, `src/webrtc`, … about 380 KB of dead code), because it was packed from a folder that still had them on disk. 0.2.2 ships only the files in git.
+- `npm publish` now refuses to run when `bin/` or `src/` has uncommitted or ignored files (`prepublishOnly`).
+- `main` now carries the version that is on npm (the 0.2.1 bump was published but never pushed to `main`).
+
+## 0.2.1
+
+- Version bump only (published to npm on 2026-10-25).
+
 ## 0.2.0
 
 ### Fixed
