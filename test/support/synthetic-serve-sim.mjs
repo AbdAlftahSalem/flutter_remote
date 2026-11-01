@@ -132,7 +132,15 @@ const PAGE = `<!doctype html><html><head><meta charset="utf-8"><title>serve-sim 
   window.addEventListener('mouseup', function(e){ if (!down) return; down = false; var p = at(e); send(3, { type: 'end', x: p.x, y: p.y }); });
   // Letters and modifiers, with the real UI's usages (serve-sim maps AltLeft to 226 = Option).
   var MOD = { ControlLeft: 224, ShiftLeft: 225, AltLeft: 226, MetaLeft: 227, ControlRight: 228, ShiftRight: 229, AltRight: 230, MetaRight: 231 };
-  var usage = function(code){ if (MOD[code] != null) return MOD[code]; var m = /^Key([A-Z])$/.exec(code || ''); return m ? 4 + m[1].charCodeAt(0) - 65 : null; };
+  // Digits and punctuation by key code too: HID Digit1..9,0 = 30..39, and the US punctuation keys.
+  var PUNCT = { Space: 44, Minus: 45, Equal: 46, BracketLeft: 47, BracketRight: 48, Backslash: 49, Semicolon: 51, Quote: 52, Backquote: 53, Comma: 54, Period: 55, Slash: 56 };
+  var usage = function(code){
+    if (MOD[code] != null) return MOD[code];
+    if (PUNCT[code] != null) return PUNCT[code];
+    var m = /^Key([A-Z])$/.exec(code || ''); if (m) return 4 + m[1].charCodeAt(0) - 65;
+    var d = /^Digit([0-9])$/.exec(code || ''); if (d) return d[1] === '0' ? 39 : 29 + Number(d[1]);
+    return null;
+  };
   window.addEventListener('keydown', function(e){ var u = usage(e.code); if (u != null) send(6, { type: 'down', usage: u }); });
   window.addEventListener('keyup', function(e){ var u = usage(e.code); if (u != null) send(6, { type: 'up', usage: u }); });
 })();

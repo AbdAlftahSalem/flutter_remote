@@ -21,10 +21,41 @@
    *   pressed (its up went to another window), is released before that key.
    * - When the page loses focus or is hidden, every key still held is released.
    *
+   * - A printable character is sent as the US key and Shift state that type it.
+   *   The Simulator's hardware keyboard is US: it types what the HID key code plus
+   *   the HID Shift give, not what the viewer's layout shows. "@" arriving as
+   *   Digit2 with no Shift (a viewer whose Shift is not part of the key event,
+   *   AltGr layouts, automation) typed "2"; a layout where "2" itself needs Shift
+   *   (AZERTY) typed "@". When the key's code or Shift state does not match what
+   *   the US keyboard needs for e.key, the key is replaced by that US key, with
+   *   Shift pressed or released around it, and its own key-up is swallowed.
+   *
    * Releases are dispatched as keyup events on window, so whichever sender is
    * active (serve-sim's UI or the player) sends the matching HID "up".
    * Registered at injection time, in the capture phase, so it runs first.
    */
+  const US_KEYS = (() => {
+    const m = {};
+    for (let i = 0; i < 26; i++) {
+      const L = String.fromCharCode(65 + i);
+      m[L.toLowerCase()] = { code: 'Key' + L, shift: false };
+      m[L] = { code: 'Key' + L, shift: true };
+    }
+    const shifted = ')!@#$%^&*(';
+    for (let d = 0; d < 10; d++) {
+      m[String(d)] = { code: 'Digit' + d, shift: false };
+      m[shifted[d]] = { code: 'Digit' + d, shift: true };
+    }
+    for (const [plain, shift, code] of [
+      ['-', '_', 'Minus'], ['=', '+', 'Equal'], ['[', '{', 'BracketLeft'], [']', '}', 'BracketRight'],
+      ['\\', '|', 'Backslash'], [';', ':', 'Semicolon'], ["'", '"', 'Quote'], ['`', '~', 'Backquote'],
+      [',', '<', 'Comma'], ['.', '>', 'Period'], ['/', '?', 'Slash'],
+    ]) {
+      m[plain] = { code, shift: false };
+      m[shift] = { code, shift: true };
+    }
+    return m;
+  })();
   const MODIFIER_FLAG = {
     AltLeft: 'altKey', AltRight: 'altKey',
     ControlLeft: 'ctrlKey', ControlRight: 'ctrlKey',
@@ -51,6 +82,36 @@
     };
     const releaseAll = () => { for (const code of Array.from(held)) release(code); };
     const isHostAlt = (e) => (e.code === 'AltLeft' || e.code === 'AltRight' || e.key === 'AltGraph') && !isMacViewer();
+    const translated = new Set();
+    // Sent to the original key's target, so the replacement travels the same path
+    // (capture on window, then the target) as the key it replaces.
+    const send = (target, type, code, key, shiftKey) => {
+      releasing = true;
+      try {
+        (target && target.dispatchEvent ? target : window).dispatchEvent(new KeyboardEvent(type, { code, key, shiftKey, bubbles: true, cancelable: true }));
+      } catch {} finally { releasing = false; }
+    };
+    const shiftHeld = () => (held.has('ShiftLeft') ? 'ShiftLeft' : held.has('ShiftRight') ? 'ShiftRight' : null);
+    // AltGr on Windows reports Ctrl+Alt; it is a layout key there, not a shortcut.
+    const isAltGr = (e) => (typeof e.getModifierState === 'function' && e.getModifierState('AltGraph'))
+      || (!isMacViewer() && e.ctrlKey && e.altKey);
+    const typeAsUs = (e) => {
+      if (e.isComposing || typeof e.key !== 'string' || e.key.length !== 1) return false;
+      if ((e.ctrlKey || e.metaKey) && !isAltGr(e)) return false; // shortcuts keep their keys
+      const us = US_KEYS[e.key];
+      if (!us || (us.code === e.code && us.shift === Boolean(e.shiftKey))) return false;
+      e.stopImmediatePropagation();
+      if (e.code) translated.add(e.code);
+      if (isAltGr(e)) for (const code of ['ControlLeft', 'ControlRight']) if (held.has(code)) release(code);
+      const physicalShift = shiftHeld();
+      if (us.shift && !physicalShift) send(e.target, 'keydown', 'ShiftLeft', 'Shift', true);
+      if (!us.shift && physicalShift) send(e.target, 'keyup', physicalShift, 'Shift', false);
+      send(e.target, 'keydown', us.code, e.key, us.shift);
+      send(e.target, 'keyup', us.code, e.key, us.shift);
+      if (us.shift && !physicalShift) send(e.target, 'keyup', 'ShiftLeft', 'Shift', false);
+      if (!us.shift && physicalShift) send(e.target, 'keydown', physicalShift, 'Shift', true);
+      return true;
+    };
     window.addEventListener('keydown', (e) => {
       if (releasing) return;
       if (isHostAlt(e)) { e.stopImmediatePropagation(); return; }
@@ -58,11 +119,13 @@
         const flag = MODIFIER_FLAG[code];
         if (flag && code !== e.code && e[flag] === false) release(code);
       }
+      if (typeAsUs(e)) return;
       if (e.code) held.add(e.code);
     }, true);
     window.addEventListener('keyup', (e) => {
       if (releasing) return;
       if (isHostAlt(e)) { e.stopImmediatePropagation(); return; }
+      if (translated.delete(e.code)) { e.stopImmediatePropagation(); return; }
       held.delete(e.code);
     }, true);
     window.addEventListener('blur', releaseAll);

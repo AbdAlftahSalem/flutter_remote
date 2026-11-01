@@ -4,6 +4,7 @@
 
 ### Fixed
 - **Login failed with Keychain error -34018 on the Simulator.** The runner built the app with `flutter build ios --simulator --no-codesign`. An unsigned Simulator build has no `application-identifier` entitlement, so every Keychain call fails with -34018 ("A required entitlement isn't present"): `flutter_secure_storage`, Firebase Auth, Google/Apple sign-in and any app that stores its session token there could not log in. Simulator builds are now signed locally by Xcode (no team or certificate needed). The build cache key changed, so old unsigned cached builds are not reused.
+- **"@" typed as "2"** (and other Shift symbols) from a viewer that is not a Mac. The Simulator's hardware keyboard is US: it types the HID key code plus the HID Shift it receives, not the character the viewer's layout shows. A symbol whose key event arrived without Shift being sent ("@" as Digit2), or a layout where a plain character needs Shift (AZERTY digits) or AltGr, typed the wrong character. The injected client now sends every printable character as the US key and Shift state that type it, pressing or lifting Shift around it when the viewer's key event does not match (shortcuts with Ctrl/Cmd are untouched; AltGr is treated as a layout key). Covers serve-sim's own page and `?player=webrtc`. The test serve-sim now maps digits and punctuation by key code like the real one. Tests: 4 new in `stream.e2e.test.mjs` (3 fail without the fix; the 4th checks that a US Shift+2 is not changed).
 
 ## 0.2.3
 
