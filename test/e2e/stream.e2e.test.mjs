@@ -32,10 +32,17 @@ async function openViewer() {
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
   await page.goto(`${stack.gate.url}/?player=webrtc&k=${stack.gate.token}`);
-  await page.waitForFunction(() => {
-    const v = document.getElementById('flutter-remote-video');
-    return v && v.videoWidth > 0 && v.currentTime > 0;
-  }, null, { timeout: 30000 });
+  try {
+    await page.waitForFunction(() => {
+      const v = document.getElementById('flutter-remote-video');
+      return v && v.videoWidth > 0 && v.currentTime > 0;
+    }, null, { timeout: 30000 });
+  } catch (err) {
+    // Say why: the player's status line and what the peer logged.
+    const status = await page.evaluate(() => document.getElementById('flutter-remote-status')?.textContent).catch(() => '?');
+    const peerLog = String(stack.peer.proc.output || '').split('\n').slice(-40).join('\n');
+    throw new Error(`no video within 30 s (player: "${status}")\n--- webrtc-peer, last lines ---\n${peerLog}`, { cause: err });
+  }
   return { page, errors };
 }
 
