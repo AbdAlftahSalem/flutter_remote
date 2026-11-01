@@ -11,15 +11,20 @@
 const { DataChannelRouter } = require('./DataChannelRouter.cjs');
 const { TouchOrderGuard } = require('./serveSimProtocol.cjs');
 
-/** Pacing rate for video RTP: well above the encoder's average so only keyframe bursts are smoothed. */
+/**
+ * Optional pacing of video RTP (FLUTTER_REMOTE_RTP_PACING=1): well above the
+ * encoder's average so only keyframe bursts are smoothed. Off by default: on
+ * GitHub's Linux runners, libdatachannel's PacingHandler made later sessions
+ * fail ICE ("Reconnecting (Gen 7)...") in 3 of 4 CI runs, while NACK alone
+ * passed every run (2026-11-01).
+ */
 const PACING_BITS_PER_SECOND = 12_000_000;
 const PACING_INTERVAL_MS = 5;
 /** RTP packets kept for retransmission (about 2 s of video at 2.5 Mbit/s). */
 const NACK_HISTORY_PACKETS = 1024;
 
 /**
- * Retransmit lost video packets on the browser's NACK (RTCP), and pace the
- * keyframe bursts. Without this, one lost UDP packet of a keyframe meant no
+ * Retransmit lost video packets on the browser's NACK (RTCP). Without this, one lost UDP packet of a keyframe meant no
  * picture until the next keyframe: on a 3 % lossy path Chrome decoded 3 frames
  * in 11 s and showed "Connected, waiting for video feed..." (CHANGELOG 0.2.4).
  */
@@ -31,7 +36,7 @@ function attachVideoReliability(track, ndc) {
   }
   const nack = new RtcpNackResponder(NACK_HISTORY_PACKETS);
   let pacing = false;
-  if (typeof PacingHandler === 'function' && process.env.FLUTTER_REMOTE_RTP_PACING !== '0') {
+  if (typeof PacingHandler === 'function' && process.env.FLUTTER_REMOTE_RTP_PACING === '1') {
     nack.addToChain(new PacingHandler(PACING_BITS_PER_SECOND, PACING_INTERVAL_MS));
     pacing = true;
   }
