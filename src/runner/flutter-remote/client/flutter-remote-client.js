@@ -132,7 +132,7 @@
         o = document.createElement('div');
         o.id = 'flutter-remote-input-overlay';
         o.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;touch-action:none;cursor:pointer;z-index:10;';
-        this.container.style.position = 'relative';
+        if (getComputedStyle(this.container).position === 'static') this.container.style.position = 'relative';
         this.container.appendChild(o);
       }
       this.overlay = o;
@@ -178,6 +178,7 @@
           ts: Date.now(),
           event: type,
           pointerId: e.pointerId || 1,
+          isPrimary: e.isPrimary !== false,
           x: Number(normX.toFixed(5)),
           y: Number(normY.toFixed(5)),
           button: e.button || 0,
@@ -207,6 +208,11 @@
         e.preventDefault();
         const dc = this.dataChannels.input;
         if (dc && dc.readyState === 'open') {
+          // serve-sim scrolls by a fraction of the screen at a point on it.
+          const rect = this.videoRenderer.getBounds();
+          const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? rect.height : 1;
+          const w = rect.width || 1;
+          const h = rect.height || 1;
           dc.send(JSON.stringify({
             v: PROTOCOL_VERSION,
             type: 'scroll',
@@ -214,6 +220,10 @@
             ts: Date.now(),
             deltaX: e.deltaX,
             deltaY: e.deltaY,
+            dx: Number(((e.deltaX * unit) / w).toFixed(5)),
+            dy: Number(((e.deltaY * unit) / h).toFixed(5)),
+            x: Number(Math.max(0, Math.min(1, (e.clientX - rect.left) / w)).toFixed(5)),
+            y: Number(Math.max(0, Math.min(1, (e.clientY - rect.top) / h)).toFixed(5)),
           }));
         }
       }, { passive: false });
@@ -221,13 +231,17 @@
   }
 
   class KeyboardController {
-    constructor(dataChannels) {
+    constructor(dataChannels, exclusive) {
       this.dataChannels = dataChannels;
+      // exclusive: the player sits on top of serve-sim's own UI, which also
+      // forwards keys; take them first so each key reaches the simulator once.
+      this.exclusive = Boolean(exclusive);
       this.nextSeq = 1;
       this._init();
     }
     _init() {
       const sendKey = (e, evtType) => {
+        if (this.exclusive) e.stopImmediatePropagation();
         const dc = this.dataChannels.keyboard;
         if (dc && dc.readyState === 'open') {
           dc.send(JSON.stringify({
@@ -242,8 +256,8 @@
           }));
         }
       };
-      window.addEventListener('keydown', (e) => sendKey(e, 'keydown'));
-      window.addEventListener('keyup', (e) => sendKey(e, 'keyup'));
+      window.addEventListener('keydown', (e) => sendKey(e, 'keydown'), this.exclusive);
+      window.addEventListener('keyup', (e) => sendKey(e, 'keyup'), this.exclusive);
     }
   }
 
@@ -323,7 +337,7 @@
   }
 
   class FlutterRemoteClient {
-    constructor() {
+    constructor(container, exclusive) {
       const p = new URLSearchParams(window.location.search);
       this.sessionId = p.get('session') || 'active';
       this.token = p.get('k') || '';
@@ -336,7 +350,7 @@
 
       this.metrics = { rtt: 0, fps: 0, reconnects: 0, connectionState: 'IDLE', iceState: 'new', generation: 1 };
 
-      const c = document.getElementById('flutter-remote-container') || document.body;
+      const c = container;
       this._videoFrameCheckTimer = null;
       this._lastKeyframeRequestTime = 0;
       this._stallWatchdogTimer = null;
@@ -349,7 +363,7 @@
         if (this.ui) this.ui.setStatus('Connected', true);
       });
       this.inputController = new InputController(c, this.videoRenderer, this.dataChannels);
-      this.keyboardController = new KeyboardController(this.dataChannels);
+      this.keyboardController = new KeyboardController(this.dataChannels, exclusive);
       this.clipboardController = new ClipboardController(this.dataChannels);
 
       this.connectionState.onChange((s, gen) => {
@@ -665,9 +679,45 @@
     }
   }
 
+  /**
+   * Where the WebRTC player mounts.
+   *
+   * The gate normally proxies serve-sim's own preview UI. That page already shows
+   * the simulator and sends taps and keys itself over /helper/<udid>/ws, which the
+   * gate tunnels. It has no #flutter-remote-container, and mounting on
+   * document.body put a transparent full-page overlay (z-index 10) over serve-sim's
+   * phone: every click landed on the overlay, serve-sim saw none and its Event Log
+   * stayed at 0. So on such a page the client now stays out of the way, unless the
+   * viewer asks for the WebRTC player with ?player=webrtc (a full-window player
+   * on top of serve-sim's UI).
+   */
+  function resolveMount() {
+    const existing = document.getElementById('flutter-remote-container');
+    if (existing) return { container: existing, exclusive: false };
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('player') !== 'webrtc') return null;
+    const c = document.createElement('div');
+    c.id = 'flutter-remote-container';
+    c.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483000;background:#000;';
+    document.body.appendChild(c);
+    return { container: c, exclusive: true };
+  }
+
+  function start() {
+    const mount = resolveMount();
+    if (!mount) {
+      window.__flutterRemoteClient = { mode: 'serve-sim-ui' };
+      console.info('[flutter-remote] serve-sim UI: its own viewer handles video and input. Open with ?player=webrtc for the WebRTC player.');
+      return;
+    }
+    const client = new FlutterRemoteClient(mount.container, mount.exclusive);
+    client.mode = 'webrtc-player';
+    window.__flutterRemoteClient = client;
+  }
+
   if (document.readyState === 'complete' || document.readyState === 'interactive') {
-    window.__flutterRemoteClient = new FlutterRemoteClient();
+    start();
   } else {
-    window.addEventListener('DOMContentLoaded', () => { window.__flutterRemoteClient = new FlutterRemoteClient(); });
+    window.addEventListener('DOMContentLoaded', start);
   }
 })();

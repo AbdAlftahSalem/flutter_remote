@@ -114,6 +114,7 @@ Start with `flutter-remote doctor`. Common cases:
 | `Permission to push workflows` fails, or `git push` is refused for `.github/workflows` | `gh auth refresh -s workflow` |
 | `On a branch: HEAD is detached` | `git switch main` |
 | Black screen in the browser | Update: `npm i -g flutter-remote@latest`, then `flutter-remote up` (files from older versions are upgraded automatically). If it persists, attach `webrtc-peer.log` from the Action log to an issue. |
+| The app shows, but taps and typing do nothing (serve-sim's Event Log stays at 0) | Fixed in 0.2.3: `npm i -g flutter-remote@latest`, then `flutter-remote up` again. On an older version, open DevTools (F12) → Console on the session page and run `document.getElementById('flutter-remote-input-overlay')?.remove()`. If the Event Log then counts taps but the app still does not react (Xcode 27 runners), see serve-sim's `repair-input`. |
 | `...edited by you, so it was kept` | You changed a generated file. `flutter-remote init --force` restores it. |
 | GitHub minutes used up | Minutes are free on public repositories. Make the existing one public (`gh repo edit --visibility public`), or run from a copy of the project with no remote using `flutter-remote up --public`, or wait for the monthly reset. Either way the code becomes public. |
 
@@ -126,12 +127,15 @@ your computer                          GitHub macOS runner
 ─────────────                          ───────────────────────────────────────────────
 flutter-remote up ──push + dispatch──▶ flutter-remote.yml
                                          ├─ flutter build ios --simulator
-                                         ├─ iOS Simulator ──▶ serve-sim (MJPEG + input socket)
+                                         ├─ iOS Simulator ──▶ serve-sim (preview UI, MJPEG, input socket /helper/<udid>/ws)
                                          ├─ webrtc-peer.cjs  (MJPEG → H.264 → WebRTC video, input channels)
                                          ├─ gate.cjs         (token auth, injects the browser client)
                                          └─ cloudflared      (public https link)
-browser ◀────────────── WebRTC video + DataChannels (tap, swipe, keys) ──────────────▶
+browser ◀────────────── serve-sim's UI: its video + its input socket, through the gate ──▶
+        ◀────────────── ?player=webrtc: WebRTC video + DataChannels (tap, swipe, keys) ─▶
 ```
+
+The link opens serve-sim's own preview UI (device list, tools, event log); taps and keys go from it straight to serve-sim's input socket through the gate. Add `?player=webrtc` to the link for the full-window WebRTC player; its input is translated by `webrtc-peer.cjs` into serve-sim's frames.
 
 The files that run on the runner are copied into your project under `.github/` by `init`/`up`. Each one carries a header with a content hash, so a newer flutter-remote upgrades the files it wrote, keeps the ones you edited, and is not confused by Windows line endings.
 

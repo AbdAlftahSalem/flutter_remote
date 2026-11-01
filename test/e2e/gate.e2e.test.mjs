@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import http from 'node:http';
 import { createRequire } from 'node:module';
-import { startStack, startGate, RUNNER_DIR, GATE } from '../support/stack.mjs';
+import { startStack, startGate, RUNNER_DIR, GATE, HELPER_PATH } from '../support/stack.mjs';
 import { stopAll, request, waitUntil, startProcess, freePort } from '../support/processes.mjs';
 import { tempDir, cleanupTemps } from '../support/cli.mjs';
 
@@ -102,17 +102,30 @@ test('the MJPEG stream flows through the gate unbuffered', async () => {
   assert.ok(jpegs >= 3);
 });
 
-test('WebSocket upgrades are proxied: /ws reaches serve-sim (the Connection: Upgrade fix)', async () => {
+test('WebSocket upgrades are proxied: serve-sim\'s input socket (/helper/<udid>/ws) reaches serve-sim (the Connection: Upgrade fix)', async () => {
   const cookie = await cookieFor();
-  const ws = new WebSocket(`${stack.gate.url.replace('http', 'ws')}/ws`, { headers: { cookie } });
+  const ws = new WebSocket(`${stack.gate.url.replace('http', 'ws')}${HELPER_PATH}/ws`, { headers: { cookie } });
   await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
-  ws.send(JSON.stringify({ type: 'e2e-probe', n: 1 }));
+  // serve-sim's own frame format: byte 0 = tag (3 = touch), then JSON.
+  ws.send(Buffer.concat([Buffer.from([3]), Buffer.from(JSON.stringify({ type: 'begin', x: 0.123, y: 0.456 }))]));
   const inputs = await waitUntil(async () => {
     const list = JSON.parse((await request(`${stack.serveSim.url}/__synthetic/inputs`)).body);
-    return list.some((m) => m.type === 'e2e-probe') && list;
+    return list.some((m) => m.tag === 3 && m.x === 0.123) && list;
   }, 5000, 'the probe never reached serve-sim');
   assert.ok(inputs.length >= 1);
   ws.close();
+});
+
+test('serve-sim has no bare /ws: like the real one, the stand-in closes it', async () => {
+  // The old peer sent input to ws://127.0.0.1:3200/ws. Real serve-sim closes that,
+  // so every tap was lost. The stand-in must behave the same or tests lie.
+  const ws = new WebSocket(`ws://127.0.0.1:${stack.serveSim.port}/ws`);
+  const outcome = await new Promise((resolve) => {
+    ws.once('open', () => resolve('open'));
+    ws.once('error', () => resolve('error'));
+    ws.once('close', () => resolve('closed'));
+  });
+  assert.notEqual(outcome, 'open');
 });
 
 test('WebSocket upgrades are proxied: /signal reaches the WebRTC peer', async () => {
@@ -125,7 +138,7 @@ test('WebSocket upgrades are proxied: /signal reaches the WebRTC peer', async ()
 });
 
 test('a WebSocket without the token is refused', async () => {
-  const ws = new WebSocket(`${stack.gate.url.replace('http', 'ws')}/ws`);
+  const ws = new WebSocket(`${stack.gate.url.replace('http', 'ws')}${HELPER_PATH}/ws`);
   const outcome = await new Promise((resolve) => {
     ws.once('open', () => resolve('open'));
     ws.once('unexpected-response', (_req, res) => resolve(res.statusCode));

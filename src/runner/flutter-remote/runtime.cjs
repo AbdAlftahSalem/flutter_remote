@@ -17,6 +17,8 @@ const config = Object.freeze({
   gateToken: env.FLUTTER_REMOTE_GATE_TOKEN || '',
   transport: env.FLUTTER_REMOTE_TRANSPORT || 'webrtc',
   streamPath: env.FLUTTER_REMOTE_STREAM_PATH || '/stream.mjpeg?raw=1',
+  /** serve-sim's input socket; empty = derived from streamPath (/helper/<udid>/ws) */
+  inputPath: env.FLUTTER_REMOTE_INPUT_PATH || '',
   adaptiveQuality: env.FLUTTER_REMOTE_ADAPTIVE_QUALITY === 'true',
   turnKeyId: env.FLUTTER_REMOTE_TURN_KEY_ID || '',
   turnKeyToken: env.FLUTTER_REMOTE_TURN_KEY_TOKEN || '',

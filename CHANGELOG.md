@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.3
+
+### Fixed
+- **Taps and typing never reached the Simulator** (the stream was live, but clicking the phone did nothing and serve-sim's Event Log stayed at 0). Two bugs, both hidden by the test stand-in:
+  - The gate injects the browser client into serve-sim's own preview page. That page has no `#flutter-remote-container`, so the client mounted on `document.body` and laid a transparent full-page input overlay (z-index 10) over serve-sim's phone. Every click on the phone hit the overlay, never serve-sim's own view. On serve-sim's page the client now stays out of the way, and serve-sim's own viewer handles video and input (its input socket is already tunnelled by the gate).
+  - The clicks the overlay captured went through WebRTC to the runner, which sent them to `ws://127.0.0.1:3200/ws` as JSON text. serve-sim has no `/ws`: its input socket is `/helper/<udid>/ws`, and it takes binary frames (a tag byte, then JSON: 3 = touch, 6 = key, 11 = scroll). serve-sim closed the connection, so every event was dropped. The peer now connects to the real socket (from serve-sim's reported `wsUrl`, or derived from the stream path) and translates pointer, keyboard, scroll and paste into serve-sim's frames. The legacy v1 client (`FLUTTER_REMOTE_TRANSPORT=v1`) relayed serve-sim's frames to the same dead path; those now pass through to the real socket too.
+- The synthetic serve-sim used by the tests now speaks the real protocol (`/helper/<udid>/ws`, binary frames, bare `/ws` refused) and serves a page shaped like serve-sim's UI, so these bugs fail the suite instead of passing it.
+
+### Added
+- `?player=webrtc` on the session link opens the WebRTC player full-window on top of serve-sim's UI (low-latency H.264 video, input through the peer).
+
 ## 0.2.2
 
 ### Fixed

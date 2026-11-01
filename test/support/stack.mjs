@@ -13,10 +13,13 @@ export const GATE = join(RUNNER_DIR, 'gate.cjs');
 export const PEER = join(RUNNER_DIR, 'webrtc-peer.cjs');
 export const SYNTHETIC_SERVE_SIM = join(here, 'synthetic-serve-sim.mjs');
 export const NODE_MODULES = join(ROOT, 'node_modules');
+/** serve-sim serves each simulator under /helper/<udid>/ (stream.mjpeg, ws). */
+export const SYNTHETIC_UDID = 'SYNTHETIC-UDID';
+export const HELPER_PATH = `/helper/${SYNTHETIC_UDID}`;
 
 export async function startServeSim({ size = '390x844', fps = 15 } = {}) {
   const port = await freePort();
-  const proc = startProcess('serve-sim', process.execPath, [SYNTHETIC_SERVE_SIM, '--port', String(port), '--size', size, '--fps', String(fps)]);
+  const proc = startProcess('serve-sim', process.execPath, [SYNTHETIC_SERVE_SIM, '--port', String(port), '--size', size, '--fps', String(fps), '--udid', SYNTHETIC_UDID]);
   await waitForHttp(`http://127.0.0.1:${port}/__synthetic/stats`);
   return { port, proc, url: `http://127.0.0.1:${port}` };
 }
@@ -28,7 +31,8 @@ export async function startPeer({ serveSimPort, env = {} }) {
       NODE_PATH: NODE_MODULES,
       FLUTTER_REMOTE_TARGET_PORT: String(serveSimPort),
       FLUTTER_REMOTE_WEBRTC_SIGNAL_PORT: String(port),
-      FLUTTER_REMOTE_STREAM_PATH: '/stream.mjpeg?raw=1',
+      // As on the runner: the input socket (/helper/<udid>/ws) is derived from this.
+      FLUTTER_REMOTE_STREAM_PATH: `${HELPER_PATH}/stream.mjpeg?raw=1`,
       ...env,
     },
   });
