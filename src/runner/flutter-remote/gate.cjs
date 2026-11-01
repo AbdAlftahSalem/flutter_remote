@@ -18,6 +18,7 @@ const net = require('node:net');
 const path = require('node:path');
 
 const { config, installCrashGuards } = require('./runtime.cjs');
+const { MjpegRelay, relayConfigFromEnv, isMjpegStreamPath } = require('./stream-relay.cjs');
 
 const TOKEN = config.gateToken;
 const TARGET_PORT = config.targetPort;
@@ -36,6 +37,14 @@ if (!TOKEN) {
 
 // A stray socket error must not take the session down.
 installCrashGuards('gate');
+
+// serve-sim's viewer pulls full-resolution JPEGs; the relay sends it scaled,
+// de-duplicated, rate-capped frames instead (see stream-relay.cjs).
+// FLUTTER_REMOTE_STREAM_RELAY=0 restores the plain pass-through.
+const RELAY_CONFIG = relayConfigFromEnv();
+const relay = RELAY_CONFIG.enabled
+  ? new MjpegRelay({ host: TARGET_HOST, port: TARGET_PORT, config: RELAY_CONFIG, log: (msg) => console.log(msg) })
+  : null;
 
 function timingSafeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
@@ -236,6 +245,13 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Stream relay counters (frames in/out, bytes, drops), token-protected.
+  if (pathnameOf(req) === '/__flutter-remote/relay-stats') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(relay ? relay.stats() : { enabled: false }));
+    return;
+  }
+
   // V2 browser client script
   if (pathnameOf(req) === '/__flutter-remote/client.js') {
     res.writeHead(200, {
@@ -269,6 +285,13 @@ const server = http.createServer((req, res) => {
       'Cache-Control': 'no-store',
     });
     res.end();
+    return;
+  }
+
+  // serve-sim's MJPEG stream (its viewer fetches <helper>/stream.mjpeg?raw=1).
+  if (relay && !agent && req.method === 'GET' && isMjpegStreamPath(pathnameOf(req))) {
+    const u = new URL(req.url, 'http://localhost');
+    relay.handle(req, res, u.pathname, u.search);
     return;
   }
 
@@ -411,5 +434,6 @@ server.on('upgrade', (req, socket, head) => {
 
 server.listen(PORT, TARGET_HOST, () => {
   console.log(`[flutter-remote gate] listening on ${TARGET_HOST}:${PORT} -> :${TARGET_PORT} (mode: ${TRANSPORT_MODE})`);
+  console.log(`[flutter-remote gate] ${relay ? relay.describe() : 'MJPEG relay off (FLUTTER_REMOTE_STREAM_RELAY=0): serve-sim frames pass through unchanged'}`);
 });
 

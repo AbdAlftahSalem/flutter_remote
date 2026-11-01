@@ -93,6 +93,9 @@ The link opens in your browser automatically (`--no-open` to skip).
 | `--codec <codec>` | `mjpeg` | How serve-sim captures the Simulator: `mjpeg`, `h264` or `auto` (= `mjpeg`) |
 | `--transport <mode>` | `webrtc` | `webrtc`, or `http` for the older injected client |
 | `--tunnel-protocol <p>` | `quic` | `quic` or `http2` (falls back to `http2` automatically) |
+| `--max-dimension <px>` | `960` | Longest side of the picture sent to the browser (`0` = full size, e.g. 1206×2622 on an iPhone 17 Pro). Smaller = less lag on slow connections |
+| `--fps <n>` | `24` | Most frames per second sent to the browser |
+| `--quality <q>` | `0.6` | Picture quality, `0.05`–`1` |
 | `--app-file <path>` | none | Run a prebuilt simulator `.app` (or `.zip`/`.tar.gz`) instead of building |
 | `--app <url>` / `--app-release <name>` | none | Run a prebuilt app from a URL or a release asset |
 | `--no-cache` | off | Force a clean native rebuild |
@@ -115,6 +118,8 @@ Start with `flutter-remote doctor`. Common cases:
 | `On a branch: HEAD is detached` | `git switch main` |
 | Black screen in the browser | Update: `npm i -g flutter-remote@latest`, then `flutter-remote up` (files from older versions are upgraded automatically). If it persists, attach `webrtc-peer.log` from the Action log to an issue. |
 | The app shows, but taps and typing do nothing (serve-sim's Event Log stays at 0) | Fixed in 0.2.3: `npm i -g flutter-remote@latest`, then `flutter-remote up` again. On an older version, open DevTools (F12) → Console on the session page and run `document.getElementById('flutter-remote-input-overlay')?.remove()`. If the Event Log then counts taps but the app still does not react (Xcode 27 runners), see serve-sim's `repair-input`. |
+| The phone flashes black or lags behind your taps | Fixed in 0.2.3 (the stream is scaled to 960 px and paced to your connection). On a slow connection try `--max-dimension 720 --fps 15`; for full size `--max-dimension 0`. |
+| `npx github:AbdAlftahSalem/flutter_remote up` prints nothing | The first `npx` of a GitHub package clones and installs it silently (21 s on a GitHub Windows runner, longer at home), then runs. Wait for it, or install once with `npm i -g github:AbdAlftahSalem/flutter_remote` and run `flutter-remote up`. |
 | `...edited by you, so it was kept` | You changed a generated file. `flutter-remote init --force` restores it. |
 | GitHub minutes used up | Minutes are free on public repositories. Make the existing one public (`gh repo edit --visibility public`), or run from a copy of the project with no remote using `flutter-remote up --public`, or wait for the monthly reset. Either way the code becomes public. |
 

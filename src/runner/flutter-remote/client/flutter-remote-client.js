@@ -4,6 +4,73 @@
   window.__flutterRemoteV2Initialized = true;
 
   const PROTOCOL_VERSION = 2;
+
+  /**
+   * Key guard, for serve-sim's own UI and the WebRTC player alike.
+   *
+   * Typing "abd" on a Windows viewer gave "å∫∂" (Option+a, Option+b, Option+d):
+   * the Simulator had an Option key held down. Both serve-sim's page and the player
+   * send every key as a HID key down/up, and the Simulator keeps a modifier held
+   * until its "up" arrives. On Windows, Alt is the system's own key: Alt+Tab and
+   * Alt+Shift (switching to/from the Arabic layout) send "Alt down" to the page and
+   * the "Alt up" goes elsewhere, so Option stayed held for every key after it.
+   *
+   * - On a viewer that is not a Mac, Alt/AltGr never reach the Simulator (they are
+   *   the host's keys there, not Option).
+   * - A modifier the page saw go down, but that the next key says is no longer
+   *   pressed (its up went to another window), is released before that key.
+   * - When the page loses focus or is hidden, every key still held is released.
+   *
+   * Releases are dispatched as keyup events on window, so whichever sender is
+   * active (serve-sim's UI or the player) sends the matching HID "up".
+   * Registered at injection time, in the capture phase, so it runs first.
+   */
+  const MODIFIER_FLAG = {
+    AltLeft: 'altKey', AltRight: 'altKey',
+    ControlLeft: 'ctrlKey', ControlRight: 'ctrlKey',
+    ShiftLeft: 'shiftKey', ShiftRight: 'shiftKey',
+    MetaLeft: 'metaKey', MetaRight: 'metaKey',
+  };
+  const MODIFIER_KEY = { altKey: 'Alt', ctrlKey: 'Control', shiftKey: 'Shift', metaKey: 'Meta' };
+  function isMacViewer() {
+    if (typeof window.__flutterRemoteMacViewer === 'boolean') return window.__flutterRemoteMacViewer;
+    const p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || '';
+    return /mac|iphone|ipad/i.test(p);
+  }
+  function installKeyGuard() {
+    if (window.__flutterRemoteKeyGuard) return;
+    const held = new Set();
+    let releasing = false;
+    const release = (code) => {
+      held.delete(code);
+      const flag = MODIFIER_FLAG[code];
+      releasing = true;
+      try {
+        window.dispatchEvent(new KeyboardEvent('keyup', { code, key: flag ? MODIFIER_KEY[flag] : '', bubbles: true }));
+      } catch {} finally { releasing = false; }
+    };
+    const releaseAll = () => { for (const code of Array.from(held)) release(code); };
+    const isHostAlt = (e) => (e.code === 'AltLeft' || e.code === 'AltRight' || e.key === 'AltGraph') && !isMacViewer();
+    window.addEventListener('keydown', (e) => {
+      if (releasing) return;
+      if (isHostAlt(e)) { e.stopImmediatePropagation(); return; }
+      for (const code of Array.from(held)) {
+        const flag = MODIFIER_FLAG[code];
+        if (flag && code !== e.code && e[flag] === false) release(code);
+      }
+      if (e.code) held.add(e.code);
+    }, true);
+    window.addEventListener('keyup', (e) => {
+      if (releasing) return;
+      if (isHostAlt(e)) { e.stopImmediatePropagation(); return; }
+      held.delete(e.code);
+    }, true);
+    window.addEventListener('blur', releaseAll);
+    window.addEventListener('pagehide', releaseAll);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+    window.__flutterRemoteKeyGuard = { held, releaseAll };
+  }
+  installKeyGuard();
   const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
 
   class ConnectionState {
@@ -120,8 +187,6 @@
       this.dataChannels = dataChannels;
       this.overlay = null;
       this.nextSeq = 1;
-      this.pendingMove = null;
-      this.rafId = null;
       this.lastInteractionTime = 0;
       this._init();
     }
@@ -137,17 +202,18 @@
       }
       this.overlay = o;
 
+      // Moves go out the moment they happen, on the unordered, unreliable "input"
+      // channel (a late move is worthless). Finger down/up go on the ordered,
+      // reliable "touch" channel: a lost "up" would leave a finger on the screen.
+      // The peer drops a move that arrives after its "up" (seq numbers).
       const sendPointer = (evt) => {
-        const dc = this.dataChannels.input;
+        const phase = evt.event !== 'move';
+        const touch = this.dataChannels.touch;
+        const dc = phase && touch && touch.readyState === 'open' ? touch : this.dataChannels.input;
         if (dc && dc.readyState === 'open') {
-          if (dc.bufferedAmount > 65536 && evt.event === 'move') return;
+          if (!phase && dc.bufferedAmount > 16384) return; // never queue moves behind a congested link
           dc.send(JSON.stringify(evt));
         }
-      };
-
-      const flush = () => {
-        if (this.pendingMove) { sendPointer(this.pendingMove); this.pendingMove = null; }
-        this.rafId = null;
       };
 
       let pressed = false;
@@ -193,16 +259,10 @@
 
         if (type === 'down') {
           try { this.overlay.setPointerCapture(e.pointerId); } catch {}
-          if (this.rafId) { cancelAnimationFrame(this.rafId); flush(); }
-          sendPointer(evt);
         } else if (type === 'up' || type === 'cancel') {
           try { this.overlay.releasePointerCapture(e.pointerId); } catch {}
-          if (this.rafId) { cancelAnimationFrame(this.rafId); flush(); }
-          sendPointer(evt);
-        } else if (type === 'move') {
-          this.pendingMove = evt;
-          if (!this.rafId) this.rafId = requestAnimationFrame(flush);
         }
+        sendPointer(evt);
       };
 
       this.overlay.addEventListener('pointerdown', (e) => handlePointer(e, 'down'));
@@ -451,6 +511,7 @@
         };
 
         this.dataChannels.input = this.peer.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
+        this.dataChannels.touch = this.peer.createDataChannel('touch', { ordered: true });
         this.dataChannels.keyboard = this.peer.createDataChannel('keyboard', { ordered: true });
         this.dataChannels.control = this.peer.createDataChannel('control', { ordered: true });
         this.dataChannels.telemetry = this.peer.createDataChannel('telemetry', { ordered: false, maxRetransmits: 0 });

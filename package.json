@@ -14,14 +14,16 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 test/e2e/cli.e2e.test.mjs test/e2e/scaffold.e2e.test.mjs test/e2e/gate.e2e.test.mjs test/e2e/stream.e2e.test.mjs",
+    "test": "node --test --test-concurrency=1 test/e2e/cli.e2e.test.mjs test/e2e/scaffold.e2e.test.mjs test/e2e/gate.e2e.test.mjs test/e2e/stream.e2e.test.mjs test/e2e/relay.e2e.test.mjs",
     "test:cli": "node --test test/e2e/cli.e2e.test.mjs test/e2e/scaffold.e2e.test.mjs",
     "test:gate": "node --test test/e2e/gate.e2e.test.mjs",
     "test:stream": "node --test test/e2e/stream.e2e.test.mjs",
     "test:runner": "node --test test/runner/runner.e2e.test.mjs",
     "check": "node scripts/check-syntax.mjs",
     "prepublishOnly": "node scripts/check-syntax.mjs && node scripts/check-clean.mjs",
-    "test:real-ui": "node --test test/e2e/real-serve-sim-ui.e2e.test.mjs"
+    "test:real-ui": "node --test test/e2e/real-serve-sim-ui.e2e.test.mjs",
+    "test:relay": "node --test test/e2e/relay.e2e.test.mjs",
+    "test:lossy": "node --test test/e2e/lossy-webrtc.e2e.test.mjs"
   },
   "repository": {
     "type": "git",

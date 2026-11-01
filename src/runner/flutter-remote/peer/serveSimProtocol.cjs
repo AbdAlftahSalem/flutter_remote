@@ -170,6 +170,51 @@ function isTouchMoveFrame(buf) {
 }
 
 /**
+ * The player sends touch moves on an unordered, unreliable DataChannel (a late
+ * move is worthless; a retransmitted one only adds lag) and begin/end on an
+ * ordered, reliable one (a lost "end" is a finger stuck on the screen). Across
+ * two channels a move can arrive after its "end" or before its "begin";
+ * serve-sim would read that as a touch without a begin. This guard, one per
+ * browser session, drops such moves by the client's sequence numbers.
+ */
+class TouchOrderGuard {
+  constructor() {
+    this.down = false;
+    this.lastPhaseSeq = -Infinity;
+    this.dropped = 0;
+  }
+
+  /** @returns {boolean} false when this raw message is a stale or orphan move to drop. */
+  accept(raw) {
+    let msg;
+    try {
+      const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw);
+      if (text[0] !== '{') return true;
+      msg = JSON.parse(text);
+    } catch { return true; }
+    if (!msg || msg.type !== 'pointer' || msg.isPrimary === false) return true;
+    const seq = Number.isFinite(msg.seq) ? msg.seq : null;
+    if (msg.event === 'down') {
+      this.down = true;
+      if (seq !== null) this.lastPhaseSeq = seq;
+      return true;
+    }
+    if (msg.event === 'up' || msg.event === 'cancel') {
+      this.down = false;
+      if (seq !== null) this.lastPhaseSeq = seq;
+      return true;
+    }
+    if (msg.event === 'move') {
+      if (!this.down || (seq !== null && seq < this.lastPhaseSeq)) {
+        this.dropped++;
+        return false;
+      }
+    }
+    return true;
+  }
+}
+
+/**
  * serve-sim's input socket lives next to its stream: `/helper/<udid>/stream.mjpeg`
  * -> `/helper/<udid>/ws`. An explicit path always wins.
  */
@@ -188,4 +233,5 @@ module.exports = {
   textToKeyFrames,
   isTouchMoveFrame,
   inputPathFor,
+  TouchOrderGuard,
 };
