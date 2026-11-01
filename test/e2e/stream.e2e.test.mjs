@@ -160,6 +160,94 @@ test('a key press in the WebRTC player reaches serve-sim once, as a HID key down
   assert.equal(all.filter((m) => m.type === 'down' && m.usage === 4).length, 1, `"a" went down ${JSON.stringify(all)}`);
 });
 
+// Typing "abd" from a Windows viewer gave "å∫∂" in the app (Option+a/b/d): an Alt
+// went down in the page and its up went to another window (Alt+Tab, Alt+Shift layout
+// switch), so serve-sim kept Option held. Option is HID usage 226 (AltLeft) / 230 (AltRight).
+const OPTION = new Set([226, 230]);
+async function openServeSimUi() {
+  const page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+  await page.goto(`${stack.gate.url}/?k=${stack.gate.token}`);
+  await page.waitForFunction(() => window.__syntheticUiSocket && window.__syntheticUiSocket.readyState === 1, null, { timeout: 10000 });
+  return page;
+}
+const keyFrames = async (from) => (await inputs()).slice(from).filter((m) => m.tag === 6);
+const downs = (list) => list.filter((m) => m.type === 'down').map((m) => m.usage);
+
+test('"abd" on serve-sim\'s UI from a non-Mac viewer reaches the Simulator as a, b, d with no Option, even with Alt held', async () => {
+  const page = await openServeSimUi();
+  const from = (await inputs()).length;
+  await page.keyboard.down('Alt'); // Alt+Tab / Alt+Shift: its "up" goes to another window
+  await page.keyboard.type('abd');
+  const got = await waitUntil(async () => {
+    const list = await keyFrames(from);
+    return list.some((m) => m.type === 'up' && m.usage === 7) && list;
+  }, 10000, '"abd" never reached serve-sim');
+  await page.keyboard.up('Alt');
+  await page.waitForTimeout(200);
+  const all = await keyFrames(from);
+  await page.close();
+  assert.deepEqual(downs(got), [4, 5, 7], `keys that went down: ${JSON.stringify(got)}`);
+  assert.equal(all.filter((m) => OPTION.has(m.usage)).length, 0, `Option reached the Simulator: ${JSON.stringify(all)}`);
+});
+
+test('a modifier whose key-up went to another window is released before the next key (Mac viewer, Option)', async () => {
+  const page = await openServeSimUi();
+  await page.evaluate(() => { window.__flutterRemoteMacViewer = true; });
+  const from = (await inputs()).length;
+  await page.keyboard.down('Alt'); // on a Mac viewer Option does reach the Simulator
+  await waitUntil(async () => (await keyFrames(from)).some((m) => m.type === 'down' && m.usage === 226), 10000, 'Option down never arrived');
+  // The Alt "up" was lost; the next key says Alt is no longer pressed.
+  await page.evaluate(() => {
+    window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyA', key: 'a', altKey: false, bubbles: true }));
+    window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyA', key: 'a', altKey: false, bubbles: true }));
+  });
+  const got = await waitUntil(async () => {
+    const list = await keyFrames(from);
+    return list.some((m) => m.type === 'up' && m.usage === 4) && list;
+  }, 10000, '"a" never reached serve-sim');
+  await page.keyboard.up('Alt');
+  await page.close();
+  const optionUp = got.findIndex((m) => m.type === 'up' && m.usage === 226);
+  const aDown = got.findIndex((m) => m.type === 'down' && m.usage === 4);
+  assert.ok(optionUp >= 0 && optionUp < aDown, `Option must be released before "a": ${JSON.stringify(got)}`);
+});
+
+test('keys still held when the page loses focus are released (Shift stays not stuck)', async () => {
+  const page = await openServeSimUi();
+  const from = (await inputs()).length;
+  await page.keyboard.down('Shift');
+  await waitUntil(async () => (await keyFrames(from)).some((m) => m.type === 'down' && m.usage === 225), 10000, 'Shift down never arrived');
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  await waitUntil(async () => (await keyFrames(from)).some((m) => m.type === 'up' && m.usage === 225), 10000, 'Shift was never released on blur');
+  // Shift still gives capitals while it is really held.
+  const from2 = (await inputs()).length;
+  await page.keyboard.up('Shift');
+  await page.keyboard.press('Shift+KeyA');
+  const got = await waitUntil(async () => {
+    const list = await keyFrames(from2);
+    return list.some((m) => m.type === 'up' && m.usage === 4) && list;
+  }, 10000, '"A" never reached serve-sim');
+  await page.close();
+  assert.deepEqual(downs(got), [225, 4], `Shift+A: ${JSON.stringify(got)}`);
+});
+
+test('in the WebRTC player, Alt held on a non-Mac viewer never reaches the Simulator as Option', async () => {
+  const { page } = await openViewer();
+  const from = (await inputs()).length;
+  await page.keyboard.down('Alt');
+  await page.keyboard.press('a');
+  await page.keyboard.up('Alt');
+  const got = await waitUntil(async () => {
+    const list = await keyFrames(from);
+    return list.some((m) => m.type === 'up' && m.usage === 4) && list;
+  }, 10000, 'the key never reached serve-sim');
+  await page.waitForTimeout(200);
+  const all = await keyFrames(from);
+  await page.close();
+  assert.ok(got.length > 0);
+  assert.equal(all.filter((m) => OPTION.has(m.usage)).length, 0, `Option reached the Simulator: ${JSON.stringify(all)}`);
+});
+
 test('a scroll in the WebRTC player reaches serve-sim as a scroll frame', async () => {
   const { page } = await openViewer();
   const before = (await inputs()).length;

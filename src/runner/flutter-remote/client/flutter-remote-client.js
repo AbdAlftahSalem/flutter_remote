@@ -4,6 +4,73 @@
   window.__flutterRemoteV2Initialized = true;
 
   const PROTOCOL_VERSION = 2;
+
+  /**
+   * Key guard, for serve-sim's own UI and the WebRTC player alike.
+   *
+   * Typing "abd" on a Windows viewer gave "å∫∂" (Option+a, Option+b, Option+d):
+   * the Simulator had an Option key held down. Both serve-sim's page and the player
+   * send every key as a HID key down/up, and the Simulator keeps a modifier held
+   * until its "up" arrives. On Windows, Alt is the system's own key: Alt+Tab and
+   * Alt+Shift (switching to/from the Arabic layout) send "Alt down" to the page and
+   * the "Alt up" goes elsewhere, so Option stayed held for every key after it.
+   *
+   * - On a viewer that is not a Mac, Alt/AltGr never reach the Simulator (they are
+   *   the host's keys there, not Option).
+   * - A modifier the page saw go down, but that the next key says is no longer
+   *   pressed (its up went to another window), is released before that key.
+   * - When the page loses focus or is hidden, every key still held is released.
+   *
+   * Releases are dispatched as keyup events on window, so whichever sender is
+   * active (serve-sim's UI or the player) sends the matching HID "up".
+   * Registered at injection time, in the capture phase, so it runs first.
+   */
+  const MODIFIER_FLAG = {
+    AltLeft: 'altKey', AltRight: 'altKey',
+    ControlLeft: 'ctrlKey', ControlRight: 'ctrlKey',
+    ShiftLeft: 'shiftKey', ShiftRight: 'shiftKey',
+    MetaLeft: 'metaKey', MetaRight: 'metaKey',
+  };
+  const MODIFIER_KEY = { altKey: 'Alt', ctrlKey: 'Control', shiftKey: 'Shift', metaKey: 'Meta' };
+  function isMacViewer() {
+    if (typeof window.__flutterRemoteMacViewer === 'boolean') return window.__flutterRemoteMacViewer;
+    const p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || '';
+    return /mac|iphone|ipad/i.test(p);
+  }
+  function installKeyGuard() {
+    if (window.__flutterRemoteKeyGuard) return;
+    const held = new Set();
+    let releasing = false;
+    const release = (code) => {
+      held.delete(code);
+      const flag = MODIFIER_FLAG[code];
+      releasing = true;
+      try {
+        window.dispatchEvent(new KeyboardEvent('keyup', { code, key: flag ? MODIFIER_KEY[flag] : '', bubbles: true }));
+      } catch {} finally { releasing = false; }
+    };
+    const releaseAll = () => { for (const code of Array.from(held)) release(code); };
+    const isHostAlt = (e) => (e.code === 'AltLeft' || e.code === 'AltRight' || e.key === 'AltGraph') && !isMacViewer();
+    window.addEventListener('keydown', (e) => {
+      if (releasing) return;
+      if (isHostAlt(e)) { e.stopImmediatePropagation(); return; }
+      for (const code of Array.from(held)) {
+        const flag = MODIFIER_FLAG[code];
+        if (flag && code !== e.code && e[flag] === false) release(code);
+      }
+      if (e.code) held.add(e.code);
+    }, true);
+    window.addEventListener('keyup', (e) => {
+      if (releasing) return;
+      if (isHostAlt(e)) { e.stopImmediatePropagation(); return; }
+      held.delete(e.code);
+    }, true);
+    window.addEventListener('blur', releaseAll);
+    window.addEventListener('pagehide', releaseAll);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+    window.__flutterRemoteKeyGuard = { held, releaseAll };
+  }
+  installKeyGuard();
   const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
 
   class ConnectionState {
