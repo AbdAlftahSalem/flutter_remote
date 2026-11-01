@@ -2,7 +2,7 @@ import { existsSync, statSync, readFileSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { usageError } from './errors.js';
 
-const SIMULATOR_BUILD = 'flutter build ios --simulator --no-codesign   (the app is in build/ios/iphonesimulator/Runner.app)';
+const SIMULATOR_BUILD = 'flutter build ios --simulator   (the app is in build/ios/iphonesimulator/Runner.app)';
 
 /**
  * Validate a prebuilt app for the iOS Simulator: a Runner.app folder, or a

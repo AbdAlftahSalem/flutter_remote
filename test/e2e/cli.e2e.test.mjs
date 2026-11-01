@@ -108,7 +108,7 @@ test('upload refuses a device .ipa and says how to make a simulator build', () =
   const r = cli(['upload', 'Runner.ipa'], { cwd: dir });
   assert.equal(r.code, 2);
   assert.match(r.stderr, /device build/);
-  assert.match(r.stderr, /flutter build ios --simulator --no-codesign/);
+  assert.match(r.stderr, /flutter build ios --simulator /);
 });
 
 test('upload refuses an iPhoneOS .app', () => {

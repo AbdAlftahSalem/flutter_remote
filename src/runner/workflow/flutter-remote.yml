@@ -143,7 +143,7 @@ jobs:
             | xargs shasum -a 256 2>/dev/null \
             | shasum -a 256 \
             | awk '{print $1}')
-          BUILD_KEY="${SOURCE_HASH}-${{ inputs.runner }}-${{ inputs.flutter_version }}-${{ inputs.build_mode }}-${{ inputs.flavor }}-${{ inputs.target }}-${{ inputs.dart_defines }}"
+          BUILD_KEY="signed-v1-${SOURCE_HASH}-${{ inputs.runner }}-${{ inputs.flutter_version }}-${{ inputs.build_mode }}-${{ inputs.flavor }}-${{ inputs.target }}-${{ inputs.dart_defines }}"
           FULL_HASH=$(printf '%s' "$BUILD_KEY" | shasum -a 256 | awk '{print substr($1, 1, 16)}')
           echo "hash=$FULL_HASH" >> "$GITHUB_OUTPUT"
           echo "Flutter build cache fingerprint: $FULL_HASH"
@@ -385,10 +385,13 @@ jobs:
           echo "Preparing Flutter dependencies..."
           flutter pub get
 
+          # No --no-codesign: Xcode signs Simulator builds locally ("Sign to Run Locally", no team or
+          # certificate needed) and embeds the Simulator entitlements. An unsigned build has no
+          # application-identifier, so every Keychain call fails with -34018 (flutter_secure_storage,
+          # firebase_auth, sign-in plugins...) and apps that keep their session there cannot log in.
           BUILD_ARGS=(
             ios
             --simulator
-            --no-codesign
           )
 
           if [ '${{ inputs.build_mode }}' = 'profile' ] || [ '${{ inputs.build_mode }}' = 'release' ]; then

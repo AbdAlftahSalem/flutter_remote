@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4
+
+### Fixed
+- **Login failed with Keychain error -34018 on the Simulator.** The runner built the app with `flutter build ios --simulator --no-codesign`. An unsigned Simulator build has no `application-identifier` entitlement, so every Keychain call fails with -34018 ("A required entitlement isn't present"): `flutter_secure_storage`, Firebase Auth, Google/Apple sign-in and any app that stores its session token there could not log in. Simulator builds are now signed locally by Xcode (no team or certificate needed). The build cache key changed, so old unsigned cached builds are not reused.
+
 ## 0.2.3
 
 ### Fixed
