@@ -98,7 +98,7 @@ export function checkRemote(cwd) {
   const [name, visibility] = repo.out.split(' ');
   return [visibility === 'PUBLIC'
     ? pass('gh-remote', 'GitHub repository', `${name} (public: free macOS minutes)`)
-    : warn('gh-remote', 'GitHub repository', `${name} is private: macOS runner minutes count 10× against your quota`, 'make the repo public, or use a separate public repo with --public')];
+    : warn('gh-remote', 'GitHub repository', `${name} is private: runs use your GitHub Actions minutes`, 'make the repo public, or use a separate public repo with --public')];
 }
 
 /** Are the flutter-remote files in this repo current, outdated, or edited? */

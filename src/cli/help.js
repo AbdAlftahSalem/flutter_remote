@@ -42,7 +42,7 @@ ${bold('OPTIONS (flutter-remote up)')}
   --agent                Enable agent-device proxy for AI agents
   --export               Download the built .app as artifact
   --no-cache             Force a clean native rebuild
-  --public               Create/push to public repository       ${dim('(free unlimited macOS minutes)')}
+  --public               Create/push to public repository       ${dim('(free macOS minutes)')}
   --repo <name>          Custom repository name when creating
   --message <msg>        Git commit message
   --no-open              Do not automatically open the browser

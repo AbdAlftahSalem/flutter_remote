@@ -93,14 +93,14 @@ export async function up(cwd, flags = {}) {
     if (isPublic) {
       warn(`Creating a PUBLIC repository ${bold(name)}: anyone can read this code.`);
     } else {
-      warn(`Creating a private repository ${bold(name)}: macOS minutes count 10× (add --public for free minutes).`);
+      warn(`Creating a private repository ${bold(name)}: runs use your GitHub Actions minutes (add --public for free minutes).`);
     }
     repo = gh.createRepo(cwd, name, { isPublic, branch });
     ok(`Created ${bold(repo)} and pushed ${bold(branch)}`);
   } else {
     git.push(cwd, branch);
     ok(`Pushed ${bold(branch)} to ${bold(repo)}`);
-    if (!gh.isPublicRepo(cwd)) warn(`${bold(repo)} is private: macOS minutes count 10× against your quota`);
+    if (!gh.isPublicRepo(cwd)) warn(`${bold(repo)} is private: runs use your GitHub Actions minutes`);
   }
   if (changed(report)) ok('flutter-remote workflow is on GitHub');
 
@@ -145,7 +145,7 @@ export async function up(cwd, flags = {}) {
   }
 
   // 4. Wait for the build and the stream.
-  steps.next('Building the app and starting the simulator (first run ~8–12 min, cached runs ~3 min)');
+  steps.next('Building the app and starting the simulator (the first run takes a while; later runs are faster thanks to caching)');
   const wait = spinner('Building on the macOS runner');
   const deadline = Date.now() + STREAM_TIMEOUT_MS;
   let liveUrl = null;
