@@ -1,7 +1,10 @@
 /**
  * Streaming end-to-end: a real headless Google Chrome opens the gate URL the
- * way a user does, negotiates real WebRTC with the real webrtc-peer.cjs, and
- * must show real, moving H.264 video. Taps and keys must reach serve-sim.
+ * way a user does. On serve-sim's own UI (the default page) the client must stay
+ * out of the way so serve-sim's own taps and keys work. With ?player=webrtc it
+ * negotiates real WebRTC with the real webrtc-peer.cjs, must show real, moving
+ * H.264 video, and its taps and keys must reach serve-sim in serve-sim's own
+ * binary format on /helper/<udid>/ws.
  *
  * The only stand-in is serve-sim itself (synthetic-serve-sim.mjs: FFmpeg
  * testsrc2 as MJPEG), because there is no iOS Simulator on Linux/Windows.
@@ -28,7 +31,7 @@ async function openViewer() {
   const page = await browser.newPage({ viewport: { width: 500, height: 900 } });
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
-  await page.goto(`${stack.gate.url}/?k=${stack.gate.token}`);
+  await page.goto(`${stack.gate.url}/?player=webrtc&k=${stack.gate.token}`);
   await page.waitForFunction(() => {
     const v = document.getElementById('flutter-remote-video');
     return v && v.videoWidth > 0 && v.currentTime > 0;
@@ -37,6 +40,42 @@ async function openViewer() {
 }
 
 const inputs = async () => JSON.parse((await request(`${stack.serveSim.url}/__synthetic/inputs`)).body);
+const rejected = async () => JSON.parse((await request(`${stack.serveSim.url}/__synthetic/rejected`)).body);
+
+test('on serve-sim\'s own UI the client adds no overlay, and a tap on serve-sim\'s phone reaches serve-sim', async () => {
+  // The reported bug: the client covered serve-sim's page with a transparent
+  // full-page overlay, so clicks on the phone never reached serve-sim (Event Log 0).
+  const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto(`${stack.gate.url}/?k=${stack.gate.token}`);
+  await page.waitForFunction(() => window.__syntheticUiSocket && window.__syntheticUiSocket.readyState === 1, null, { timeout: 10000 });
+  const state = await page.evaluate(() => {
+    const t = document.getElementById('device-touch').getBoundingClientRect();
+    const hit = document.elementFromPoint(t.left + t.width / 2, t.top + t.height / 2);
+    return {
+      overlay: Boolean(document.getElementById('flutter-remote-input-overlay')),
+      video: Boolean(document.getElementById('flutter-remote-video')),
+      mode: window.__flutterRemoteClient && window.__flutterRemoteClient.mode,
+      hit: hit && hit.id,
+      center: { x: t.left + t.width / 2, y: t.top + t.height / 2 },
+    };
+  });
+  assert.equal(state.overlay, false, 'no input overlay on serve-sim\'s page');
+  assert.equal(state.video, false, 'no hidden second video on serve-sim\'s page');
+  assert.equal(state.mode, 'serve-sim-ui');
+  assert.equal(state.hit, 'device-touch', `a click on the phone lands on ${state.hit}, not serve-sim's view`);
+
+  const before = (await inputs()).length;
+  await page.mouse.click(state.center.x, state.center.y);
+  const got = await waitUntil(async () => {
+    const list = (await inputs()).slice(before).filter((m) => m.tag === 3);
+    return list.some((m) => m.type === 'begin') && list.some((m) => m.type === 'end') && list;
+  }, 10000, 'serve-sim\'s own tap never reached serve-sim through the gate');
+  await page.close();
+  assert.deepEqual(errors, [], 'no page errors');
+  assert.ok(Math.abs(got[0].x - 0.5) < 0.02 && Math.abs(got[0].y - 0.5) < 0.02);
+});
 
 test('the browser shows live, non-black H.264 video within seconds', async () => {
   const started = Date.now();
@@ -82,30 +121,51 @@ test('the picture keeps moving (not frozen)', async () => {
   assert.notEqual(s1.mean.toFixed(3), s2.mean.toFixed(3), 'two samples 1.5 s apart are identical');
 });
 
-test('a tap on the video reaches serve-sim as pointer down and up', async () => {
+test('a tap in the WebRTC player reaches serve-sim as a touch begin and end at the right spot', async () => {
   const { page } = await openViewer();
   const before = (await inputs()).length;
+  const rejectedBefore = (await rejected()).length;
   const box = await page.locator('#flutter-remote-input-overlay').boundingBox();
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
   const got = await waitUntil(async () => {
-    const list = (await inputs()).slice(before);
-    const kinds = list.map((m) => m.event ?? m.phase ?? m.action ?? m.type);
-    return kinds.some((k) => /down/.test(k)) && kinds.some((k) => /up/.test(k)) && list;
-  }, 10000, 'pointer down/up never reached serve-sim');
+    const list = (await inputs()).slice(before).filter((m) => m.tag === 3);
+    return list.some((m) => m.type === 'begin') && list.some((m) => m.type === 'end') && list;
+  }, 10000, 'touch begin/end never reached serve-sim');
   await page.close();
-  assert.ok(got.every((m) => typeof m === 'object'));
+  const begin = got.find((m) => m.type === 'begin');
+  assert.ok(Math.abs(begin.x - 0.5) < 0.02 && Math.abs(begin.y - 0.5) < 0.02, `tap landed at ${begin.x},${begin.y}`);
+  assert.equal((await rejected()).length, rejectedBefore, 'serve-sim got frames it could not read');
 });
 
-test('a key press reaches serve-sim', async () => {
+test('a key press in the WebRTC player reaches serve-sim once, as a HID key down and up', async () => {
   const { page } = await openViewer();
   const before = (await inputs()).length;
   await page.keyboard.press('a');
   const got = await waitUntil(async () => {
-    const list = (await inputs()).slice(before);
-    return list.some((m) => JSON.stringify(m).includes('"a"') || /key/i.test(m.type ?? '')) && list;
+    const list = (await inputs()).slice(before).filter((m) => m.tag === 6);
+    return list.some((m) => m.type === 'up' && m.usage === 4) && list;
   }, 10000, 'the key never reached serve-sim');
+  await page.waitForTimeout(300);
+  const all = (await inputs()).slice(before).filter((m) => m.tag === 6);
   await page.close();
   assert.ok(got.length > 0);
+  // serve-sim's own UI underneath also listens for keys; the player must take them first.
+  assert.equal(all.filter((m) => m.type === 'down' && m.usage === 4).length, 1, `"a" went down ${JSON.stringify(all)}`);
+});
+
+test('a scroll in the WebRTC player reaches serve-sim as a scroll frame', async () => {
+  const { page } = await openViewer();
+  const before = (await inputs()).length;
+  const box = await page.locator('#flutter-remote-input-overlay').boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.wheel(0, 120);
+  const got = await waitUntil(async () => {
+    const list = (await inputs()).slice(before).filter((m) => m.tag === 11);
+    return list.length > 0 && list;
+  }, 10000, 'the scroll never reached serve-sim');
+  await page.close();
+  assert.ok(got[0].dy > 0, `dy ${got[0].dy}`);
+  assert.ok(got[0].x >= 0 && got[0].x <= 1 && got[0].y >= 0 && got[0].y <= 1);
 });
 
 test('reloading the page reconnects and the video comes back', async () => {

@@ -251,6 +251,21 @@ jobs:
           echo "stream_path=$STREAM_PATH" >> "$GITHUB_OUTPUT"
           echo "FLUTTER_REMOTE_STREAM_PATH=$STREAM_PATH" >> "$GITHUB_ENV"
 
+          # serve-sim's input socket is /helper/<udid>/ws (binary frames), not /ws.
+          # Use the wsUrl serve-sim reports; when it reports none, the peer derives
+          # it from the stream path.
+          INPUT_PATH=$(node -e '
+            const out = process.argv[1] || "";
+            let ws = "";
+            try { ws = JSON.parse(out).wsUrl || ""; } catch {
+              const m = out.match(/"wsUrl"\s*:\s*"([^"]+)"/);
+              if (m) ws = m[1];
+            }
+            try { if (ws) console.log(new URL(ws).pathname); } catch {}
+          ' "$SERVE_SIM_OUT")
+          echo "Input socket path: ${INPUT_PATH:-<derived from stream path>}"
+          echo "input_path=$INPUT_PATH" >> "$GITHUB_OUTPUT"
+
       - name: Install WebRTC peer dependencies
         timeout-minutes: 5
         run: |
@@ -265,6 +280,7 @@ jobs:
           FLUTTER_REMOTE_WEBRTC_SIGNAL_PORT: "3201"
           FLUTTER_REMOTE_TRANSPORT: ${{ inputs.transport }}
           FLUTTER_REMOTE_STREAM_PATH: ${{ steps.serve_sim.outputs.stream_path || env.FLUTTER_REMOTE_STREAM_PATH || format('/helper/{0}/stream.mjpeg?raw=1', steps.sim.outputs.udid) }}
+          FLUTTER_REMOTE_INPUT_PATH: ${{ steps.serve_sim.outputs.input_path }}
         run: |
           set -euo pipefail
           export NODE_PATH="$(npm root -g)"

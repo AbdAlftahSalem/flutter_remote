@@ -41,6 +41,7 @@ try {
 
 const PREVIEW_PORT = config.targetPort;
 const STREAM_PATH = config.streamPath;
+const INPUT_PATH = config.inputPath;
 const SIGNAL_PORT = config.signalPort;
 const TRANSPORT_MODE = config.transport;
 const ADAPTIVE_QUALITY_ENABLED = config.adaptiveQuality;
@@ -85,6 +86,7 @@ const serveSimConsumer = new ServeSimConsumer({
   targetHost: TARGET_HOST,
   previewPort: PREVIEW_PORT,
   streamPath: STREAM_PATH,
+  inputPath: INPUT_PATH,
   videoEncoder,
   streamWsClients,
   activeVideoTracks,
@@ -207,4 +209,5 @@ server.listen(SIGNAL_PORT, TARGET_HOST, () => {
   console.log(`[webrtc-peer] listening on ${TARGET_HOST}:${SIGNAL_PORT}`);
   console.log(`[webrtc-peer] target serve-sim: ${TARGET_HOST}:${PREVIEW_PORT}`);
   console.log(`[webrtc-peer] stream path: ${STREAM_PATH}`);
+  console.log(`[webrtc-peer] input path: ${serveSimConsumer.inputPath}`);
 });

@@ -4,11 +4,14 @@
  * Owns:
  *   1. HTTP client for serve-sim MJPEG stream (SOI/EOI boundary demarcation)
  *   2. Feeding parsed JPEGs to VideoEncoder & legacy /stream-ws subscribers
- *   3. WebSocket client bridge to serve-sim /ws with offline queueing & move coalescing
+ *   3. WebSocket client bridge to serve-sim's input socket (/helper/<udid>/ws),
+ *      translating browser input into serve-sim's binary frames, with offline
+ *      queueing & move coalescing (see serveSimProtocol.cjs)
  */
 
 const http = require('node:http');
 const { createJpegSplitter } = require('./mjpeg.cjs');
+const { toServeSimFrames, isTouchMoveFrame, inputPathFor } = require('./serveSimProtocol.cjs');
 
 class ServeSimConsumer {
   constructor(options = {}) {
@@ -19,6 +22,7 @@ class ServeSimConsumer {
     this.streamWsClients = options.streamWsClients || new Set();
     this.activeVideoTracks = options.activeVideoTracks || new Set();
     this.WebSocketClass = options.WebSocketClass || null;
+    this.inputPath = inputPathFor({ inputPath: options.inputPath, streamPath: this.streamPath });
 
     this.localStreamReq = null;
     this.jpegFrameCount = 0;
@@ -174,30 +178,28 @@ class ServeSimConsumer {
   }
 
   sendToServeSim(msg) {
+    // Browser messages are JSON; serve-sim only understands binary tag+JSON frames.
+    const frames = toServeSimFrames(msg);
+    for (const f of frames) this._sendFrame(f);
+  }
+
+  _sendFrame(buf) {
     if (this.serveSimWs && this.serveSimWs.readyState === 1 /* OPEN */) {
       try {
-        this.serveSimWs.send(msg);
+        this.serveSimWs.send(buf, { binary: true });
         return;
       } catch {}
     }
 
     if (this.serveSimQueue.length < 500) {
-      try {
-        const parsed = JSON.parse(typeof msg === 'string' ? msg : msg.toString());
-        if (parsed.event === 'move' || parsed.type === 'pointer_move') {
-          const lastIdx = this.serveSimQueue.findLastIndex((item) => {
-            try {
-              const p = JSON.parse(typeof item === 'string' ? item : item.toString());
-              return p.event === 'move' || p.type === 'pointer_move';
-            } catch { return false; }
-          });
-          if (lastIdx !== -1) {
-            this.serveSimQueue[lastIdx] = msg;
-            return;
-          }
+      if (isTouchMoveFrame(buf)) {
+        const lastIdx = this.serveSimQueue.findLastIndex((item) => isTouchMoveFrame(item));
+        if (lastIdx !== -1 && lastIdx === this.serveSimQueue.length - 1) {
+          this.serveSimQueue[lastIdx] = buf;
+          return;
         }
-      } catch {}
-      this.serveSimQueue.push(msg);
+      }
+      this.serveSimQueue.push(buf);
     }
 
     this.initServeSimWs();
@@ -208,20 +210,23 @@ class ServeSimConsumer {
     if (this.serveSimConnecting || (this.serveSimWs && this.serveSimWs.readyState === 1 /* OPEN */)) return;
     this.serveSimConnecting = true;
 
-    this.serveSimWs = new this.WebSocketClass(`ws://${this.targetHost}:${this.previewPort}/ws`);
+    const url = `ws://${this.targetHost}:${this.previewPort}${this.inputPath}`;
+    const ws = new this.WebSocketClass(url);
+    this.serveSimWs = ws;
 
-    this.serveSimWs.on('open', () => {
+    ws.on('open', () => {
       this.serveSimConnecting = false;
-      console.log('[webrtc-peer] Connected to serve-sim /ws, flushing queue of', this.serveSimQueue.length);
-      while (this.serveSimQueue.length > 0 && this.serveSimWs.readyState === 1) {
+      console.log(`[webrtc-peer] Connected to serve-sim input ${this.inputPath}, flushing queue of`, this.serveSimQueue.length);
+      while (this.serveSimQueue.length > 0 && ws.readyState === 1) {
         const m = this.serveSimQueue.shift();
-        try { this.serveSimWs.send(m); } catch {}
+        try { ws.send(m, { binary: true }); } catch {}
       }
     });
 
-    this.serveSimWs.on('error', (err) => {
+    ws.on('error', (err) => {
       this.serveSimConnecting = false;
-      console.warn('[webrtc-peer -> serve-sim ws error]', err.message);
+      // Loud on purpose: a wrong input path means taps silently do nothing.
+      console.warn(`[webrtc-peer -> serve-sim input ${url}] ${err.message}`);
     });
 
     this.serveSimWs.on('close', () => {

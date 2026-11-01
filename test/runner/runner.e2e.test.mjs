@@ -4,9 +4,10 @@
  * Runs `flutter-remote up` for real against a real Flutter app (fixture/main.dart),
  * which dispatches the real workflow on a real GitHub macOS runner, builds the
  * app, boots the real iOS Simulator and opens the tunnel. Then a real headless
- * Chrome opens the printed link and checks: video arrives, it is the app (green
- * screen, not black), and a tap in the browser flips the app to yellow in the
- * Simulator. Finally `flutter-remote down`.
+ * Chrome opens the printed link with ?player=webrtc (the WebRTC player, so the
+ * peer's input bridge to serve-sim is what gets tested) and checks: video arrives,
+ * it is the app (green screen, not black), and a tap in the browser flips the app
+ * to yellow in the Simulator. Finally `flutter-remote down`.
  *
  * Needs: GH_TOKEN with repo + workflow scope, FR_E2E_APP_DIR (a Flutter app
  * folder, see .github/workflows/e2e-runner.yml), Google Chrome. Costs macOS
@@ -53,7 +54,8 @@ test('flutter-remote up streams the real app from the iOS Simulator, and taps re
   const { url } = await up();
   browser = await launchChrome();
   const page = await browser.newPage({ viewport: { width: 600, height: 1000 } });
-  await page.goto(url);
+  // Without ?player=webrtc the page is serve-sim's own UI, which handles input itself.
+  await page.goto(url.replace('/?k=', '/?player=webrtc&k='));
   await page.waitForFunction(() => {
     const v = document.getElementById('flutter-remote-video');
     return v && v.videoWidth > 0 && v.currentTime > 0;

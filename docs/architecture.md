@@ -39,13 +39,15 @@ src/runner/flutter-remote/              → .github/flutter-remote/   (1:1)
   runtime.cjs          env config + crash guards (shared by gate and peer)
   gate.cjs             auth gate: ?k= token → HttpOnly cookie, proxies serve-sim,
                        WebSocket upgrades (/signal → peer), injects the client
-  client/flutter-remote-client.js   browser client (WebRTC video + input channels)
+  client/flutter-remote-client.js   browser client: stays out of serve-sim's own UI;
+                                    with ?player=webrtc, a WebRTC player (video + input channels)
   client/legacy-hid.js              v1 client (FLUTTER_REMOTE_TRANSPORT=v1)
-  webrtc-peer.cjs      MJPEG from serve-sim → H.264 → RTP over WebRTC; input → serve-sim /ws
+  webrtc-peer.cjs      MJPEG from serve-sim → H.264 → RTP over WebRTC; input → serve-sim /helper/<udid>/ws
   peer/
     PeerSession.cjs        one browser: offer/answer, H.264 negotiated from the offer
     DataChannelRouter.cjs  input / keyboard / control / telemetry channels
     ServeSimConsumer.cjs   reads serve-sim's MJPEG stream, forwards input
+    serveSimProtocol.cjs   serve-sim's input frames (tag byte + JSON) and the translation into them
     mjpeg.cjs              JPEG splitter (also used by `benchmark`)
     VideoEncoder.cjs       FFmpeg H.264 encoder (VideoToolbox or libx264)
     ffmpegArgs.cjs         the single FFmpeg argument builder
@@ -64,12 +66,35 @@ untouched. Line endings are normalized first, so Windows checkouts are fine.
 
 ```text
 iOS Simulator → serve-sim :3200 ──MJPEG──▶ webrtc-peer :3201 ──H.264/RTP──┐
-                     ▲  /ws (input)              ▲ /signal (WebSocket)       │
+                     ▲  /helper/<udid>/ws        ▲ /signal (WebSocket)       │
                      └────────── gate :3199 ─────┘                            │
                                    ▲ cloudflared (https)                      │
 browser ──── page + client.js + signaling ──────┘                             │
 browser ◀──────────────────────── WebRTC video + DataChannels ◀───────────────┘
 ```
+
+## Input
+
+serve-sim's input socket is `/helper/<udid>/ws` on the preview port (there is no
+bare `/ws`; serve-sim closes it). Every message is one binary frame: byte 0 is a
+tag, the rest is UTF-8 JSON.
+
+| Tag | Meaning | JSON |
+|---|---|---|
+| 3 | touch | `{type: "begin" \| "move" \| "end", x, y}`, x and y normalized 0..1 |
+| 6 | key | `{type: "down" \| "up", usage}`, USB HID usage (keyboard page) |
+| 11 | scroll | `{dx, dy, x, y}`, dx and dy as a fraction of the screen |
+
+Two paths reach it:
+
+- **serve-sim's own UI** (the default page). Its viewer sends these frames itself;
+  the gate tunnels the WebSocket. The injected client adds nothing to this page:
+  covering it with an overlay is what broke input in 0.2.2.
+- **The WebRTC player** (`?player=webrtc`). The client sends JSON on DataChannels;
+  `serveSimProtocol.cjs` translates it into frames and `ServeSimConsumer.cjs`
+  sends them. Binary frames that already carry a serve-sim tag (the v1 client)
+  pass through unchanged. If nothing reacts, `webrtc-peer.log` names the input
+  path it connected to.
 
 ## Tests
 
