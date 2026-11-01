@@ -16,6 +16,8 @@
 - The WebRTC player sends finger moves the moment they happen, instead of once per display frame. Finger down/up go on a reliable channel, so a lost "up" can no longer leave a finger on the screen. The peer drops moves that arrive after their "up".
 - The H.264 encoder probe ran `ffmpeg` from PATH (not installed on the runner) and logged a misleading fallback. VideoToolbox is now opt-in (`FLUTTER_REMOTE_VIDEOTOOLBOX=1`), and libx264 is the default the tests prove.
 
+- README: `npx github:AbdAlftahSalem/flutter_remote up` "printing nothing" on Windows. The first `npx` of a GitHub package clones and installs it without printing anything; on a clean GitHub Windows runner that took 21 s, and each later run took 2–3 s and printed normally (`up`, `doctor`, `status`, `--help` all checked). The CLI itself prints its first line at once. This cannot be fixed inside the package, so the README now explains it and points to `npm i -g`.
+
 ### Added
 - Tests: `test/e2e/relay.e2e.test.mjs` (8 tests, part of `npm test`). In `npm run test:real-ui`, serve-sim's real page on an 8 Mbit/s link (a screen change must show within 1.5 s, and the phone never dims). `npm run test:lossy` (Linux, sudo) is the WebRTC player under 3 % UDP loss in a network namespace. It fails without NACK (5 frames in 10 s) and passes with it.
 
