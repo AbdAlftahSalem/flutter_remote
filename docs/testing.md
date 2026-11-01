@@ -22,7 +22,9 @@ passed while taps never reached a real Simulator (fixed in 0.2.3).
 | `test/e2e/gate.e2e.test.mjs` | `npm run test:gate` | gate + peer + synthetic serve-sim: health, 403 without token, `?k=` → HttpOnly cookie, script injection, served client parses, ICE config, MJPEG through the gate, WebSocket upgrades to serve-sim and peer (the Connection: Upgrade fix), metrics, v1 mode, refusing to start without a token |
 | `test/e2e/stream.e2e.test.mjs` | `npm run test:stream` | headless **Google Chrome** opens the gate link: on serve-sim's own UI no overlay covers the phone and its own tap reaches serve-sim; with `?player=webrtc` H.264 video arrives (codec checked in `getStats`), 390×844, not black, keeps moving, negotiated from the offer, tap, key and scroll reach serve-sim as serve-sim's frames (a key exactly once), reload reconnects, two viewers at once |
 
-`npm test` runs all four (about 25 s). The stream suite needs Google Chrome
+| `test/e2e/real-serve-sim-ui.e2e.test.mjs` | `FLUTTER_REMOTE_REAL_SERVE_SIM=1 npm run test:real-ui` (opt-in, downloads serve-sim from npm; `=0.1.49` picks a version) | serve-sim's **real** preview UI (its own React viewer, taken from its npm package) behind the real gate and peer: a click on its phone and a key reach serve-sim as its own frames; with `?player=webrtc` a tap and a key reach it exactly once. Fails on 0.2.2 (the overlay takes the click). |
+
+`npm test` runs the first four (about 25 s). The stream suite needs Google Chrome
 (`channel: chrome`; set `FLUTTER_REMOTE_E2E_CHROME=/path/to/chrome` to use
 another build) and FFmpeg (installed with `ffmpeg-static`).
 

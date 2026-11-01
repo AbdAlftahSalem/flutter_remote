@@ -150,7 +150,13 @@
         this.rafId = null;
       };
 
+      let pressed = false;
       const handlePointer = (e, type) => {
+        // A move with no finger down is a hover: serve-sim would read it as a
+        // touch move without a begin, so it is not sent.
+        if (type === 'move' && !pressed) return;
+        if (type === 'down') pressed = true;
+        else if (type === 'up' || type === 'cancel') pressed = false;
         this.lastInteractionTime = Date.now();
         const rect = this.videoRenderer.getBounds();
         const { width: vW, height: vH } = this.videoRenderer.getVideoResolution();

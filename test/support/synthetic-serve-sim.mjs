@@ -24,9 +24,14 @@
  * frame, oldest first: {tag, ...payload}), GET /__synthetic/rejected (frames it
  * could not decode) and GET /__synthetic/stats.
  *
- * Usage: node synthetic-serve-sim.mjs --port 3200 [--size 390x844] [--fps 15] [--udid ID]
+ * --ui-html FILE serves serve-sim's REAL preview UI (the HTML from its npm package)
+ * at / instead, configured for this device, so its own React viewer runs against
+ * this stand-in (see test/e2e/real-serve-sim-ui.e2e.test.mjs).
+ *
+ * Usage: node synthetic-serve-sim.mjs --port 3200 [--size 390x844] [--fps 15] [--udid ID] [--ui-html FILE]
  */
 import http from 'node:http';
+import { readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 
@@ -113,11 +118,26 @@ const PAGE = `<!doctype html><html><head><meta charset="utf-8"><title>serve-sim 
 })();
 </script></body></html>`;
 
+const REAL_UI = args['ui-html'] ? readFileSync(args['ui-html'], 'utf8') : null;
+
+/** serve-sim's real page, with the config its own server would inject for this device. */
+function realUiPage(req) {
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  const https = req.headers['x-forwarded-proto'] === 'https';
+  const cfg = {
+    pid: process.pid, port: PORT, device: UDID, url: `${https ? 'https' : 'http'}://${host}`,
+    streamUrl: `${https ? 'https' : 'http'}://${host}${HELPER}/stream.mjpeg`,
+    wsUrl: `${https ? 'wss' : 'ws'}://${host}${HELPER}/ws`,
+    basePath: '', previewEndpoint: '/', codec: 'mjpeg', proxyHelpers: true,
+  };
+  return REAL_UI.replace('<!--__SIM_PREVIEW_CONFIG__-->', `<script>window.__SIM_PREVIEW__=${JSON.stringify(cfg)}</script>`);
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(PAGE);
+    res.end(REAL_UI ? realUiPage(req) : PAGE);
   } else if (url.pathname === '/stream.mjpeg' || url.pathname === `${HELPER}/stream.mjpeg`) {
     res.writeHead(200, {
       'content-type': `multipart/x-mixed-replace; boundary=${BOUNDARY}`,

@@ -17,9 +17,10 @@ export const NODE_MODULES = join(ROOT, 'node_modules');
 export const SYNTHETIC_UDID = 'SYNTHETIC-UDID';
 export const HELPER_PATH = `/helper/${SYNTHETIC_UDID}`;
 
-export async function startServeSim({ size = '390x844', fps = 15 } = {}) {
+export async function startServeSim({ size = '390x844', fps = 15, uiHtml } = {}) {
   const port = await freePort();
-  const proc = startProcess('serve-sim', process.execPath, [SYNTHETIC_SERVE_SIM, '--port', String(port), '--size', size, '--fps', String(fps), '--udid', SYNTHETIC_UDID]);
+  const extra = uiHtml ? ['--ui-html', uiHtml] : [];
+  const proc = startProcess('serve-sim', process.execPath, [SYNTHETIC_SERVE_SIM, '--port', String(port), '--size', size, '--fps', String(fps), '--udid', SYNTHETIC_UDID, ...extra]);
   await waitForHttp(`http://127.0.0.1:${port}/__synthetic/stats`);
   return { port, proc, url: `http://127.0.0.1:${port}` };
 }
