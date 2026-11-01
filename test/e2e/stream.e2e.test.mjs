@@ -231,6 +231,89 @@ test('keys still held when the page loses focus are released (Shift stays not st
   assert.deepEqual(downs(got), [225, 4], `Shift+A: ${JSON.stringify(got)}`);
 });
 
+// "@" typed as "2" from a Windows viewer: the Simulator's hardware keyboard is US,
+// so it types the HID key code plus the HID Shift it was given. A symbol that came
+// with the key code but without the Shift (or with a Shift its US key does not want,
+// as on AZERTY) typed the wrong character. HID: Shift 225, Digit2 31.
+const SHIFT = 225;
+const DIGIT2 = 31;
+const sentAt = (list, type, usage) => list.findIndex((m) => m.type === type && m.usage === usage);
+async function typeSynthetic(page, key, code, shiftKey) {
+  // Dispatched on the focused element, where a real key event lands.
+  await page.evaluate(([key, code, shiftKey]) => {
+    const el = document.activeElement || document.body;
+    el.dispatchEvent(new KeyboardEvent('keydown', { key, code, shiftKey, bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent('keyup', { key, code, shiftKey, bubbles: true }));
+  }, [key, code, shiftKey]);
+}
+
+test('"@" whose key event carries no Shift reaches the Simulator as Shift+2, not "2" (serve-sim\'s UI)', async () => {
+  const page = await openServeSimUi();
+  const from = (await inputs()).length;
+  await typeSynthetic(page, '@', 'Digit2', false);
+  const got = await waitUntil(async () => {
+    const list = await keyFrames(from);
+    return list.some((m) => m.type === 'up' && m.usage === SHIFT) && list;
+  }, 10000, '"@" never reached serve-sim with Shift');
+  await page.waitForTimeout(200);
+  const all = await keyFrames(from);
+  await page.close();
+  assert.deepEqual(downs(all), [SHIFT, DIGIT2], `keys that went down: ${JSON.stringify(all)}`);
+  assert.ok(sentAt(all, 'down', SHIFT) < sentAt(all, 'down', DIGIT2) && sentAt(all, 'up', DIGIT2) < sentAt(all, 'up', SHIFT),
+    `Shift must wrap the 2: ${JSON.stringify(all)}`);
+  assert.equal(all.filter((m) => m.type === 'up' && m.usage === DIGIT2).length, 1, `the key's own up must not be sent twice: ${JSON.stringify(all)}`);
+});
+
+test('a "2" that needs Shift on the viewer\'s layout (AZERTY) reaches the Simulator as 2, with Shift lifted around it', async () => {
+  const page = await openServeSimUi();
+  const from = (await inputs()).length;
+  await page.keyboard.down('Shift');
+  await waitUntil(async () => (await keyFrames(from)).some((m) => m.type === 'down' && m.usage === SHIFT), 10000, 'Shift down never arrived');
+  await typeSynthetic(page, '2', 'Digit2', true);
+  const got = await waitUntil(async () => {
+    const list = await keyFrames(from);
+    return list.some((m) => m.type === 'up' && m.usage === DIGIT2) && list;
+  }, 10000, '"2" never reached serve-sim');
+  await page.waitForTimeout(200);
+  await page.keyboard.up('Shift');
+  await page.waitForTimeout(200);
+  const all = await keyFrames(from);
+  await page.close();
+  const shiftUp = sentAt(all, 'up', SHIFT);
+  const twoDown = sentAt(all, 'down', DIGIT2);
+  assert.ok(shiftUp >= 0 && shiftUp < twoDown, `Shift must be up before the 2: ${JSON.stringify(all)}`);
+  const shiftBackDown = all.findIndex((m, i) => i > twoDown && m.type === 'down' && m.usage === SHIFT);
+  assert.ok(shiftBackDown > sentAt(all, 'up', DIGIT2), `Shift, still held, goes back down after the 2: ${JSON.stringify(all)}`);
+});
+
+test('Shift+2 on a US keyboard still sends Shift then 2 once each (nothing translated)', async () => {
+  const page = await openServeSimUi();
+  const from = (await inputs()).length;
+  await page.keyboard.press('Shift+Digit2');
+  const got = await waitUntil(async () => {
+    const list = await keyFrames(from);
+    return list.some((m) => m.type === 'up' && m.usage === SHIFT) && list;
+  }, 10000, 'Shift+2 never reached serve-sim');
+  await page.waitForTimeout(200);
+  const all = await keyFrames(from);
+  await page.close();
+  assert.deepEqual(downs(all), [SHIFT, DIGIT2], `Shift+2: ${JSON.stringify(all)}`);
+});
+
+test('in the WebRTC player, "@" with no Shift on its key event reaches the Simulator as Shift+2', async () => {
+  const { page } = await openViewer();
+  const from = (await inputs()).length;
+  await typeSynthetic(page, '@', 'Digit2', false);
+  const got = await waitUntil(async () => {
+    const list = await keyFrames(from);
+    return list.some((m) => m.type === 'up' && m.usage === SHIFT) && list;
+  }, 10000, '"@" never reached serve-sim with Shift');
+  await page.waitForTimeout(200);
+  const all = await keyFrames(from);
+  await page.close();
+  assert.deepEqual(downs(all), [SHIFT, DIGIT2], `keys that went down: ${JSON.stringify(all)}`);
+});
+
 test('in the WebRTC player, Alt held on a non-Mac viewer never reaches the Simulator as Option', async () => {
   const { page } = await openViewer();
   const from = (await inputs()).length;
