@@ -51,14 +51,14 @@ on:
         description: "Cloudflare tunnel protocol: 'quic' (recommended, UDP-based, better on lossy networks) or 'http2'"
         default: quic
       max_dimension:
-        description: Cap captured width/height in pixels (0 for native resolution)
-        default: "720"
+        description: Longest side of the picture sent to the browser, in pixels (0 = full size)
+        default: "960"
       video_fps:
-        description: MJPEG frame rate
-        default: "20"
+        description: Most frames per second sent to the browser
+        default: "24"
       video_quality:
-        description: MJPEG quality 0.05-1
-        default: "0.5"
+        description: Picture quality sent to the browser, 0.05-1
+        default: "0.6"
       export_app:
         description: Upload the built .app as a GitHub Actions artifact
         default: "false"
@@ -281,6 +281,7 @@ jobs:
           FLUTTER_REMOTE_TRANSPORT: ${{ inputs.transport }}
           FLUTTER_REMOTE_STREAM_PATH: ${{ steps.serve_sim.outputs.stream_path || env.FLUTTER_REMOTE_STREAM_PATH || format('/helper/{0}/stream.mjpeg?raw=1', steps.sim.outputs.udid) }}
           FLUTTER_REMOTE_INPUT_PATH: ${{ steps.serve_sim.outputs.input_path }}
+          FLUTTER_REMOTE_MAX_DIMENSION: ${{ inputs.max_dimension }}
         run: |
           set -euo pipefail
           export NODE_PATH="$(npm root -g)"
@@ -310,8 +311,14 @@ jobs:
           FLUTTER_REMOTE_TURN_KEY_TOKEN: ${{ secrets.FLUTTER_REMOTE_TURN_KEY_TOKEN }}
           FLUTTER_REMOTE_WEBRTC_SIGNAL_PORT: "3201"
           FLUTTER_REMOTE_TRANSPORT: ${{ inputs.transport }}
+          # serve-sim's viewer gets scaled, de-duplicated, rate-capped frames (stream-relay.cjs).
+          FLUTTER_REMOTE_MAX_DIMENSION: ${{ inputs.max_dimension }}
+          FLUTTER_REMOTE_VIDEO_FPS: ${{ inputs.video_fps }}
+          FLUTTER_REMOTE_VIDEO_QUALITY: ${{ inputs.video_quality }}
         run: |
           set -euo pipefail
+          # The relay scales frames with the ffmpeg-static installed for the peer.
+          export NODE_PATH="$(npm root -g)"
           GATE_PATH=".github/flutter-remote/gate.cjs"
           if [ ! -f "$GATE_PATH" ]; then
             GATE_PATH="src/runner/flutter-remote/gate.cjs"
@@ -323,6 +330,7 @@ jobs:
             sleep 0.5
           done
           echo "Auth gate proxy running on port $GATE_PORT"
+          cat gate.log || true
 
       - name: Open tunnel and publish URL
         timeout-minutes: 10
@@ -557,7 +565,7 @@ jobs:
         run: |
           MINUTES='${{ inputs.minutes }}'
           echo "Stream is active. Holding session open for $MINUTES minutes..."
-          tail -f webrtc-peer.log &
+          tail -f webrtc-peer.log gate.log &
           TAIL_PID=$!
           sleep $((MINUTES * 60))
           kill $TAIL_PID 2>/dev/null || true

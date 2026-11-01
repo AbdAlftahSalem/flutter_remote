@@ -120,8 +120,6 @@
       this.dataChannels = dataChannels;
       this.overlay = null;
       this.nextSeq = 1;
-      this.pendingMove = null;
-      this.rafId = null;
       this.lastInteractionTime = 0;
       this._init();
     }
@@ -137,17 +135,18 @@
       }
       this.overlay = o;
 
+      // Moves go out the moment they happen, on the unordered, unreliable "input"
+      // channel (a late move is worthless). Finger down/up go on the ordered,
+      // reliable "touch" channel: a lost "up" would leave a finger on the screen.
+      // The peer drops a move that arrives after its "up" (seq numbers).
       const sendPointer = (evt) => {
-        const dc = this.dataChannels.input;
+        const phase = evt.event !== 'move';
+        const touch = this.dataChannels.touch;
+        const dc = phase && touch && touch.readyState === 'open' ? touch : this.dataChannels.input;
         if (dc && dc.readyState === 'open') {
-          if (dc.bufferedAmount > 65536 && evt.event === 'move') return;
+          if (!phase && dc.bufferedAmount > 16384) return; // never queue moves behind a congested link
           dc.send(JSON.stringify(evt));
         }
-      };
-
-      const flush = () => {
-        if (this.pendingMove) { sendPointer(this.pendingMove); this.pendingMove = null; }
-        this.rafId = null;
       };
 
       let pressed = false;
@@ -193,16 +192,10 @@
 
         if (type === 'down') {
           try { this.overlay.setPointerCapture(e.pointerId); } catch {}
-          if (this.rafId) { cancelAnimationFrame(this.rafId); flush(); }
-          sendPointer(evt);
         } else if (type === 'up' || type === 'cancel') {
           try { this.overlay.releasePointerCapture(e.pointerId); } catch {}
-          if (this.rafId) { cancelAnimationFrame(this.rafId); flush(); }
-          sendPointer(evt);
-        } else if (type === 'move') {
-          this.pendingMove = evt;
-          if (!this.rafId) this.rafId = requestAnimationFrame(flush);
         }
+        sendPointer(evt);
       };
 
       this.overlay.addEventListener('pointerdown', (e) => handlePointer(e, 'down'));
@@ -451,6 +444,7 @@
         };
 
         this.dataChannels.input = this.peer.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
+        this.dataChannels.touch = this.peer.createDataChannel('touch', { ordered: true });
         this.dataChannels.keyboard = this.peer.createDataChannel('keyboard', { ordered: true });
         this.dataChannels.control = this.peer.createDataChannel('control', { ordered: true });
         this.dataChannels.telemetry = this.peer.createDataChannel('telemetry', { ordered: false, maxRetransmits: 0 });

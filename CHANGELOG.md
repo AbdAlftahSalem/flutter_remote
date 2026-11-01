@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.4
+
+### Fixed
+- **The phone kept flashing black, and taps felt slow** (serve-sim's default page). serve-sim sends the Simulator as full-size JPEGs (1206×2622, about 230 KB each on an iPhone 17 Pro), 12–16 per second, even when nothing on the screen moves: 22–30 Mbit/s through the tunnel, measured on a GitHub macOS runner on 2026-11-01. Most connections cannot carry that, so the frames queue up. What you see falls seconds behind what you tap. And whenever one frame takes longer than 2 s, serve-sim's viewer covers the phone with its dark "Connecting..." overlay until the next frame lands. The gate now serves `<helper>/stream.mjpeg` itself (`stream-relay.cjs`), from one shared connection to serve-sim:
+  - frames are scaled so the longest side is at most 960 px and re-encoded at quality 0.6 (FFmpeg, from the `ffmpeg-static` the runner already installs). That is about 8× less data on a moving screen;
+  - identical frames (serve-sim's idle re-sends) are dropped. A still screen costs about one frame a second, enough that the viewer never dims;
+  - at most 24 frames a second, but the last frame of a burst always goes out;
+  - on a slow connection the newest frame replaces older ones instead of queueing behind them.
+
+  In the tests, on a link throttled to 8 Mbit/s, a change on the screen showed after 10.3 s before this change and in under 1.5 s after it. `FLUTTER_REMOTE_STREAM_RELAY=0` turns the relay off.
+- **`?player=webrtc` stuck on "Connected, waiting for video feed..."** on real networks. A lost video packet was never sent again, and a keyframe of a full-size frame is ~100 packets. On a path that drops 3 % of UDP packets, Chrome decoded 3 frames in 11 s. The peer now resends lost packets when Chrome asks for them (NACK), paces keyframe bursts, and encodes at the same 960 px. Same lossy path: full frame rate, no frames lost.
+- `--max-dimension`, `--fps` and `--quality` (and the workflow inputs `max_dimension`, `video_fps`, `video_quality`) were accepted but did nothing. They now set what the browser receives, in both players. The new defaults are 960 / 24 / 0.6; use `--max-dimension 0` for full size.
+- The WebRTC encoder showed each picture two frames late (FFmpeg holds piped frames back). When serve-sim goes quiet, the last picture is now pushed through at once.
+- The WebRTC player sends finger moves the moment they happen, instead of once per display frame. Finger down/up go on a reliable channel, so a lost "up" can no longer leave a finger on the screen. The peer drops moves that arrive after their "up".
+- The H.264 encoder probe ran `ffmpeg` from PATH (not installed on the runner) and logged a misleading fallback. VideoToolbox is now opt-in (`FLUTTER_REMOTE_VIDEOTOOLBOX=1`), and libx264 is the default the tests prove.
+
+### Added
+- Tests: `test/e2e/relay.e2e.test.mjs` (8 tests, part of `npm test`). In `npm run test:real-ui`, serve-sim's real page on an 8 Mbit/s link (a screen change must show within 1.5 s, and the phone never dims). `npm run test:lossy` (Linux, sudo) is the WebRTC player under 3 % UDP loss in a network namespace. It fails without NACK (5 frames in 10 s) and passes with it.
+
 ## 0.2.3
 
 ### Fixed

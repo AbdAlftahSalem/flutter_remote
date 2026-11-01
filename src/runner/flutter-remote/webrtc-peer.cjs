@@ -19,11 +19,15 @@ const { ServerMetrics } = require('./peer/Metrics.cjs');
 let ndc;
 let PeerConnection;
 let Video;
+let RtcpNackResponder;
+let PacingHandler;
 
 try {
   ndc = require('node-datachannel');
   PeerConnection = ndc.PeerConnection;
   Video = ndc.Video;
+  RtcpNackResponder = ndc.RtcpNackResponder;
+  PacingHandler = ndc.PacingHandler;
 } catch (e) {
   console.error('[webrtc-peer] node-datachannel not found:', e.message);
 }
@@ -50,18 +54,23 @@ const TARGET_HOST = config.host;
 installCrashGuards('webrtc-peer');
 
 // Create video encoder with capability detection
-const videoEncoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30 });
-detectH264Encoder().then((detected) => {
-  if (detected && detected.isHardware) {
-    console.log(`[webrtc-peer] hardware acceleration enabled: ${detected.name}`);
-    videoEncoder.encoderName = detected.name;
-    videoEncoder.isHardware = true;
-  } else if (detected) {
-    console.log(`[webrtc-peer] using encoder: ${detected.name}`);
-  }
-}).catch((err) => {
-  console.warn('[webrtc-peer] encoder capability detection warning:', err.message);
-});
+const videoEncoder = new VideoEncoder({ payloadType: 98, ssrc: 12345, mtu: 1200, fps: 30, maxDimension: config.video.maxDimension });
+console.log(`[webrtc-peer] video: longest side <= ${config.video.maxDimension || 'native'} px, libx264 (${videoEncoder.ffmpegPath})`);
+// libx264 is what the E2E suite proves end to end. VideoToolbox is opt-in
+// (FLUTTER_REMOTE_VIDEOTOOLBOX=1): on GitHub's macOS VMs it is unverified.
+if (process.env.FLUTTER_REMOTE_VIDEOTOOLBOX === '1') {
+  detectH264Encoder(videoEncoder.ffmpegPath).then((detected) => {
+    if (detected && detected.isHardware) {
+      console.log(`[webrtc-peer] hardware acceleration enabled: ${detected.name}`);
+      videoEncoder.encoderName = detected.name;
+      videoEncoder.isHardware = true;
+    } else if (detected) {
+      console.log(`[webrtc-peer] using encoder: ${detected.name}${detected.hardwareUnavailableReason ? ` (VideoToolbox: ${detected.hardwareUnavailableReason})` : ''}`);
+    }
+  }).catch((err) => {
+    console.warn('[webrtc-peer] encoder capability detection warning:', err.message);
+  });
+}
 const qualityController = new AdaptiveQualityController({ videoEncoder });
 const serverMetrics = new ServerMetrics();
 
@@ -154,7 +163,7 @@ if (WebSocketServer) {
 
     const session = new PeerSession({
       ws,
-      ndc: { PeerConnection, Video },
+      ndc: { PeerConnection, Video, RtcpNackResponder, PacingHandler },
       videoEncoder,
       qualityController,
       adaptiveQualityEnabled: ADAPTIVE_QUALITY_ENABLED,

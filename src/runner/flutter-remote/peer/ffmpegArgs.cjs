@@ -5,14 +5,22 @@
  * repeat-headers).
  */
 
-function scaleFilter({ width, height }) {
+function scaleFilter({ width, height, maxDimension }) {
+  if (maxDimension > 0) {
+    // Longest side at most maxDimension (never upscaled), even sizes for H.264.
+    // A full-size iPhone frame (1206x2622) has 4.5x the pixels of 442x960 and its
+    // keyframes are split into hundreds of RTP packets: one lost packet and the
+    // picture cannot be decoded until the next keyframe.
+    const d = Math.round(maxDimension);
+    return `scale='if(gte(iw,ih),min(${d},trunc(iw/2)*2),-2)':'if(gte(iw,ih),-2,min(${d},trunc(ih/2)*2))':flags=area`;
+  }
   return (width && height && (width !== 720 || height !== 1280))
     ? `scale=${width}:${height}`
     : 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
 }
 
 /**
- * @param {{ encoderName: string, width?: number, height?: number, fps: number, bitrateKbps: number }} o
+ * @param {{ encoderName: string, width?: number, height?: number, maxDimension?: number, fps: number, bitrateKbps: number }} o
  * @returns {string[]}
  */
 function buildH264Args(o) {
@@ -25,6 +33,8 @@ function buildH264Args(o) {
     '-analyzeduration', '0',
     '-fflags', 'nobuffer',
     '-flags', 'low_delay',
+    // One decoder thread: frame threading holds frames back before they are encoded.
+    '-threads', '1',
     '-f', 'image2pipe',
     '-vcodec', 'mjpeg',
     '-i', 'pipe:0',
@@ -51,4 +61,4 @@ function buildH264Args(o) {
   return [...input, ...codec, ...output];
 }
 
-module.exports = { buildH264Args };
+module.exports = { buildH264Args, scaleFilter };

@@ -93,6 +93,9 @@ The link opens in your browser automatically (`--no-open` to skip).
 | `--codec <codec>` | `mjpeg` | How serve-sim captures the Simulator: `mjpeg`, `h264` or `auto` (= `mjpeg`) |
 | `--transport <mode>` | `webrtc` | `webrtc`, or `http` for the older injected client |
 | `--tunnel-protocol <p>` | `quic` | `quic` or `http2` (falls back to `http2` automatically) |
+| `--max-dimension <px>` | `960` | Longest side of the picture sent to the browser (`0` = full size, e.g. 1206×2622 on an iPhone 17 Pro). Smaller = less lag on slow connections |
+| `--fps <n>` | `24` | Most frames per second sent to the browser |
+| `--quality <q>` | `0.6` | Picture quality, `0.05`–`1` |
 | `--app-file <path>` | none | Run a prebuilt simulator `.app` (or `.zip`/`.tar.gz`) instead of building |
 | `--app <url>` / `--app-release <name>` | none | Run a prebuilt app from a URL or a release asset |
 | `--no-cache` | off | Force a clean native rebuild |

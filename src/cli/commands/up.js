@@ -39,10 +39,11 @@ export function dispatchInputs(flags, { session, gateToken, mode, flutterVersion
     transport: flags.transport ?? process.env.FLUTTER_REMOTE_TRANSPORT ?? 'webrtc',
     tunnel_protocol: flags['tunnel-protocol'] ?? 'quic', // falls back to http2 on the runner if UDP is blocked
     codec: codec === 'auto' ? 'mjpeg' : codec,
-    // serve-sim streams at native resolution; these three are kept for older workflows.
-    max_dimension: String(flags['max-dimension'] ?? 720),
-    video_fps: String(flags.fps ?? 20),
-    video_quality: String(flags.quality ?? 0.5),
+    // What the browser receives (both players): longest side, frames per second,
+    // JPEG quality. serve-sim captures at full size; the gate scales on the runner.
+    max_dimension: String(flags['max-dimension'] ?? 960),
+    video_fps: String(flags.fps ?? 24),
+    video_quality: String(flags.quality ?? 0.6),
     cache: flags.cache === false ? 'false' : 'true',
     runner: flags.runner ?? 'macos-26',
   };

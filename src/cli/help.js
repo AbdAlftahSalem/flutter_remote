@@ -32,6 +32,9 @@ ${bold('OPTIONS (flutter-remote up)')}
   --dart-define <K=V>    Define environment config values       ${dim('(can be repeated)')}
   --codec <codec>        Stream codec: mjpeg | h264 | auto      ${dim('default mjpeg (stable, no black screen)')}
   --tunnel-protocol <p>  quic | http2                           ${dim('default quic (better on lossy networks)')}
+  --max-dimension <px>   Longest side of the streamed picture   ${dim('default 960 (0 = full size)')}
+  --fps <n>              Max frames per second sent             ${dim('default 24')}
+  --quality <q>          Picture quality 0.05-1                 ${dim('default 0.6')}
   --app-file <path>      Run a prebuilt local .app or archive
   --app <url>            Run a prebuilt simulator .app from URL
   --app-release <name>   Run an asset from flutter-remote-build release

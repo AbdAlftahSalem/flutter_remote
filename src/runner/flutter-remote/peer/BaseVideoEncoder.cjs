@@ -20,6 +20,18 @@ class BaseVideoEncoder extends EventEmitter {
     this.bitrateKbps = options.bitrateKbps || 2500;
     this.width = options.width || 720;
     this.height = options.height || 1280;
+    // Longest side of what is encoded (0 = serve-sim's full frame size).
+    this.maxDimension = Number(options.maxDimension) || 0;
+    // FFmpeg's piped JPEG input releases a frame only after ~2 more arrive. When
+    // serve-sim goes quiet (the screen settled), the last picture is pushed out
+    // with two repeats of it after this long, instead of waiting for the next
+    // change or keepalive. Repeats encode as near-empty P-frames.
+    // The wait adapts to how often serve-sim is sending (twice the usual gap),
+    // so a steady stream is never padded with repeats.
+    this.idleFlushMs = options.idleFlushMs ?? null;
+    this._idleFlushTimer = null;
+    this._lastInputAt = 0;
+    this._inputGapMs = 0;
     this.ffmpegPath = options.ffmpegPath || 'ffmpeg';
     this.supervisor = options.supervisor || null;
 
@@ -471,11 +483,36 @@ class BaseVideoEncoder extends EventEmitter {
       if (!canAcceptMore) {
         this._waitingForDrain = true;
       }
+      this._scheduleIdleFlush(jpegBuffer);
       return true;
     } catch (err) {
       this.emit('encoder_error', err);
       return false;
     }
+  }
+
+  _scheduleIdleFlush(jpegBuffer) {
+    const now = Date.now();
+    if (this._lastInputAt) {
+      const gap = Math.min(1000, now - this._lastInputAt);
+      this._inputGapMs = this._inputGapMs ? this._inputGapMs * 0.8 + gap * 0.2 : gap;
+    }
+    this._lastInputAt = now;
+    if (this.idleFlushMs === 0) return;
+    const wait = this.idleFlushMs || Math.min(300, Math.max(60, Math.round(2 * (this._inputGapMs || 50))));
+    if (this._idleFlushTimer) clearTimeout(this._idleFlushTimer);
+    this._idleFlushTimer = setTimeout(() => {
+      this._idleFlushTimer = null;
+      if (this._latestFrame !== jpegBuffer || this._waitingForDrain) return;
+      const stdin = this.ffmpegProc && this.ffmpegProc.stdin;
+      if (!stdin || !stdin.writable) return;
+      try {
+        stdin.write(jpegBuffer);
+        if (!stdin.write(jpegBuffer)) this._waitingForDrain = true;
+        this.metrics.idleFlushes = (this.metrics.idleFlushes || 0) + 1;
+      } catch {}
+    }, wait);
+    if (typeof this._idleFlushTimer.unref === 'function') this._idleFlushTimer.unref();
   }
 
   _flushNextPendingInput() {
@@ -736,6 +773,7 @@ class BaseVideoEncoder extends EventEmitter {
 
   close() {
     this._isClosing = true;
+    if (this._idleFlushTimer) { clearTimeout(this._idleFlushTimer); this._idleFlushTimer = null; }
     this._isEncoding = false;
     if (this._flushTimer) {
       clearTimeout(this._flushTimer);

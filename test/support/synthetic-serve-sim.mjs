@@ -28,7 +28,12 @@
  * at / instead, configured for this device, so its own React viewer runs against
  * this stand-in (see test/e2e/real-serve-sim-ui.e2e.test.mjs).
  *
- * Usage: node synthetic-serve-sim.mjs --port 3200 [--size 390x844] [--fps 15] [--udid ID] [--ui-html FILE]
+ * --still 1 behaves like serve-sim on a screen that is not changing: it keeps
+ * re-sending the same JPEG bytes at --fps. POST /__synthetic/change makes the
+ * next generated frame the new still picture (a "screen change"), and
+ * GET /__synthetic/stats reports when that happened.
+ *
+ * Usage: node synthetic-serve-sim.mjs --port 3200 [--size 390x844] [--fps 15] [--udid ID] [--ui-html FILE] [--still 1]
  */
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
@@ -45,6 +50,11 @@ const PORT = Number(args.port ?? 3200);
 const SIZE = args.size ?? '390x844';
 const FPS = Number(args.fps ?? 15);
 const UDID = args.udid ?? 'SYNTHETIC-UDID';
+const STILL = args.still === '1' || args.still === 'true';
+let stillFrame = null;
+let changeRequested = false;
+let changes = 0;
+let lastChangeAt = 0;
 const HELPER = `/helper/${UDID}`;
 let ffmpegPath = 'ffmpeg';
 try { ffmpegPath = require('ffmpeg-static') || 'ffmpeg'; } catch { /* system ffmpeg */ }
@@ -71,10 +81,18 @@ ffmpeg.stdout.on('data', (chunk) => {
     if (soi < 0) { pending = Buffer.alloc(0); return; }
     const eoi = pending.indexOf(Buffer.from([0xff, 0xd9]), soi + 2);
     if (eoi < 0) { pending = pending.subarray(soi); return; }
-    const frame = pending.subarray(soi, eoi + 2);
+    let frame = pending.subarray(soi, eoi + 2);
     pending = pending.subarray(eoi + 2);
     framesProduced++;
     latestFrame = frame;
+    if (STILL) {
+      if (!stillFrame || changeRequested) {
+        stillFrame = Buffer.from(frame);
+        if (changeRequested) { changes++; lastChangeAt = Date.now(); }
+        changeRequested = false;
+      }
+      frame = stillFrame;
+    }
     for (const res of viewers) {
       res.write(`--${BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`);
       res.write(frame);
@@ -155,9 +173,13 @@ const server = http.createServer((req, res) => {
   } else if (url.pathname === '/__synthetic/rejected') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(rejected));
+  } else if (url.pathname === '/__synthetic/change' && req.method === 'POST') {
+    changeRequested = true;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, requestedAt: Date.now() }));
   } else if (url.pathname === '/__synthetic/stats') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ framesProduced, viewers: viewers.size, inputs: inputs.length, rejected: rejected.length, udid: UDID }));
+    res.end(JSON.stringify({ framesProduced, viewers: viewers.size, inputs: inputs.length, rejected: rejected.length, udid: UDID, still: STILL, changes, lastChangeAt }));
   } else {
     res.writeHead(404, { 'content-type': 'text/plain' });
     res.end('not found');

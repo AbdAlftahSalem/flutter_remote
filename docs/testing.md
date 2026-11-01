@@ -34,6 +34,14 @@ line in the gate, both WebSocket tests fail; with the 0.2.2 client and
 `ServeSimConsumer.cjs`, the serve-sim UI tap test and the player tap and scroll
 tests fail.
 
+### Stream relay and lossy-network suites
+
+- `npm run test:relay` (also in `npm test`): the gate's MJPEG relay with serve-sim's real frame size (1206×2622). Covers scaling to 960 px, at least 4× fewer bytes, the frame-rate cap, a still screen costing about one frame a second with no gap over 1.5 s (serve-sim's viewer dims after 2 s), a change on a still screen showing within 500 ms, pass-through when off, no-FFmpeg fallback, 404 pass-through, and two viewers sharing one connection. Without the relay's idle flush, the 500 ms test fails: the new picture never arrives, because FFmpeg holds piped frames back.
+- `npm run test:real-ui` now also opens serve-sim's real page with Chrome throttled to 8 Mbit/s. A change on the screen must show within 1.5 s, and the "Connecting..." overlay must never appear. To see the old behaviour, run it with `FLUTTER_REMOTE_TEST_RELAY=0`: the change took 10.3 s.
+- `FLUTTER_REMOTE_LOSSY=1 npm run test:lossy` (Linux, passwordless sudo) runs the stack and Chrome inside a network namespace that drops 3 % of UDP packets. The WebRTC player must decode at least 100 frames in 10 s. To see it fail, add `FLUTTER_REMOTE_LOSSY_PEER_ENV='{"FLUTTER_REMOTE_RTP_NACK":"0"}'`, which turns retransmission off: 5 frames.
+
+What these cannot show: the real Simulator's frames, a real home connection through the Cloudflare tunnel, and Safari/iOS browsers. Those need a session on a macOS runner.
+
 ## Runner suite (macOS runner, real iOS Simulator)
 
 `test/runner/runner.e2e.test.mjs`, run by `.github/workflows/e2e-runner.yml`

@@ -4,6 +4,24 @@
  */
 const env = process.env;
 
+function num(value, fallback) {
+  const n = Number(value);
+  return value === undefined || value === null || value === '' || !Number.isFinite(n) ? fallback : n;
+}
+
+/**
+ * What the browser receives (both players): the workflow passes the CLI's
+ * --max-dimension / --fps / --quality here. maxDimension 0 = native size.
+ */
+function videoConfigFromEnv(e = env) {
+  return Object.freeze({
+    relay: e.FLUTTER_REMOTE_STREAM_RELAY !== '0',
+    maxDimension: Math.max(0, Math.round(num(e.FLUTTER_REMOTE_MAX_DIMENSION, 960))),
+    fps: Math.min(60, Math.max(1, num(e.FLUTTER_REMOTE_VIDEO_FPS, 24))),
+    quality: Math.min(1, Math.max(0.05, num(e.FLUTTER_REMOTE_VIDEO_QUALITY, 0.6))),
+  });
+}
+
 const config = Object.freeze({
   host: '127.0.0.1',
   /** serve-sim (the Simulator stream + input socket) */
@@ -22,6 +40,7 @@ const config = Object.freeze({
   adaptiveQuality: env.FLUTTER_REMOTE_ADAPTIVE_QUALITY === 'true',
   turnKeyId: env.FLUTTER_REMOTE_TURN_KEY_ID || '',
   turnKeyToken: env.FLUTTER_REMOTE_TURN_KEY_TOKEN || '',
+  video: videoConfigFromEnv(env),
 });
 
 /** Log instead of dying on a stray socket error: the session must stay up. */
@@ -30,4 +49,4 @@ function installCrashGuards(name) {
   process.on('unhandledRejection', (reason) => console.error(`[${name} unhandledRejection]`, reason));
 }
 
-module.exports = { config, installCrashGuards };
+module.exports = { config, installCrashGuards, videoConfigFromEnv };

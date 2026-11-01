@@ -9,6 +9,35 @@
  */
 
 const { DataChannelRouter } = require('./DataChannelRouter.cjs');
+const { TouchOrderGuard } = require('./serveSimProtocol.cjs');
+
+/** Pacing rate for video RTP: well above the encoder's average so only keyframe bursts are smoothed. */
+const PACING_BITS_PER_SECOND = 12_000_000;
+const PACING_INTERVAL_MS = 5;
+/** RTP packets kept for retransmission (about 2 s of video at 2.5 Mbit/s). */
+const NACK_HISTORY_PACKETS = 1024;
+
+/**
+ * Retransmit lost video packets on the browser's NACK (RTCP), and pace the
+ * keyframe bursts. Without this, one lost UDP packet of a keyframe meant no
+ * picture until the next keyframe: on a 3 % lossy path Chrome decoded 3 frames
+ * in 11 s and showed "Connected, waiting for video feed..." (CHANGELOG 0.2.4).
+ */
+function attachVideoReliability(track, ndc) {
+  const { RtcpNackResponder, PacingHandler } = ndc || {};
+  if (process.env.FLUTTER_REMOTE_RTP_NACK === '0') return { nack: false, pacing: false }; // diagnostics only
+  if (!track || typeof track.setMediaHandler !== 'function' || typeof RtcpNackResponder !== 'function') {
+    return { nack: false, pacing: false };
+  }
+  const nack = new RtcpNackResponder(NACK_HISTORY_PACKETS);
+  let pacing = false;
+  if (typeof PacingHandler === 'function' && process.env.FLUTTER_REMOTE_RTP_PACING !== '0') {
+    nack.addToChain(new PacingHandler(PACING_BITS_PER_SECOND, PACING_INTERVAL_MS));
+    pacing = true;
+  }
+  track.setMediaHandler(nack);
+  return { nack: true, pacing };
+}
 
 class PeerSession {
   constructor(options = {}) {
@@ -27,6 +56,7 @@ class PeerSession {
     this.peer = null;
     this.videoTrack = null;
     this.router = new DataChannelRouter();
+    this.touchGuard = new TouchOrderGuard();
   }
 
   handleOffer(msg) {
@@ -76,8 +106,14 @@ class PeerSession {
         }
         console.log(`[webrtc-peer] video negotiated: mid=${neg.mid} H264 pt=${neg.payloadType} (${neg.fmtp || 'no fmtp'})`);
         this.videoTrack = this.peer.addTrack(video);
+        let reliability = { nack: false, pacing: false };
+        try {
+          reliability = attachVideoReliability(this.videoTrack, this.ndc);
+        } catch (err) {
+          console.warn('[webrtc-peer] NACK/pacing unavailable:', err.message);
+        }
         this.activeVideoTracks.add(this.videoTrack);
-        console.log('[webrtc-peer] video track ready');
+        console.log(`[webrtc-peer] video track ready (NACK retransmission: ${reliability.nack ? 'on' : 'off'}, pacing: ${reliability.pacing ? 'on' : 'off'})`);
 
         // Delay keyframe send until ICE+DTLS are fully established.
         // Sending RTP before 'connected' causes silent drops and black screen.
@@ -182,6 +218,7 @@ class PeerSession {
             }
           } catch {}
         }
+        if (!this.touchGuard.accept(rawMsg)) return;
         this.serveSimConsumer.sendToServeSim(rawMsg);
       });
     });
@@ -247,5 +284,6 @@ function negotiateH264(sdp) {
 
 module.exports = {
   negotiateH264,
+  attachVideoReliability,
   PeerSession,
 };
