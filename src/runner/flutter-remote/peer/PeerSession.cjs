@@ -26,7 +26,7 @@ const NACK_HISTORY_PACKETS = 1024;
 /**
  * Retransmit lost video packets on the browser's NACK (RTCP). Without this, one lost UDP packet of a keyframe meant no
  * picture until the next keyframe: on a 3 % lossy path Chrome decoded 3 frames
- * in 11 s and showed "Connected, waiting for video feed..." (CHANGELOG 0.2.4).
+ * in 11 s and showed "Connected, waiting for video feed..." (CHANGELOG 0.2.3).
  */
 function attachVideoReliability(track, ndc) {
   const { RtcpNackResponder, PacingHandler } = ndc || {};

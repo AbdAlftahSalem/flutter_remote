@@ -1,8 +1,12 @@
 # Changelog
 
-## 0.2.4
+## 0.2.3
 
 ### Fixed
+- **Taps and typing never reached the Simulator** (the stream was live, but clicking the phone did nothing and serve-sim's Event Log stayed at 0). Two bugs, both hidden by the test stand-in:
+  - The gate injects the browser client into serve-sim's own preview page. That page has no `#flutter-remote-container`, so the client mounted on `document.body` and laid a transparent full-page input overlay (z-index 10) over serve-sim's phone. Every click on the phone hit the overlay, never serve-sim's own view. On serve-sim's page the client now stays out of the way, and serve-sim's own viewer handles video and input (its input socket is already tunnelled by the gate).
+  - The clicks the overlay captured went through WebRTC to the runner, which sent them to `ws://127.0.0.1:3200/ws` as JSON text. serve-sim has no `/ws`: its input socket is `/helper/<udid>/ws`, and it takes binary frames (a tag byte, then JSON: 3 = touch, 6 = key, 11 = scroll). serve-sim closed the connection, so every event was dropped. The peer now connects to the real socket (from serve-sim's reported `wsUrl`, or derived from the stream path) and translates pointer, keyboard, scroll and paste into serve-sim's frames. The legacy v1 client (`FLUTTER_REMOTE_TRANSPORT=v1`) relayed serve-sim's frames to the same dead path; those now pass through to the real socket too.
+- The synthetic serve-sim used by the tests now speaks the real protocol (`/helper/<udid>/ws`, binary frames, bare `/ws` refused) and serves a page shaped like serve-sim's UI, so these bugs fail the suite instead of passing it.
 - **The phone kept flashing black, and taps felt slow** (serve-sim's default page). serve-sim sends the Simulator as full-size JPEGs (1206×2622, about 230 KB each on an iPhone 17 Pro), 12–16 per second, even when nothing on the screen moves: 22–30 Mbit/s through the tunnel, measured on a GitHub macOS runner on 2026-11-01. Most connections cannot carry that, so the frames queue up. What you see falls seconds behind what you tap. And whenever one frame takes longer than 2 s, serve-sim's viewer covers the phone with its dark "Connecting..." overlay until the next frame lands. The gate now serves `<helper>/stream.mjpeg` itself (`stream-relay.cjs`), from one shared connection to serve-sim:
   - frames are scaled so the longest side is at most 960 px and re-encoded at quality 0.6 (FFmpeg, from the `ffmpeg-static` the runner already installs). That is about 8× less data on a moving screen;
   - identical frames (serve-sim's idle re-sends) are dropped. A still screen costs about one frame a second, enough that the viewer never dims;
@@ -19,18 +23,8 @@
 - README: `npx github:AbdAlftahSalem/flutter_remote up` "printing nothing" on Windows. The first `npx` of a GitHub package clones and installs it without printing anything; on a clean GitHub Windows runner that took 21 s, and each later run took 2–3 s and printed normally (`up`, `doctor`, `status`, `--help` all checked). The CLI itself prints its first line at once. This cannot be fixed inside the package, so the README now explains it and points to `npm i -g`.
 
 ### Added
-- Tests: `test/e2e/relay.e2e.test.mjs` (8 tests, part of `npm test`). In `npm run test:real-ui`, serve-sim's real page on an 8 Mbit/s link (a screen change must show within 1.5 s, and the phone never dims). `npm run test:lossy` (Linux, sudo) is the WebRTC player under 3 % UDP loss in a network namespace. It fails without NACK (5 frames in 10 s) and passes with it.
-
-## 0.2.3
-
-### Fixed
-- **Taps and typing never reached the Simulator** (the stream was live, but clicking the phone did nothing and serve-sim's Event Log stayed at 0). Two bugs, both hidden by the test stand-in:
-  - The gate injects the browser client into serve-sim's own preview page. That page has no `#flutter-remote-container`, so the client mounted on `document.body` and laid a transparent full-page input overlay (z-index 10) over serve-sim's phone. Every click on the phone hit the overlay, never serve-sim's own view. On serve-sim's page the client now stays out of the way, and serve-sim's own viewer handles video and input (its input socket is already tunnelled by the gate).
-  - The clicks the overlay captured went through WebRTC to the runner, which sent them to `ws://127.0.0.1:3200/ws` as JSON text. serve-sim has no `/ws`: its input socket is `/helper/<udid>/ws`, and it takes binary frames (a tag byte, then JSON: 3 = touch, 6 = key, 11 = scroll). serve-sim closed the connection, so every event was dropped. The peer now connects to the real socket (from serve-sim's reported `wsUrl`, or derived from the stream path) and translates pointer, keyboard, scroll and paste into serve-sim's frames. The legacy v1 client (`FLUTTER_REMOTE_TRANSPORT=v1`) relayed serve-sim's frames to the same dead path; those now pass through to the real socket too.
-- The synthetic serve-sim used by the tests now speaks the real protocol (`/helper/<udid>/ws`, binary frames, bare `/ws` refused) and serves a page shaped like serve-sim's UI, so these bugs fail the suite instead of passing it.
-
-### Added
 - `?player=webrtc` on the session link opens the WebRTC player full-window on top of serve-sim's UI (low-latency H.264 video, input through the peer).
+- Tests: `test/e2e/relay.e2e.test.mjs` (8 tests, part of `npm test`). In `npm run test:real-ui`, serve-sim's real page on an 8 Mbit/s link (a screen change must show within 1.5 s, and the phone never dims). `npm run test:lossy` (Linux, sudo) is the WebRTC player under 3 % UDP loss in a network namespace. It fails without NACK (5 frames in 10 s) and passes with it.
 
 ## 0.2.2
 
