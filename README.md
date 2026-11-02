@@ -11,6 +11,14 @@
 
 It is not Flutter Web and not a recording: it is your real iOS build in Apple's Simulator, streamed over WebRTC.
 
+<p align="center">
+  <img src="docs/media/demo.gif" alt="flutter-remote: install, flutter-remote up, then a Flutter app running in the iOS Simulator in the browser" width="900">
+</p>
+
+<p align="center">
+  <a href="docs/media/demo.mp4"><b>▶ Watch the full demo</b></a>: install, <code>flutter-remote doctor</code>, <code>flutter-remote up</code>, using the app in the browser, <code>flutter-remote status</code> and <code>flutter-remote down</code>.
+</p>
+
 ## Quick start (3 steps)
 
 1. **Install** (Node.js 20+, Git and the GitHub CLI are the only requirements):
